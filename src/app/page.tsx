@@ -1,69 +1,233 @@
-import Image from "next/image";
+import {
+  getKrakenDevices,
+  getKrakenPlannedDispatches,
+  getKrakenVehicleStatus,
+} from "../lib/kraken/client";
 
-export default function Home() {
+type VehicleStatus = {
+  currentState: string | null;
+  isSuspended: boolean | null;
+  stateOfCharge: {
+    value: number | null;
+  } | null;
+  activePower: {
+    value: number | null;
+  } | null;
+};
+
+type PlannedDispatch = {
+  start: string;
+  end: string;
+  type: string;
+  energyAddedKwh: string | null;
+};
+
+type Vehicle = {
+  id: string;
+  name: string;
+  deviceType: string;
+  provider: string;
+  vehicleBatterySize: string | null;
+  chargePointPowerOutput: string | null;
+  preferences: {
+    schedules: Array<{
+      dayOfWeek: string;
+      time: string;
+      min: number | null;
+      max: number | null;
+      upperLimit: number | null;
+    }>;
+  } | null;
+  plannedDispatches: PlannedDispatch[];
+  status: VehicleStatus;
+};
+
+async function getVehicles(): Promise<Vehicle[]> {
+  const devices = await getKrakenDevices();
+
+  const vehicles = await Promise.all(
+    devices.map(async (device) => ({
+      ...device,
+      status: await getKrakenVehicleStatus(device.id),
+      plannedDispatches: await getKrakenPlannedDispatches(device.id),
+    }))
+  );
+
+  return vehicles;
+}
+
+function formatSmartControl(state: string | null) {
+  switch (state) {
+    case "SMART_CONTROL_CAPABLE":
+      return "Smart Control ready";
+    case "SMART_CONTROL_IN_PROGRESS":
+      return "Smart Control active";
+    case "SMART_CONTROL_NOT_AVAILABLE":
+      return "Smart Control unavailable";
+    case "BOOSTING":
+      return "Boost charging";
+    default:
+      return state ?? "Unknown";
+  }
+}
+
+export default async function Home() {
+  const vehicles = await getVehicles();
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
+    <main className="min-h-screen bg-zinc-950 px-6 py-10 text-white">
+      <div className="mx-auto max-w-5xl">
+        <div className="mb-10">
+          <p className="mb-2 text-sm font-medium uppercase tracking-widest text-emerald-400">
+            Home Energy Platform
+          </p>
+
+          <h1 className="text-4xl font-semibold tracking-tight">
+            Electric Vehicles
           </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
+
+          <p className="mt-3 text-zinc-400">
+            Live vehicle data from Kraken Flex
           </p>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+
+        <div className="grid gap-6 md:grid-cols-2">
+          {vehicles.map((vehicle) => {
+            const soc = Number(vehicle.status.stateOfCharge?.value ?? 0);
+            const activePower = Number(vehicle.status.activePower?.value ?? 0);
+            const schedule = vehicle.preferences?.schedules?.[0];
+            const readyBy = schedule?.time?.slice(0, 5) ?? "Not set";
+            const targetSoc = schedule?.max ?? null;
+
+            const plannedDispatches = vehicle.plannedDispatches ?? [];
+
+            const plannedEnergy = plannedDispatches.reduce(
+              (total, dispatch) =>
+                total + Math.abs(Number(dispatch.energyAddedKwh ?? 0)),
+              0
+            );
+
+            const firstDispatch = plannedDispatches[0] ?? null;
+            const lastDispatch =
+              plannedDispatches[plannedDispatches.length - 1] ?? null;
+            return (
+              <section
+                key={vehicle.id}
+                className="rounded-3xl border border-zinc-800 bg-zinc-900 p-7"
+              >
+                <div className="mb-8">
+                  <p className="text-sm text-zinc-500">{vehicle.provider}</p>
+                  <h2 className="mt-1 text-2xl font-semibold">
+                    {vehicle.name}
+                  </h2>
+                </div>
+
+                <div className="mb-3 flex items-end justify-between">
+                  <span className="text-sm text-zinc-400">Battery</span>
+                  <span className="text-4xl font-semibold">{soc}%</span>
+                </div>
+
+                <div className="mb-8 h-3 overflow-hidden rounded-full bg-zinc-800">
+                  <div
+                    className="h-full rounded-full bg-emerald-400"
+                    style={{ width: `${Math.min(soc, 100)}%` }}
+                  />
+                </div>
+
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="rounded-2xl bg-zinc-800/70 p-4">
+                    <p className="text-xs uppercase tracking-wide text-zinc-500">
+                      Battery Capacity
+                    </p>
+                    <p className="mt-2 font-medium">
+                      {Number(vehicle.vehicleBatterySize).toFixed(1)} kWh
+                    </p>
+                  </div>
+                  <div className="rounded-2xl bg-zinc-800/70 p-4">
+                    <p className="text-xs uppercase tracking-wide text-zinc-500">
+                      Charger Power
+                    </p>
+                    <p className="mt-2 font-medium">
+                      {Number(vehicle.chargePointPowerOutput).toFixed(1)} kW
+                    </p>
+                  </div>
+                  <div className="rounded-2xl bg-zinc-800/70 p-4">
+                    <p className="text-xs uppercase tracking-wide text-zinc-500">
+                      Ready By
+                    </p>
+                    <p className="mt-2 font-medium">
+                      {readyBy}
+                    </p>
+                  </div>
+                  <div className="rounded-2xl bg-zinc-800/70 p-4">
+                    <p className="text-xs uppercase tracking-wide text-zinc-500">
+                      Target
+                    </p>
+                    <p className="mt-2 font-medium">
+                      {targetSoc !== null ? `${targetSoc}%` : "Not set"}
+                    </p>
+                  </div>
+                  <div className="rounded-2xl bg-zinc-800/70 p-4">
+                    <p className="text-xs uppercase tracking-wide text-zinc-500">
+
+
+                      Smart Control
+                    </p>
+                    <p className="mt-2 font-medium">
+                      {formatSmartControl(vehicle.status.currentState)}
+                    </p>
+                  </div>
+
+                  <div className="rounded-2xl bg-zinc-800/70 p-4">
+                    <p className="text-xs uppercase tracking-wide text-zinc-500">
+                      Charging
+                    </p>
+                    <p className="mt-2 font-medium">
+                      {activePower > 0
+                        ? `${activePower.toFixed(1)} kW`
+                        : "Not charging"}
+                    </p>
+                  </div>
+                </div>
+                <div className="mt-6 border-t border-zinc-800 pt-6">
+                  <p className="text-xs uppercase tracking-wide text-zinc-500">
+                    Kraken Plan
+                  </p>
+
+                  {firstDispatch && lastDispatch ? (
+                    <div className="mt-3">
+                      <p className="text-lg font-medium">
+                        {plannedEnergy.toFixed(2)} kWh planned
+                      </p>
+
+                      <p className="mt-1 text-sm text-zinc-400">
+                        {new Date(firstDispatch.start).toLocaleTimeString(
+                          "en-GB",
+                          {
+                            hour: "2-digit",
+                            minute: "2-digit",
+                            timeZone: "Europe/London",
+                          }
+                        )}
+                        {" → "}
+                        {new Date(lastDispatch.end).toLocaleTimeString("en-GB", {
+                          hour: "2-digit",
+                          minute: "2-digit",
+                          timeZone: "Europe/London",
+                        })}
+                      </p>
+                    </div>
+                  ) : (
+                    <p className="mt-3 text-sm text-zinc-400">
+                      No charging plan currently available
+                    </p>
+                  )}
+                </div>
+              </section>
+            );
+          })}
         </div>
-      </main>
-    </div>
+      </div>
+    </main>
   );
 }
