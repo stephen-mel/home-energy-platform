@@ -88,6 +88,17 @@ export type KrakenDevice = {
       upperLimit: number | null;
     }>;
   } | null;
+
+  preferenceSetting: {
+    scheduleSettings: Array<{
+      timeFrom: string | null;
+      timeTo: string | null;
+      timeStep: number;
+      min: string | null;
+      max: string | null;
+      step: string;
+    }>;
+  } | null;
 };
 
 export async function getKrakenDevices(): Promise<KrakenDevice[]> {
@@ -106,9 +117,11 @@ export async function getKrakenDevices(): Promise<KrakenDevice[]> {
       name
       deviceType
       provider
+
       ... on SmartFlexVehicle {
         vehicleBatterySize
         chargePointPowerOutput
+
         preferences {
           ... on SmartFlexDevicePreferences {
             schedules {
@@ -117,6 +130,21 @@ export async function getKrakenDevices(): Promise<KrakenDevice[]> {
               min
               max
               upperLimit
+            }
+          }
+        }
+
+        preferenceSetting {
+          ... on FlexDevicePreferenceSetting {
+            scheduleSettings {
+              ... on FlexDevicePreferenceScheduleSetting {
+                timeFrom
+                timeTo
+                timeStep
+                min
+                max
+                step
+              }
             }
           }
         }
@@ -224,4 +252,51 @@ export async function getKrakenPlannedDispatches(
   }>(query, token);
 
   return data.flexPlannedDispatches ?? [];
+}
+
+export type KrakenPreferenceSchedule = {
+  dayOfWeek: string;
+  time: string;
+  min: number | null;
+  max: number;
+};
+
+export async function setKrakenVehiclePreferences(
+  deviceId: string,
+  schedules: KrakenPreferenceSchedule[]
+) {
+  const token = await getKrakenToken();
+
+  const scheduleInput = schedules
+    .map(
+      (schedule) => `{
+        dayOfWeek: ${schedule.dayOfWeek}
+        time: "${schedule.time}"
+        ${schedule.min !== null
+          ? `min: ${schedule.min}`
+          : ""
+        }
+        max: ${schedule.max}
+      }`
+    )
+    .join("\n");
+
+  const query = `
+    mutation {
+      setDevicePreferences(
+        input: {
+          deviceId: ${JSON.stringify(deviceId)}
+          mode: CHARGE
+          unit: PERCENTAGE
+          schedules: [
+            ${scheduleInput}
+          ]
+        }
+      ) {
+        __typename
+      }
+    }
+  `;
+
+  return krakenGraphQL(query, token);
 }

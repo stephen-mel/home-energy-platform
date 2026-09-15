@@ -4,6 +4,8 @@ import {
   getKrakenVehicleStatus,
 } from "../lib/kraken/client";
 
+import ReadyByControl from "../components/ReadyByControl";
+
 type VehicleStatus = {
   currentState: string | null;
   isSuspended: boolean | null;
@@ -36,6 +38,16 @@ type Vehicle = {
       min: number | null;
       max: number | null;
       upperLimit: number | null;
+    }>;
+  } | null;
+  preferenceSetting: {
+    scheduleSettings: Array<{
+      timeFrom: string | null;
+      timeTo: string | null;
+      timeStep: number;
+      min: string | null;
+      max: string | null;
+      step: string;
     }>;
   } | null;
   plannedDispatches: PlannedDispatch[];
@@ -98,6 +110,26 @@ export default async function Home() {
             const schedule = vehicle.preferences?.schedules?.[0];
             const readyBy = schedule?.time?.slice(0, 5) ?? "Not set";
             const targetSoc = schedule?.max ?? null;
+            const scheduleSetting =
+              vehicle.preferenceSetting?.scheduleSettings?.[0] ?? null;
+
+            const readyByFrom = scheduleSetting?.timeFrom?.slice(0, 5) ?? null;
+            const readyByTo = scheduleSetting?.timeTo?.slice(0, 5) ?? null;
+            const readyByStep = scheduleSetting?.timeStep ?? null;
+
+            const targetMin =
+              scheduleSetting?.min !== null && scheduleSetting?.min !== undefined
+                ? Number(scheduleSetting.min)
+                : null;
+
+            const targetMax =
+              scheduleSetting?.max !== null && scheduleSetting?.max !== undefined
+                ? Number(scheduleSetting.max)
+                : null;
+
+            const targetStep = scheduleSetting?.step
+              ? Number(scheduleSetting.step)
+              : null;
 
             const plannedDispatches = vehicle.plannedDispatches ?? [];
 
@@ -155,10 +187,25 @@ export default async function Home() {
                     <p className="text-xs uppercase tracking-wide text-zinc-500">
                       Ready By
                     </p>
-                    <p className="mt-2 font-medium">
-                      {readyBy}
-                    </p>
+                    {readyByFrom && readyByTo && readyByStep ? (
+                      <ReadyByControl
+                        deviceId={vehicle.id}
+                        value={readyBy}
+                        timeFrom={readyByFrom}
+                        timeTo={readyByTo}
+                        timeStep={readyByStep}
+                      />
+                    ) : (
+                      <p className="mt-2 font-medium">{readyBy}</p>
+                    )}
+
+                    {readyByFrom && readyByTo && readyByStep && (
+                      <p className="mt-1 text-xs text-zinc-500">
+                        {readyByFrom}–{readyByTo} · {readyByStep} min steps
+                      </p>
+                    )}
                   </div>
+
                   <div className="rounded-2xl bg-zinc-800/70 p-4">
                     <p className="text-xs uppercase tracking-wide text-zinc-500">
                       Target
@@ -166,11 +213,16 @@ export default async function Home() {
                     <p className="mt-2 font-medium">
                       {targetSoc !== null ? `${targetSoc}%` : "Not set"}
                     </p>
+
+                    {targetMin !== null && targetMax !== null && targetStep !== null && (
+                      <p className="mt-1 text-xs text-zinc-500">
+                        {targetMin}–{targetMax}% · {targetStep}% steps
+                      </p>
+                    )}
                   </div>
+
                   <div className="rounded-2xl bg-zinc-800/70 p-4">
                     <p className="text-xs uppercase tracking-wide text-zinc-500">
-
-
                       Smart Control
                     </p>
                     <p className="mt-2 font-medium">
@@ -200,22 +252,46 @@ export default async function Home() {
                         {plannedEnergy.toFixed(2)} kWh planned
                       </p>
 
-                      <p className="mt-1 text-sm text-zinc-400">
-                        {new Date(firstDispatch.start).toLocaleTimeString(
-                          "en-GB",
-                          {
-                            hour: "2-digit",
-                            minute: "2-digit",
-                            timeZone: "Europe/London",
-                          }
-                        )}
-                        {" → "}
-                        {new Date(lastDispatch.end).toLocaleTimeString("en-GB", {
-                          hour: "2-digit",
-                          minute: "2-digit",
-                          timeZone: "Europe/London",
+                      <div className="mt-3 space-y-2">
+                        {plannedDispatches.map((dispatch, index) => {
+                          const start = new Date(dispatch.start).toLocaleTimeString(
+                            "en-GB",
+                            {
+                              hour: "2-digit",
+                              minute: "2-digit",
+                              timeZone: "Europe/London",
+                            }
+                          );
+
+                          const end = new Date(dispatch.end).toLocaleTimeString(
+                            "en-GB",
+                            {
+                              hour: "2-digit",
+                              minute: "2-digit",
+                              timeZone: "Europe/London",
+                            }
+                          );
+
+                          const energy = Math.abs(
+                            Number(dispatch.energyAddedKwh ?? 0)
+                          );
+
+                          return (
+                            <div
+                              key={`${dispatch.start}-${index}`}
+                              className="flex items-center justify-between text-sm"
+                            >
+                              <span className="text-zinc-400">
+                                {start} → {end}
+                              </span>
+
+                              <span className="font-medium">
+                                {energy.toFixed(2)} kWh
+                              </span>
+                            </div>
+                          );
                         })}
-                      </p>
+                      </div>
                     </div>
                   ) : (
                     <p className="mt-3 text-sm text-zinc-400">

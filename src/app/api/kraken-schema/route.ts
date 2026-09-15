@@ -7,11 +7,14 @@ export async function GET() {
     try {
         const token = await getKrakenToken();
 
-        const query = `
+const query = `
   query {
-    __type(name: "SmartFlexDispatch") {
+    __type(name: "FlexDevicePreferenceScheduleSettingInterface") {
       name
       kind
+      possibleTypes {
+        name
+      }
       fields {
         name
         type {
