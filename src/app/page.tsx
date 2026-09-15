@@ -6,6 +6,7 @@ import {
 
 import ReadyByControl from "../components/ReadyByControl";
 import TargetSocControl from "../components/TargetSocControl";
+import { getPowerwallStatus } from "../lib/home-assistant/client";
 
 
 type VehicleStatus = {
@@ -87,6 +88,7 @@ function formatSmartControl(state: string | null) {
 
 export default async function Home() {
   const vehicles = await getVehicles();
+  const powerwall = await getPowerwallStatus();
 
   return (
     <main className="min-h-screen bg-zinc-950 px-6 py-10 text-white">
@@ -103,6 +105,62 @@ export default async function Home() {
           <p className="mt-3 text-zinc-400">
             Live vehicle data from Kraken Flex
           </p>
+        </div>
+
+        <div className="mb-10 rounded-3xl border border-zinc-800 bg-zinc-900 p-6">
+          <div className="mb-6">
+            <p className="text-sm font-medium uppercase tracking-widest text-emerald-400">
+              Live Home Energy
+            </p>
+            <h2 className="mt-2 text-2xl font-semibold">Powerwall & Home</h2>
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+            <div className="rounded-2xl bg-zinc-800/70 p-4">
+              <p className="text-xs uppercase tracking-wide text-zinc-500">
+                Powerwall
+              </p>
+              <p className="mt-2 text-xl font-medium">
+                {powerwall.batterySoc}%
+              </p>
+            </div>
+
+            <div className="rounded-2xl bg-zinc-800/70 p-4">
+              <p className="text-xs uppercase tracking-wide text-zinc-500">
+                Solar
+              </p>
+              <p className="mt-2 text-xl font-medium">
+                {powerwall.solarPower.toFixed(2)} kW
+              </p>
+            </div>
+
+            <div className="rounded-2xl bg-zinc-800/70 p-4">
+              <p className="text-xs uppercase tracking-wide text-zinc-500">
+                House
+              </p>
+              <p className="mt-2 text-xl font-medium">
+                {powerwall.housePower.toFixed(2)} kW
+              </p>
+            </div>
+
+            <div className="rounded-2xl bg-zinc-800/70 p-4">
+              <p className="text-xs uppercase tracking-wide text-zinc-500">
+                Battery
+              </p>
+              <p className="mt-2 text-xl font-medium">
+                {powerwall.batteryPower.toFixed(2)} kW
+              </p>
+            </div>
+
+            <div className="rounded-2xl bg-zinc-800/70 p-4">
+              <p className="text-xs uppercase tracking-wide text-zinc-500">
+                Grid
+              </p>
+              <p className="mt-2 text-xl font-medium">
+                {powerwall.gridPower.toFixed(2)} kW
+              </p>
+            </div>
+          </div>
         </div>
 
         <div className="grid gap-6 md:grid-cols-2">
@@ -217,7 +275,7 @@ export default async function Home() {
                       targetMax !== null &&
                       targetStep !== null ? (
                       <TargetSocControl
-                      deviceId={vehicle.id}
+                        deviceId={vehicle.id}
                         value={targetSoc}
                         min={targetMin}
                         max={targetMax}
