@@ -5,6 +5,8 @@ import {
 } from "../lib/kraken/client";
 
 import ReadyByControl from "../components/ReadyByControl";
+import TargetSocControl from "../components/TargetSocControl";
+
 
 type VehicleStatus = {
   currentState: string | null;
@@ -210,9 +212,22 @@ export default async function Home() {
                     <p className="text-xs uppercase tracking-wide text-zinc-500">
                       Target
                     </p>
-                    <p className="mt-2 font-medium">
-                      {targetSoc !== null ? `${targetSoc}%` : "Not set"}
-                    </p>
+                    {targetSoc !== null &&
+                      targetMin !== null &&
+                      targetMax !== null &&
+                      targetStep !== null ? (
+                      <TargetSocControl
+                      deviceId={vehicle.id}
+                        value={targetSoc}
+                        min={targetMin}
+                        max={targetMax}
+                        step={targetStep}
+                      />
+                    ) : (
+                      <p className="mt-2 font-medium">
+                        {targetSoc !== null ? `${targetSoc}%` : "Not set"}
+                      </p>
+                    )}
 
                     {targetMin !== null && targetMax !== null && targetStep !== null && (
                       <p className="mt-1 text-xs text-zinc-500">

@@ -9,12 +9,23 @@ export async function POST(request: Request) {
 
         const deviceId = body.deviceId;
         const readyBy = body.readyBy;
+        const targetSoc = body.targetSoc;
 
-        if (!deviceId || !readyBy) {
+        if (!deviceId) {
             return Response.json(
                 {
                     success: false,
-                    message: "deviceId and readyBy are required",
+                    message: "deviceId is required",
+                },
+                { status: 400 }
+            );
+        }
+
+        if (readyBy === undefined && targetSoc === undefined) {
+            return Response.json(
+                {
+                    success: false,
+                    message: "readyBy or targetSoc is required",
                 },
                 { status: 400 }
             );
@@ -39,47 +50,104 @@ export async function POST(request: Request) {
             throw new Error(`${device.name} has no preference settings`);
         }
 
-        const timeFrom = scheduleSetting.timeFrom?.slice(0, 5);
-        const timeTo = scheduleSetting.timeTo?.slice(0, 5);
-        const timeStep = scheduleSetting.timeStep;
+        let newReadyBy =
+            device.preferences.schedules[0].time.slice(0, 5);
 
-        if (!timeFrom || !timeTo) {
-            throw new Error("Kraken did not provide Ready By constraints");
+        let newTargetSoc =
+            device.preferences.schedules[0].max ?? 100;
+
+        if (readyBy !== undefined) {
+            const timeFrom = scheduleSetting.timeFrom?.slice(0, 5);
+            const timeTo = scheduleSetting.timeTo?.slice(0, 5);
+            const timeStep = scheduleSetting.timeStep;
+
+            if (!timeFrom || !timeTo) {
+                throw new Error(
+                    "Kraken did not provide Ready By constraints"
+                );
+            }
+
+            const timeToMinutes = (time: string) => {
+                const [hours, minutes] = time.split(":").map(Number);
+                return hours * 60 + minutes;
+            };
+
+            const requestedMinutes = timeToMinutes(readyBy);
+            const fromMinutes = timeToMinutes(timeFrom);
+            const toMinutes = timeToMinutes(timeTo);
+
+            const isWithinRange =
+                requestedMinutes >= fromMinutes &&
+                requestedMinutes <= toMinutes;
+
+            const isValidStep =
+                (requestedMinutes - fromMinutes) % timeStep === 0;
+
+            if (!isWithinRange || !isValidStep) {
+                return Response.json(
+                    {
+                        success: false,
+                        message: `Ready By must be between ${timeFrom} and ${timeTo} in ${timeStep}-minute steps`,
+                    },
+                    { status: 400 }
+                );
+            }
+
+            newReadyBy = readyBy;
         }
 
-        const timeToMinutes = (time: string) => {
-            const [hours, minutes] = time.split(":").map(Number);
-            return hours * 60 + minutes;
-        };
+        if (targetSoc !== undefined) {
+            const targetMin =
+                scheduleSetting.min !== null
+                    ? Number(scheduleSetting.min)
+                    : null;
 
-        const requestedMinutes = timeToMinutes(readyBy);
-        const fromMinutes = timeToMinutes(timeFrom);
-        const toMinutes = timeToMinutes(timeTo);
+            const targetMax =
+                scheduleSetting.max !== null
+                    ? Number(scheduleSetting.max)
+                    : null;
 
-        const isWithinRange =
-            requestedMinutes >= fromMinutes &&
-            requestedMinutes <= toMinutes;
+            const targetStep = Number(scheduleSetting.step);
 
-        const isValidStep =
-            (requestedMinutes - fromMinutes) % timeStep === 0;
+            if (targetMin === null || targetMax === null) {
+                throw new Error(
+                    "Kraken did not provide Target SOC constraints"
+                );
+            }
 
-        if (!isWithinRange || !isValidStep) {
-            return Response.json(
-                {
-                    success: false,
-                    message: `Ready By must be between ${timeFrom} and ${timeTo} in ${timeStep}-minute steps`,
-                },
-                { status: 400 }
-            );
+            const requestedTarget = Number(targetSoc);
+
+            const isWithinRange =
+                requestedTarget >= targetMin &&
+                requestedTarget <= targetMax;
+
+            const isValidStep =
+                (requestedTarget - targetMin) % targetStep === 0;
+
+            if (
+                !Number.isFinite(requestedTarget) ||
+                !isWithinRange ||
+                !isValidStep
+            ) {
+                return Response.json(
+                    {
+                        success: false,
+                        message: `Target SOC must be between ${targetMin}% and ${targetMax}% in ${targetStep}% steps`,
+                    },
+                    { status: 400 }
+                );
+            }
+
+            newTargetSoc = requestedTarget;
         }
 
-        const krakenTime = `${readyBy}:00`;
+        const krakenTime = `${newReadyBy}:00`;
 
         const schedules = device.preferences.schedules.map((schedule) => ({
             dayOfWeek: schedule.dayOfWeek,
             time: krakenTime,
             min: schedule.min,
-            max: schedule.max ?? 100,
+            max: newTargetSoc,
         }));
 
         const result = await setKrakenVehiclePreferences(
@@ -89,8 +157,9 @@ export async function POST(request: Request) {
 
         return Response.json({
             success: true,
-            message: `${device.name} Ready By changed to ${readyBy}`,
-            readyBy,
+            message: `${device.name} preferences updated`,
+            readyBy: newReadyBy,
+            targetSoc: newTargetSoc,
             result,
         });
     } catch (error) {
