@@ -8,6 +8,7 @@ import ReadyByControl from "../components/ReadyByControl";
 import TargetSocControl from "../components/TargetSocControl";
 import { getPowerwallStatus } from "../lib/home-assistant/client";
 
+export const dynamic = "force-dynamic";
 
 type VehicleStatus = {
   currentState: string | null;
