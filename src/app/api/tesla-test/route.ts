@@ -1,13 +1,36 @@
-import { getTeslaProducts } from "../../../lib/tesla/client";
+import {
+    getTeslaProducts,
+    getTeslaSiteInfo,
+} from "../../../lib/tesla/client";
 
 export async function GET() {
     try {
         const products = await getTeslaProducts();
 
+        const energyProduct = products.response?.find(
+            (product: { energy_site_id?: number }) =>
+                product.energy_site_id
+        );
+
+        if (!energyProduct?.energy_site_id) {
+            return Response.json(
+                {
+                    success: false,
+                    message: "No Tesla energy site found",
+                },
+                { status: 404 }
+            );
+        }
+
+        const siteInfo = await getTeslaSiteInfo(
+            energyProduct.energy_site_id
+        );
+
         return Response.json({
             success: true,
-            message: "Tesla Fleet API connection successful",
-            products,
+            message: "Tesla Fleet API site info retrieved",
+            energySiteId: energyProduct.energy_site_id,
+            siteInfo,
         });
     } catch (error) {
         console.error("Tesla Fleet API test failed:", error);

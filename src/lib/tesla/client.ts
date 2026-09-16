@@ -47,3 +47,35 @@ export async function getTeslaProducts() {
 
     return response.json();
 }
+
+export async function getTeslaSiteInfo(
+    energySiteId: number
+) {
+    const tokens = await getTeslaTokens();
+
+    const response = await fetch(
+        `https://fleet-api.prd.eu.vn.cloud.tesla.com/api/1/energy_sites/${energySiteId}/site_info`,
+        {
+            headers: {
+                Authorization: `Bearer ${tokens.access_token}`,
+            },
+            cache: "no-store",
+        }
+    );
+
+    if (!response.ok) {
+        const errorText = await response.text();
+
+        console.error(
+            "Tesla Fleet API site info request failed:",
+            response.status,
+            errorText
+        );
+
+        throw new Error(
+            `Tesla Fleet API site info HTTP error ${response.status}`
+        );
+    }
+
+    return response.json();
+}
