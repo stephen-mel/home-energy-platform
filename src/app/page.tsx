@@ -1,8 +1,5 @@
-import {
-  getKrakenDevices,
-  getKrakenPlannedDispatches,
-  getKrakenVehicleStatus,
-} from "../lib/kraken/client";
+import { getCurrentSite } from "../lib/site/repository";
+import { getSiteState } from "../lib/site/get-site-state";
 
 import ReadyByControl from "../components/ReadyByControl";
 import TargetSocControl from "../components/TargetSocControl";
@@ -10,67 +7,7 @@ import { getPowerwallStatus } from "../lib/home-assistant/client";
 
 export const dynamic = "force-dynamic";
 
-type VehicleStatus = {
-  currentState: string | null;
-  isSuspended: boolean | null;
-  stateOfCharge: {
-    value: number | null;
-  } | null;
-  activePower: {
-    value: number | null;
-  } | null;
-};
 
-type PlannedDispatch = {
-  start: string;
-  end: string;
-  type: string;
-  energyAddedKwh: string | null;
-};
-
-type Vehicle = {
-  id: string;
-  name: string;
-  deviceType: string;
-  provider: string;
-  vehicleBatterySize: string | null;
-  chargePointPowerOutput: string | null;
-  preferences: {
-    schedules: Array<{
-      dayOfWeek: string;
-      time: string;
-      min: number | null;
-      max: number | null;
-      upperLimit: number | null;
-    }>;
-  } | null;
-  preferenceSetting: {
-    scheduleSettings: Array<{
-      timeFrom: string | null;
-      timeTo: string | null;
-      timeStep: number;
-      min: string | null;
-      max: string | null;
-      step: string;
-    }>;
-  } | null;
-  plannedDispatches: PlannedDispatch[];
-  status: VehicleStatus;
-};
-
-async function getVehicles(): Promise<Vehicle[]> {
-  const devices = await getKrakenDevices();
-
-  const vehicles = await Promise.all(
-    devices.map(async (device) => ({
-      ...device,
-      status: await getKrakenVehicleStatus(device.id),
-      plannedDispatches: await getKrakenPlannedDispatches(device.id),
-    }))
-  );
-
-  return vehicles;
-}
 
 function formatSmartControl(state: string | null) {
   switch (state) {
@@ -88,7 +25,11 @@ function formatSmartControl(state: string | null) {
 }
 
 export default async function Home() {
-  const vehicles = await getVehicles();
+  const site = await getCurrentSite();
+  const siteState = await getSiteState(site);
+
+  const vehicles = siteState.integrations.kraken.data?.vehicles ?? [];
+  const krakenError = siteState.integrations.kraken.error;
   const powerwall = await getPowerwallStatus();
 
   return (
