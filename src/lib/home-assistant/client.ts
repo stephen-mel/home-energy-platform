@@ -14,6 +14,7 @@ export async function getHomeAssistantStates() {
                 "Content-Type": "application/json",
             },
             cache: "no-store",
+            signal: AbortSignal.timeout(5_000),
         }
     );
 
@@ -38,6 +39,7 @@ export async function getHomeAssistantState(entityId: string) {
                 "Content-Type": "application/json",
             },
             cache: "no-store",
+            signal: AbortSignal.timeout(5_000),
         }
     );
 
@@ -48,45 +50,4 @@ export async function getHomeAssistantState(entityId: string) {
     }
 
     return response.json();
-}
-export type PowerwallStatus = {
-    batterySoc: number;
-    solarPower: number;
-    housePower: number;
-    batteryPower: number;
-    gridPower: number;
-};
-
-export async function getPowerwallStatus(): Promise<PowerwallStatus> {
-    const [
-        batterySoc,
-        solarPower,
-        housePower,
-        batteryPower,
-        gridPower,
-    ] = await Promise.all([
-        getHomeAssistantState(
-            "sensor.powerwall_192_168_68_74_charge"
-        ),
-        getHomeAssistantState(
-            "sensor.powerwall_192_168_68_74_solar_power"
-        ),
-        getHomeAssistantState(
-            "sensor.powerwall_192_168_68_74_load_power"
-        ),
-        getHomeAssistantState(
-            "sensor.powerwall_192_168_68_74_battery_power"
-        ),
-        getHomeAssistantState(
-            "sensor.powerwall_192_168_68_74_site_power"
-        ),
-    ]);
-
-    return {
-        batterySoc: Number(batterySoc.state),
-        solarPower: Number(solarPower.state),
-        housePower: Number(housePower.state),
-        batteryPower: Number(batteryPower.state),
-        gridPower: Number(gridPower.state),
-    };
 }

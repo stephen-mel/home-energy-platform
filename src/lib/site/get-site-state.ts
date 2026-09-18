@@ -1,3 +1,4 @@
+import { getHomeAssistantSiteState, type HomeAssistantState } from "./home-assistant-state";
 import type { Site } from "./types";
 import {
     getKrakenState,
@@ -16,7 +17,7 @@ export type SiteState = {
 
     integrations: {
         kraken: IntegrationState<KrakenState>;
-        homeAssistant: IntegrationState<unknown>;
+        homeAssistant: IntegrationState<HomeAssistantState>;
         tesla: IntegrationState<unknown>;
     };
 };
@@ -25,37 +26,18 @@ export async function getSiteState(
     site: Site
 ): Promise<SiteState> {
 
-    let krakenData: KrakenState | null = null;
-    let krakenError: string | null = null;
-
-    if (site.integrations.kraken.enabled) {
-        try {
-            krakenData = await getKrakenState();
-        } catch (error) {
-            console.error("Kraken site state failed:", error);
-
-            krakenError =
-                error instanceof Error
-                    ? error.message
-                    : "Kraken is currently unavailable";
-        }
-    }
+    const [kraken, homeAssistant] = await Promise.all([
+        loadIntegration(site.integrations.kraken.enabled, getKrakenState),
+        loadIntegration(site.integrations.homeAssistant.enabled, () =>
+            getHomeAssistantSiteState(site.integrations.homeAssistant)),
+    ]);
     return {
         site,
         updatedAt: new Date().toISOString(),
 
         integrations: {
-            kraken: {
-                enabled: site.integrations.kraken.enabled,
-                data: krakenData,
-                error: krakenError,
-            },
-
-            homeAssistant: {
-                enabled: site.integrations.homeAssistant.enabled,
-                data: null,
-                error: null,
-            },
+            kraken,
+            homeAssistant,
 
             tesla: {
                 enabled: site.integrations.tesla.enabled,
@@ -64,4 +46,20 @@ export async function getSiteState(
             },
         },
     };
+}
+async function loadIntegration<T>(
+    enabled: boolean,
+    load: () => Promise<T>
+): Promise<IntegrationState<T>> {
+    if (!enabled) return { enabled, data: null, error: null };
+    try {
+        return { enabled, data: await load(), error: null };
+    } catch (error) {
+        console.error("Site integration failed:", error);
+        return {
+            enabled,
+            data: null,
+            error: error instanceof Error ? error.message : "Integration is currently unavailable",
+        };
+    }
 }

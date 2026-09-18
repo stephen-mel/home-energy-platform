@@ -3,7 +3,7 @@ import { getSiteState } from "../lib/site/get-site-state";
 
 import ReadyByControl from "../components/ReadyByControl";
 import TargetSocControl from "../components/TargetSocControl";
-import { getPowerwallStatus } from "../lib/home-assistant/client";
+import { getSmartControlSetting } from "../lib/site/kraken-state";
 
 export const dynamic = "force-dynamic";
 
@@ -28,9 +28,10 @@ export default async function Home() {
   const site = await getCurrentSite();
   const siteState = await getSiteState(site);
 
-  const vehicles = siteState.integrations.kraken.data?.vehicles ?? [];
+  const kraken = siteState.integrations.kraken.data;
+  const vehicles = kraken?.vehicles ?? [];
   const krakenError = siteState.integrations.kraken.error;
-  const powerwall = await getPowerwallStatus();
+  const homeAssistant = siteState.integrations.homeAssistant;
 
   return (
     <main className="min-h-screen bg-zinc-950 px-6 py-10 text-white">
@@ -45,65 +46,50 @@ export default async function Home() {
           </h1>
 
           <p className="mt-3 text-zinc-400">
-            Live vehicle data from Kraken Flex
+            {kraken?.stale ? "Last known vehicle data from Kraken Flex" : "Live vehicle data from Kraken Flex"}
           </p>
         </div>
 
-        <div className="mb-10 rounded-3xl border border-zinc-800 bg-zinc-900 p-6">
-          <div className="mb-6">
-            <p className="text-sm font-medium uppercase tracking-widest text-emerald-400">
-              Live Home Energy
-            </p>
-            <h2 className="mt-2 text-2xl font-semibold">Powerwall & Home</h2>
-          </div>
-
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
-            <div className="rounded-2xl bg-zinc-800/70 p-4">
-              <p className="text-xs uppercase tracking-wide text-zinc-500">
-                Powerwall
+        {homeAssistant.error && (
+          <p className="mb-6 text-sm text-zinc-400">
+            Home energy data is currently unavailable.
+          </p>
+        )}
+        {homeAssistant.data?.assets.map((asset) => (
+          <div key={asset.id} className="mb-10 rounded-3xl border border-zinc-800 bg-zinc-900 p-6">
+            <div className="mb-6">
+              <p className="text-sm font-medium uppercase tracking-widest text-emerald-400">
+                Live Home Energy
               </p>
-              <p className="mt-2 text-xl font-medium">
-                {powerwall.batterySoc}%
-              </p>
+              <h2 className="mt-2 text-2xl font-semibold">{asset.name}</h2>
             </div>
-
-            <div className="rounded-2xl bg-zinc-800/70 p-4">
-              <p className="text-xs uppercase tracking-wide text-zinc-500">
-                Solar
-              </p>
-              <p className="mt-2 text-xl font-medium">
-                {powerwall.solarPower.toFixed(2)} kW
-              </p>
-            </div>
-
-            <div className="rounded-2xl bg-zinc-800/70 p-4">
-              <p className="text-xs uppercase tracking-wide text-zinc-500">
-                House
-              </p>
-              <p className="mt-2 text-xl font-medium">
-                {powerwall.housePower.toFixed(2)} kW
-              </p>
-            </div>
-
-            <div className="rounded-2xl bg-zinc-800/70 p-4">
-              <p className="text-xs uppercase tracking-wide text-zinc-500">
-                Battery
-              </p>
-              <p className="mt-2 text-xl font-medium">
-                {powerwall.batteryPower.toFixed(2)} kW
-              </p>
-            </div>
-
-            <div className="rounded-2xl bg-zinc-800/70 p-4">
-              <p className="text-xs uppercase tracking-wide text-zinc-500">
-                Grid
-              </p>
-              <p className="mt-2 text-xl font-medium">
-                {powerwall.gridPower.toFixed(2)} kW
-              </p>
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+              {asset.metrics.map((metric) => (
+                <div key={metric.entityId} className="rounded-2xl bg-zinc-800/70 p-4">
+                  <p className="text-xs uppercase tracking-wide text-zinc-500">{metric.label}</p>
+                  <p className="mt-2 text-xl font-medium">
+                    {metric.value === null ? "Unavailable" :
+                      `${metric.value.toFixed(metric.decimals)}${metric.unit === "%" ? "" : " "}${metric.unit}`}
+                  </p>
+                </div>
+              ))}
             </div>
           </div>
-        </div>
+        ))}
+        {kraken?.stale && (
+          <p role="status" className="mb-6 text-sm text-amber-400">
+            Kraken vehicle data is stale. Showing last known readings. Last successful update:{" "}
+            <time dateTime={kraken.lastSuccessfulUpdate}>
+              {new Date(kraken.lastSuccessfulUpdate).toLocaleString("en-GB", {
+                timeZone: "Europe/London",
+                timeZoneName: "short",
+              })}
+            </time>.
+          </p>
+        )}
+        {krakenError && (
+          <p className="mb-6 text-sm text-zinc-400">Vehicle data is currently unavailable.</p>
+        )}
 
         <div className="grid gap-6 md:grid-cols-2">
           {vehicles.map((vehicle) => {
@@ -241,7 +227,10 @@ export default async function Home() {
                       Smart Control
                     </p>
                     <p className="mt-2 font-medium">
-                      {formatSmartControl(vehicle.status.currentState)}
+                      {getSmartControlSetting(vehicle.status.isSuspended)}
+                    </p>
+                    <p className="mt-1 text-xs text-zinc-500">
+                      Operational state: {formatSmartControl(vehicle.status.currentState)}
                     </p>
                   </div>
 

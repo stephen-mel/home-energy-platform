@@ -62,35 +62,45 @@ export type KrakenVehicleState = {
 
 export type KrakenState = {
     vehicles: KrakenVehicleState[];
+    lastSuccessfulUpdate: string;
+    stale: boolean;
 };
 
- export async function getKrakenState(): Promise<KrakenState> {
-        const now = Date.now();
+// Suspension is a user setting; currentState describes operation independently.
+export function getSmartControlSetting(isSuspended: boolean | null): string {
+    if (isSuspended === false) return "Enabled";
+    if (isSuspended === true) return "Suspended";
+    return "Unknown";
+}
 
-    if (
-        cachedKrakenState &&
-        now - cachedKrakenStateAt < KRAKEN_CACHE_MS
-    ) {
+export async function getKrakenState(): Promise<KrakenState> {
+    const now = Date.now();
+    if (cachedKrakenState && now - cachedKrakenStateAt < KRAKEN_CACHE_MS) {
         return cachedKrakenState;
     }
 
-    const devices = await getKrakenDevices();
-
-    const vehicles = await Promise.all(
-        devices.map(async (device) => ({
-            ...device,
-            status: await getKrakenVehicleStatus(device.id),
-            plannedDispatches: await getKrakenPlannedDispatches(device.id),
-        }))
-    );
-
-    const state: KrakenState = {
-    vehicles,
-};
-
-cachedKrakenState = state;
-cachedKrakenStateAt = Date.now();
-
-return state;
-
+    try {
+        const devices = await getKrakenDevices();
+        const vehicles = await Promise.all(
+            devices.map(async (device) => ({
+                ...device,
+                status: await getKrakenVehicleStatus(device.id),
+                plannedDispatches: await getKrakenPlannedDispatches(device.id),
+            }))
+        );
+        cachedKrakenStateAt = Date.now();
+        cachedKrakenState = {
+            vehicles,
+            lastSuccessfulUpdate: new Date(cachedKrakenStateAt).toISOString(),
+            stale: false,
+        };
+        return cachedKrakenState;
+    } catch (error) {
+        // Keep the last successful snapshot and retry on the next request.
+        if (cachedKrakenState) {
+            console.error("Kraken refresh failed; using cached data:", error);
+            return { ...cachedKrakenState, stale: true };
+        }
+        throw error;
+    }
 }
