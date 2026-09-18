@@ -1,3 +1,5 @@
+import HomeEnergyPlan from "../components/HomeEnergyPlan";
+import { getSitePriceSignal } from "../lib/site/get-site-price-signal";
 import HomeEnergyTelemetry from "../components/HomeEnergyTelemetry";
 import { getCurrentSite } from "../lib/site/repository";
 import { getSiteState } from "../lib/site/get-site-state";
@@ -58,6 +60,7 @@ export default async function Home() {
             })),
           }} />
         )}
+        <HomeEnergyPlan plan={getSitePriceSignal(site, kraken, siteState.updatedAt)} />
         {kraken?.stale && (
           <p role="status" className="mb-6 text-sm text-amber-400">
             Kraken vehicle data is stale. Showing last known readings. Last successful update:{" "}

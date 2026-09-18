@@ -1,3 +1,4 @@
+import type { TariffConfig } from "../tariff/types";
 import type {
     SiteConstraints,
     SiteIntegrationConfig,
@@ -8,4 +9,5 @@ export type Site = {
     name: string;
     integrations: SiteIntegrationConfig;
     constraints: SiteConstraints;
+    tariff?: TariffConfig;
 };

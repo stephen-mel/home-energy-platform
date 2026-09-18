@@ -1,3 +1,5 @@
+import type { EnergyPrice } from "../tariff/types";
+
 export type HomeEnergyAssetConfig = {
     id: string;
     name: string;
@@ -13,6 +15,7 @@ export type HomeEnergyAssetConfig = {
 export type SiteIntegrationConfig = {
     kraken: {
         enabled: boolean;
+        wholeHomeDispatchRate?: { enabled: boolean; importPrice: EnergyPrice | null };
     };
 
     homeAssistant: {

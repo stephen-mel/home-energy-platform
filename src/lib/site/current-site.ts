@@ -7,6 +7,7 @@ export const currentSite: Site = {
     integrations: {
         kraken: {
             enabled: true,
+            wholeHomeDispatchRate: { enabled: true, importPrice: null },
         },
 
         homeAssistant: {
@@ -27,6 +28,12 @@ export const currentSite: Site = {
         tesla: {
             enabled: true,
         },
+    },
+
+    tariff: {
+        timeZone: "Europe/London",
+        normalImport: null,
+        export: null,
     },
 
     constraints: {
