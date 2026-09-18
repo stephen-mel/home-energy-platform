@@ -1,3 +1,4 @@
+import { normalizeHomeAssistantMetric } from "./home-assistant-metrics";
 import { getHomeAssistantState } from "../home-assistant/client";
 import type { HomeEnergyAssetConfig, SiteIntegrationConfig } from "./config";
 
@@ -6,6 +7,7 @@ export type HomeAssistantState = {
         id: string;
         name: string;
         metrics: Array<HomeEnergyAssetConfig["metrics"][number] & {
+            rawValue: number | null;
             value: number | null;
         }>;
     }>;
@@ -22,13 +24,10 @@ export async function getHomeAssistantSiteState(
         metrics: await Promise.all(asset.metrics.map(async (metric) => {
             try {
                 const entity = await getHomeAssistantState(metric.entityId);
-                const raw: unknown = entity.state;
-                const value = typeof raw === "string" && raw.trim() !== ""
-                    ? Number(raw) : NaN;
-                return { ...metric, value: Number.isFinite(value) ? value : null };
+                return normalizeHomeAssistantMetric(metric, entity.state);
             } catch {
                 // An individual missing or unreachable sensor must not hide healthy readings.
-                return { ...metric, value: null };
+                return normalizeHomeAssistantMetric(metric, null);
             }
         })),
     })));

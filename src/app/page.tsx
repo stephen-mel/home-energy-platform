@@ -1,3 +1,4 @@
+import HomeEnergyTelemetry from "../components/HomeEnergyTelemetry";
 import { getCurrentSite } from "../lib/site/repository";
 import { getSiteState } from "../lib/site/get-site-state";
 
@@ -50,32 +51,13 @@ export default async function Home() {
           </p>
         </div>
 
-        {homeAssistant.error && (
-          <p className="mb-6 text-sm text-zinc-400">
-            Home energy data is currently unavailable.
-          </p>
+        {homeAssistant.enabled && site.integrations.homeAssistant.assets?.some(asset => asset.metrics.length > 0) && (
+          <HomeEnergyTelemetry initial={homeAssistant.data ?? {
+            assets: (site.integrations.homeAssistant.assets ?? []).map(asset => ({
+              ...asset, metrics: asset.metrics.map(metric => ({ ...metric, rawValue: null, value: null })),
+            })),
+          }} />
         )}
-        {homeAssistant.data?.assets.map((asset) => (
-          <div key={asset.id} className="mb-10 rounded-3xl border border-zinc-800 bg-zinc-900 p-6">
-            <div className="mb-6">
-              <p className="text-sm font-medium uppercase tracking-widest text-emerald-400">
-                Live Home Energy
-              </p>
-              <h2 className="mt-2 text-2xl font-semibold">{asset.name}</h2>
-            </div>
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
-              {asset.metrics.map((metric) => (
-                <div key={metric.entityId} className="rounded-2xl bg-zinc-800/70 p-4">
-                  <p className="text-xs uppercase tracking-wide text-zinc-500">{metric.label}</p>
-                  <p className="mt-2 text-xl font-medium">
-                    {metric.value === null ? "Unavailable" :
-                      `${metric.value.toFixed(metric.decimals)}${metric.unit === "%" ? "" : " "}${metric.unit}`}
-                  </p>
-                </div>
-              ))}
-            </div>
-          </div>
-        ))}
         {kraken?.stale && (
           <p role="status" className="mb-6 text-sm text-amber-400">
             Kraken vehicle data is stale. Showing last known readings. Last successful update:{" "}

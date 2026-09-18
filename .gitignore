@@ -43,3 +43,6 @@ next-env.d.ts
 .tesla-tokens.json
 tesla-private-key.pem
 !public/.well-known/appspecific/com.tesla.3p.public-key.pem
+
+# Local last-known integration state (including atomic-write temporary files)
+/.cache/home-energy-platform/

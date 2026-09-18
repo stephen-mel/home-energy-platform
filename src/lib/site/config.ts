@@ -6,6 +6,7 @@ export type HomeEnergyAssetConfig = {
         label: string;
         unit: string;
         decimals: number;
+        normalization?: "powerwall-display-soc";
     }>;
 };
 

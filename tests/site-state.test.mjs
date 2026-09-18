@@ -9,6 +9,11 @@ function load(path, dependencies = {}, globals = {}) {
   const source = ts.transpileModule(fs.readFileSync(path, 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText;
+  dependencies = { './home-assistant-metrics': path.endsWith('home-assistant-state.ts')
+    ? load('src/lib/site/home-assistant-metrics.ts') : {}, './kraken-state-store': {
+    readLastKnownKrakenState: async () => null,
+    writeLastKnownKrakenState: async () => {},
+  }, ...dependencies };
   const exports = {};
   vm.runInNewContext(source, {
     exports,
@@ -141,4 +146,55 @@ test('Rejected, missing and timed-out HA sensors preserve healthy metrics and as
   assert.equal(data.assets[0].metrics[0].value, 42);
   for (const reading of data.assets[0].metrics.slice(1)) assert.equal(reading.value, null);
   assert.equal(data.assets[1].metrics[0].value, 42);
+});
+
+test('Powerwall display SOC is opt-in, clamped, preserves raw SOC and ignores Backup Reserve', () => {
+  const { normalizeHomeAssistantMetric } = load('src/lib/site/home-assistant-metrics.ts');
+  const metric = { entityId: 'sensor.soc', label: 'SOC', unit: '%', decimals: 0,
+    normalization: 'powerwall-display-soc', backupReserve: 10 };
+  const reading = normalizeHomeAssistantMetric(metric, '21');
+  assert.equal(reading.rawValue, 21);
+  assert.ok(Math.abs(reading.value - 16.842105263157894) < 1e-10);
+  assert.equal(reading.value.toFixed(metric.decimals), '17');
+  for (const [raw, expected] of [[5, 0], [100, 100], [-5, 0], [105, 100]]) {
+    const result = normalizeHomeAssistantMetric(metric, raw);
+    assert.equal(result.rawValue, raw); assert.equal(result.value, expected);
+  }
+  for (const raw of [null, undefined, '', ' ', 'unknown', 'unavailable', 'bad', NaN, Infinity, -Infinity, {}, true]) {
+    const result = normalizeHomeAssistantMetric(metric, raw);
+    assert.equal(result.rawValue, null); assert.equal(result.value, null);
+  }
+  assert.equal(normalizeHomeAssistantMetric({ ...metric, normalization: undefined }, 21).value, 21);
+});
+
+test('HA snapshots and live updates use identical normalization without double conversion', async () => {
+  const metrics = load('src/lib/site/home-assistant-metrics.ts');
+  const { getHomeAssistantSiteState } = load('src/lib/site/home-assistant-state.ts', {
+    '../home-assistant/client': { getHomeAssistantState: async () => ({ state: '21' }) },
+  });
+  const metric = { entityId: 'sensor.soc', label: 'SOC', unit: '%', decimals: 0 };
+  const initial = await getHomeAssistantSiteState({ enabled: true, assets: [
+    { id: 'powerwall', name: 'Powerwall', metrics: [{ ...metric, normalization: 'powerwall-display-soc' }] },
+    { id: 'other', name: 'Other battery', metrics: [metric] },
+  ] });
+  assert.equal(initial.assets[0].metrics[0].rawValue, 21);
+  assert.equal(initial.assets[0].metrics[0].value.toFixed(0), '17');
+  assert.equal(initial.assets[1].metrics[0].value, 21);
+  const update = { 'sensor.soc': 21 };
+  const live = metrics.applyHomeAssistantMetricUpdates(initial, update);
+  assert.equal(JSON.stringify(live), JSON.stringify(initial));
+  assert.equal(JSON.stringify(metrics.applyHomeAssistantMetricUpdates(live, update)), JSON.stringify(initial));
+  assert.equal(JSON.stringify(metrics.applyHomeAssistantMetricUpdates(live, { unrelated: 5 })), JSON.stringify(initial));
+  const unavailable = metrics.applyHomeAssistantMetricUpdates(live, { 'sensor.soc': null });
+  assert.equal(unavailable.assets[0].metrics[0].value, null);
+  assert.equal(unavailable.assets[0].metrics[0].rawValue, null);
+});
+
+test('current site enables Powerwall normalization only for the local charge metric', () => {
+  const { currentSite } = load('src/lib/site/current-site.ts');
+  const configured = currentSite.integrations.homeAssistant.assets.flatMap(a => a.metrics)
+    .filter(m => m.normalization);
+  assert.equal(configured.length, 1);
+  assert.equal(configured[0].entityId, 'sensor.powerwall_192_168_68_74_charge');
+  assert.equal(configured[0].normalization, 'powerwall-display-soc');
 });

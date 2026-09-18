@@ -1,3 +1,4 @@
+import { readLastKnownKrakenState, writeLastKnownKrakenState } from "./kraken-state-store";
 import {
     getKrakenDevices,
     getKrakenPlannedDispatches,
@@ -75,7 +76,7 @@ export function getSmartControlSetting(isSuspended: boolean | null): string {
 
 export async function getKrakenState(): Promise<KrakenState> {
     const now = Date.now();
-    if (cachedKrakenState && now - cachedKrakenStateAt < KRAKEN_CACHE_MS) {
+    if (cachedKrakenState && !cachedKrakenState.stale && now - cachedKrakenStateAt < KRAKEN_CACHE_MS) {
         return cachedKrakenState;
     }
 
@@ -94,8 +95,12 @@ export async function getKrakenState(): Promise<KrakenState> {
             lastSuccessfulUpdate: new Date(cachedKrakenStateAt).toISOString(),
             stale: false,
         };
+        await writeLastKnownKrakenState(cachedKrakenState);
         return cachedKrakenState;
     } catch (error) {
+        // Only consult disk after live retrieval fails and memory has no snapshot.
+        // A recovered snapshot never starts a fresh 60-second cache window.
+        cachedKrakenState ??= await readLastKnownKrakenState();
         // Keep the last successful snapshot and retry on the next request.
         if (cachedKrakenState) {
             console.error("Kraken refresh failed; using cached data:", error);

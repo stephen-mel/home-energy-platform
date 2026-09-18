@@ -15,7 +15,7 @@ export const currentSite: Site = {
                 id: "powerwall-home",
                 name: "Powerwall & Home",
                 metrics: [
-                    { entityId: "sensor.powerwall_192_168_68_74_charge", label: "Powerwall", unit: "%", decimals: 0 },
+                    { entityId: "sensor.powerwall_192_168_68_74_charge", label: "Powerwall", unit: "%", decimals: 0, normalization: "powerwall-display-soc" },
                     { entityId: "sensor.powerwall_192_168_68_74_solar_power", label: "Solar", unit: "kW", decimals: 2 },
                     { entityId: "sensor.powerwall_192_168_68_74_load_power", label: "House", unit: "kW", decimals: 2 },
                     { entityId: "sensor.powerwall_192_168_68_74_battery_power", label: "Battery", unit: "kW", decimals: 2 },
