@@ -1,17 +1,12 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { applyHomeAssistantMetricUpdates } from "../lib/site/home-assistant-metrics";
 import type { HomeAssistantState } from "../lib/site/home-assistant-state";
-import { watchHomeAssistant, type LiveStatus } from "../lib/home-assistant/browser-stream";
+import type { LiveStatus } from "../lib/home-assistant/browser-stream";
 
-export default function HomeEnergyTelemetry({ initial }: { initial: HomeAssistantState }) {
-  const [values, setValues] = useState<Record<string, number | null>>({});
-  const [status, setStatus] = useState<LiveStatus>("connecting");
-  useEffect(() => watchHomeAssistant(
-    updates => setValues(previous => ({ ...previous, ...updates })), setStatus,
-  ), []);
-  const { assets } = applyHomeAssistantMetricUpdates(initial, values);
+export default function HomeEnergyTelemetry({ initial, status = "connecting" }: {
+  initial: HomeAssistantState; status?: LiveStatus;
+}) {
+  const { assets } = initial;
   return <section aria-label="Home energy">
     <p role="status" className="mb-4 text-sm text-zinc-400">
       {status === "live" ? "Home energy updates connected" : status === "connecting"

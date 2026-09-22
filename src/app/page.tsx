@@ -1,6 +1,6 @@
 import HomeEnergyPlan from "../components/HomeEnergyPlan";
 import { getSitePriceSignal } from "../lib/site/get-site-price-signal";
-import HomeEnergyTelemetry from "../components/HomeEnergyTelemetry";
+import LiveHomeEnergy from "../components/LiveHomeEnergy";
 import { getCurrentSite } from "../lib/site/repository";
 import { getSiteState } from "../lib/site/get-site-state";
 
@@ -35,6 +35,7 @@ export default async function Home() {
   const vehicles = kraken?.vehicles ?? [];
   const krakenError = siteState.integrations.kraken.error;
   const homeAssistant = siteState.integrations.homeAssistant;
+  const pricePlan = getSitePriceSignal(site, kraken, siteState.updatedAt);
 
   return (
     <main className="min-h-screen bg-zinc-950 px-6 py-10 text-white">
@@ -43,14 +44,14 @@ export default async function Home() {
           <h1 className="text-4xl font-semibold tracking-tight">Home Energy Platform</h1>
         </div>
 
-        {homeAssistant.enabled && site.integrations.homeAssistant.assets?.some(asset => asset.metrics.length > 0) && (
-          <HomeEnergyTelemetry initial={homeAssistant.data ?? {
+        <LiveHomeEnergy key={site.id} plan={pricePlan} haEnabled={homeAssistant.enabled}
+          configuration={site.opportunities} initial={homeAssistant.data ?? {
             assets: (site.integrations.homeAssistant.assets ?? []).map(asset => ({
               ...asset, metrics: asset.metrics.map(metric => ({ ...metric, rawValue: null, value: null })),
             })),
-          }} />
-        )}
-        <HomeEnergyPlan plan={getSitePriceSignal(site, kraken, siteState.updatedAt)} />
+          }}>
+          <HomeEnergyPlan plan={pricePlan} />
+        </LiveHomeEnergy>
         <h2 className="mb-3 text-2xl font-semibold">Electric Vehicles</h2>
         <p className="mb-6 text-sm text-zinc-400">
           {kraken?.stale ? "Last known vehicle data from Kraken Flex" : "Vehicle data from Kraken Flex"}

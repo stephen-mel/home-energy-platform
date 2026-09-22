@@ -105,3 +105,47 @@ in a particular way. Self-consumption/carbon do not override the financial conte
 `node --test tests/opportunity.test.mjs`, `node --test tests/*.test.mjs`,
 `npx tsc --noEmit`, `npm run lint`. Tests use synthetic inputs and include explicit
 control-language exclusions. No real-home connections or external writes are required.
+
+## Live homepage integration
+
+`page.tsx` loads site state once and derives one effective price plan from that
+snapshot. `LiveHomeEnergy` owns the existing HA EventSource subscription and
+passes the same normalized readings to the telemetry display and
+`liveSiteOpportunities`. The engine and its economic rules remain unchanged.
+There are no extra integration calls, timers, polling, controls or refreshes.
+Existing stream metrics/status events trigger recomputation; a normal dashboard
+reload supplies any new Kraken plan through the existing cache. Without HA,
+tariff-only insights render on the server and remain available.
+
+`Site.opportunities` declares optional metric bindings and export context. The
+current site's HA Powerwall grid/battery measurements use the integration's
+positive-import / positive-toward-home conventions explicitly (multiplier +1).
+SOC is the shared normalized display measurement, with raw SOC retained. Export
+value uses the configured economic curve; payment/capability remain unknown.
+Other sites can omit these bindings or supply different assets and polarities.
+
+Freshness describes the connection's last-known state, not independently verified
+sensor sampling age: initial REST readings have unknown freshness; after the
+complete stream snapshot and live status they are usable as observations;
+disconnection marks retained readings stale. HA does not currently forward sensor
+measurement timestamps, so an upstream sensor stuck on an old numeric value
+cannot be detected here. Missing/null values never establish live export.
+Existing stream status/heartbeat events advance the observation time without new
+polling. The price horizon is finite; after it expires a normal dashboard reload
+is needed. HA events do not refresh Kraken or reclassify its snapshot freshness.
+
+`energy-opportunities-view.ts` selects at most three cards in order: additional
+SMART opportunity, cheaper import ahead, live export, stored energy, other gross
+spread context. It selects the nearest instance per message type. The cheap-rate
+summary suppresses secondary import/exposure/export-spread cards to avoid repeated
+economics; independent live export observations remain eligible. No-additional
+context is shown only when there are no other selected insights. This deliberately
+conservative summary is not an exhaustive opportunity list.
+
+Cards distinguish guaranteed prices, conditional plans, observed qualification
+(not bill verification), and verified billing only when supplied as evidence.
+Current Kraken data stays conditional. Native Details disclosures preserve
+source, evidence, limitations, grouped dispatch attribution and original times.
+Export is instantaneous economic value, not confirmed revenue or a forecast;
+battery context does not claim sufficiency or recommend an action. Stale/unknown
+qualifications remain visible without opening Details.

@@ -1,3 +1,5 @@
+import type { TelemetryBindings } from "../opportunity/home-assistant-input";
+import type { ExportContext } from "../opportunity/types";
 import type { TariffConfig } from "../tariff/types";
 import type {
     SiteConstraints,
@@ -10,4 +12,5 @@ export type Site = {
     integrations: SiteIntegrationConfig;
     constraints: SiteConstraints;
     tariff?: TariffConfig;
+    opportunities?: { telemetry: TelemetryBindings; exportContext?: ExportContext };
 };

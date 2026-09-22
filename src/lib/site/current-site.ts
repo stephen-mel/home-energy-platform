@@ -53,6 +53,22 @@ export const currentSite: Site = {
         }],
     },
 
+    opportunities: {
+        // HA Powerwall convention: grid negative = export; battery negative =
+        // energy into storage. Map explicitly into the engine's identical signs.
+        telemetry: {
+            solarKw: { assetId: "powerwall-home", entityId: "sensor.powerwall_192_168_68_74_solar_power", multiplier: 1 },
+            houseLoadKw: { assetId: "powerwall-home", entityId: "sensor.powerwall_192_168_68_74_load_power", multiplier: 1 },
+            gridImportKw: { assetId: "powerwall-home", entityId: "sensor.powerwall_192_168_68_74_site_power", multiplier: 1 },
+            batteries: [{
+                id: "powerwall-home", name: "Powerwall",
+                socPercent: { assetId: "powerwall-home", entityId: "sensor.powerwall_192_168_68_74_charge" },
+                powerToHomeKw: { assetId: "powerwall-home", entityId: "sensor.powerwall_192_168_68_74_battery_power", multiplier: 1 },
+            }],
+        },
+        exportContext: { capability: "unknown", actualTariff: { status: "unknown", price: null }, economicValue: { kind: "signal" } },
+    },
+
     constraints: {
         maxImportKw: 10,
         maxExportKw: 5,
