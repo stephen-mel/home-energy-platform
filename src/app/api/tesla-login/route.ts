@@ -18,7 +18,8 @@ export async function GET(request: NextRequest) {
     prompt: "login",
     redirect_uri: "http://localhost:3000/api/tesla/callback",
     response_type: "code",
-    scope: "openid offline_access energy_device_data",
+    scope: "openid offline_access energy_device_data energy_cmds",
+    prompt_missing_scopes: "true",
     state: challenge.state,
   });
 

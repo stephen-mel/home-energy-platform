@@ -38,7 +38,7 @@ test('callback validates and consumes state before exchange or token replacement
   assert.equal((await route.GET(req(a.state, a.binding))).status, 500); assert.equal(calls, 1);
   assert.equal((await route.GET(req(a.state, a.binding))).status, 400); assert.equal(calls, 1); assert.equal(writes, 0);
 });
-test('login binds state to HttpOnly short-lived SameSite cookie without adding scopes', async () => {
+test('login requests exact energy scopes and missing-scope consent while retaining browser state binding', async () => {
   const route = load('src/app/api/tesla-login/route.ts', {
     '../../../lib/tesla/oauth-state': state,
     'next/server': { NextResponse: { redirect: url => ({ url, cookies: { set: (...args) => { captured = args; } }, headers: { set() {} } }) } },
@@ -46,7 +46,12 @@ test('login binds state to HttpOnly short-lived SameSite cookie without adding s
   let captured;
   const result = await route.GET({ nextUrl: new URL('https://localhost/api/tesla-login') });
   const url = new URL(result.url);
-  assert.equal(url.searchParams.get('scope'), 'openid offline_access energy_device_data');
+  assert.equal(url.searchParams.get('scope'), 'openid offline_access energy_device_data energy_cmds');
+  assert.equal(url.searchParams.get('prompt_missing_scopes'), 'true');
+  assert.equal(url.origin + url.pathname, 'https://auth.tesla.com/oauth2/v3/authorize');
+  assert.equal(url.searchParams.get('prompt'), 'login');
+  assert.equal(url.searchParams.get('redirect_uri'), 'http://localhost:3000/api/tesla/callback');
+  assert.equal(url.searchParams.get('response_type'), 'code');
   assert.equal(captured[2].httpOnly, true); assert.equal(captured[2].sameSite, 'lax'); assert.equal(captured[2].secure, true);
   assert.equal(captured[2].maxAge, 300);
   assert.equal(state.consumeTeslaOAuthState(url.searchParams.get('state'), captured[1]), true);
