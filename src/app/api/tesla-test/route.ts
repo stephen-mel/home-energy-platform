@@ -1,3 +1,4 @@
+import { captureObservedTariff } from "../../../lib/tesla-tariff/observed-tariff";
 import {
     getTeslaProducts,
     getTeslaSiteInfo,
@@ -31,6 +32,7 @@ export async function GET() {
             message: "Tesla Fleet API site info retrieved",
             energySiteId: energyProduct.energy_site_id,
             siteInfo,
+            observedTariff: captureObservedTariff(siteInfo, String(energyProduct.energy_site_id), new Date().toISOString()),
         });
     } catch (error) {
         console.error("Tesla Fleet API test failed:", error);
