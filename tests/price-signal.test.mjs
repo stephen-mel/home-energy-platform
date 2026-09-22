@@ -26,7 +26,7 @@ const { getSitePriceSignal } = load('src/lib/site/get-site-price-signal.ts', {
   '../tariff/price-signal': curve, '../tariff/kraken-dispatches': adapter,
   '../tariff/effective-tariff': effectiveTariff,
 });
-const { default: HomeEnergyPlan } = load('src/components/HomeEnergyPlan.tsx', { 'react/jsx-runtime': jsxRuntime });
+const { default: HomeEnergyPlan } = load('src/components/HomeEnergyPlan.tsx', { 'react/jsx-runtime': jsxRuntime, './home-energy-plan-view': load('src/components/home-energy-plan-view.ts') });
 const now = '2026-09-18T00:00:00.000Z';
 const at = hour => `2026-09-18T${String(hour).padStart(2, '0')}:00:00.000Z`;
 const price = amount => ({ amount, currency: 'GBP', unit: 'kWh' });
@@ -469,4 +469,80 @@ test('equivalent horizon instants compare identically and ambiguous versions rem
   const ambiguous = eonPlan([], '2026-09-22T10:00:00+01:00', config);
   assert.ok([...ambiguous.signal.import, ...ambiguous.signal.export].every(w => w.price === null));
   assert.match(ambiguous.signal.import[0].sources[0].description, /Overlapping tariff versions/);
+});
+
+const { homeEnergyPlanView } = load('src/components/home-energy-plan-view.ts');
+const renderPlan = plan => renderToStaticMarkup(createElement(HomeEnergyPlan, { plan }));
+const defaultUI = plan => renderPlan(plan).split('<details')[0];
+
+test('homeowner daytime summary shows current import, next guaranteed cheap and independent export', () => {
+  const plan = eonPlan([], '2026-09-22T12:00:00+01:00');
+  const view = homeEnergyPlanView(plan.signal);
+  assert.equal(view.currentImport.price.amount, 0.2518);
+  assert.equal(view.currentExport.price.amount, 0.175);
+  assert.equal(view.cheap.kind, 'guaranteed-off-peak'); assert.equal(view.cheapNow, false);
+  const html = defaultUI(plan);
+  for (const text of ['Now', '25.18p/kWh', 'Standard rate', 'Next cheap period', '2.99p/kWh', 'Guaranteed', '17.5p/kWh']) assert.ok(html.includes(text), text);
+  assert.ok(!html.includes('No planned whole-home cheap opportunities'));
+  assert.ok(!html.includes('No cheap period'));
+});
+
+test('current guaranteed cheap period says cheap now even with overlapping SMART dispatch', () => {
+  const plan = eonPlan([eonDispatch('2026-09-22T01:00:00+01:00', '2026-09-22T05:00:00+01:00')], '2026-09-22T02:15:00+01:00');
+  const view = homeEnergyPlanView(plan.signal);
+  assert.equal(view.cheapNow, true); assert.equal(view.currentImport.kind, 'guaranteed-off-peak');
+  const html = defaultUI(plan).split('Next 24 hours')[0];
+  assert.match(html, /Cheap period now/); assert.match(html, /Until/);
+  assert.doesNotMatch(html, /Next cheap period|Conditional/);
+  assert.match(html, /2.99p\/kWh/);
+  assert.equal(view.segments[0].start, '2026-09-22T01:15:00.000Z');
+});
+
+test('SMART summary attributes vehicle by name, keeps UUID out of default UI and preserves diagnostics in closed details', () => {
+  const snapshot = state([eonDispatch('2026-09-22T12:00:00+01:00', '2026-09-22T14:00:00+01:00')], true);
+  snapshot.vehicles[0].id = 'uuid-hidden-from-summary'; snapshot.vehicles[0].name = 'Family car';
+  const plan = getSitePriceSignal(eonSite(), snapshot, '2026-09-22T11:00:00+01:00');
+  const visible = defaultUI(plan), html = renderPlan(plan);
+  assert.match(visible, /Family car/); assert.match(visible, /Smart charge · Conditional/);
+  assert.doesNotMatch(visible, /uuid-hidden-from-summary|Source:|planned-conditional|half-hourly/);
+  assert.match(html, /<details class=/); assert.doesNotMatch(html, /<details[^>]*\bopen(?:=|\s|>)/);
+  const details = html.split('<details')[1];
+  for (const text of ['Details', 'uuid-hidden-from-summary', 'Family car', 'Source:', 'Kraken schedule is stale',
+    'Original Kraken dispatches', 'Dispatch type: SMART', 'half-hourly', 'planned-conditional']) assert.ok(details.includes(text), text);
+  const active = getSitePriceSignal(eonSite(), snapshot, '2026-09-22T12:15:00+01:00');
+  assert.match(defaultUI(active), /Possible rate if scheduled charging qualifies/);
+});
+
+test('24-hour timeline clips elapsed segments and preserves standard, conditional and guaranteed distinction', () => {
+  const plan = eonPlan([eonDispatch('2026-09-22T22:30:00+01:00', '2026-09-23T04:00:00+01:00')], '2026-09-22T21:15:00+01:00');
+  const view = homeEnergyPlanView(plan.signal);
+  assert.equal(Date.parse(view.end) - Date.parse(view.start), 24 * 3600000);
+  assert.deepEqual(plain(view.segments.map(s => s.window.kind)), ['standard', 'cheap-opportunity', 'guaranteed-off-peak', 'standard']);
+  assert.ok(Math.abs(view.segments.reduce((sum, s) => sum + s.percent, 0) - 100) < 1e-8);
+  assert.equal(view.segments[1].percent, 1.5 / 24 * 100);
+  assert.equal(view.segments[2].percent, 6 / 24 * 100);
+  assert.equal(view.segments.at(-1).end, view.end);
+  assert.match(defaultUI(plan), /aria-label="24-hour import prices"/);
+});
+
+test('timeline widths use 24 elapsed hours on both London DST transitions', () => {
+  const config = eonSite();
+  config.tariff.versions[0].effectiveFrom = '2026-01-01T00:00:00Z';
+  config.tariff.versions[0].effectiveTo = '2027-01-01T00:00:00Z';
+  for (const [start, expectedHours] of [['2026-03-29T00:00:00Z', 5], ['2026-10-24T23:00:00Z', 7]]) {
+    const view = homeEnergyPlanView(eonPlan([], start, config).signal);
+    assert.equal(Date.parse(view.end) - Date.parse(view.start), 24 * 3600000);
+    assert.equal(view.segments[0].percent, expectedHours / 24 * 100);
+    assert.ok(Math.abs(view.segments.reduce((sum, s) => sum + s.percent, 0) - 100) < 1e-8);
+  }
+});
+
+test('unknown rates and missing coverage remain unknown in presentation, never zero', () => {
+  const signal = eonPlan([], '2026-10-01T00:00:00+01:00').signal;
+  const view = homeEnergyPlanView(signal);
+  assert.equal(view.currentImport.price, null); assert.equal(view.cheap, null);
+  const empty = homeEnergyPlanView({ ...signal, import: [], export: [] });
+  assert.equal(empty.segments.length, 1); assert.equal(empty.segments[0].percent, 100);
+  assert.equal(empty.currentImport, null);
+  assert.match(defaultUI(eonPlan([], '2026-10-01T00:00:00+01:00')), /Rate unknown/);
 });

@@ -40,17 +40,7 @@ export default async function Home() {
     <main className="min-h-screen bg-zinc-950 px-6 py-10 text-white">
       <div className="mx-auto max-w-5xl">
         <div className="mb-10">
-          <p className="mb-2 text-sm font-medium uppercase tracking-widest text-emerald-400">
-            Home Energy Platform
-          </p>
-
-          <h1 className="text-4xl font-semibold tracking-tight">
-            Electric Vehicles
-          </h1>
-
-          <p className="mt-3 text-zinc-400">
-            {kraken?.stale ? "Last known vehicle data from Kraken Flex" : "Live vehicle data from Kraken Flex"}
-          </p>
+          <h1 className="text-4xl font-semibold tracking-tight">Home Energy Platform</h1>
         </div>
 
         {homeAssistant.enabled && site.integrations.homeAssistant.assets?.some(asset => asset.metrics.length > 0) && (
@@ -61,6 +51,10 @@ export default async function Home() {
           }} />
         )}
         <HomeEnergyPlan plan={getSitePriceSignal(site, kraken, siteState.updatedAt)} />
+        <h2 className="mb-3 text-2xl font-semibold">Electric Vehicles</h2>
+        <p className="mb-6 text-sm text-zinc-400">
+          {kraken?.stale ? "Last known vehicle data from Kraken Flex" : "Vehicle data from Kraken Flex"}
+        </p>
         {kraken?.stale && (
           <p role="status" className="mb-6 text-sm text-amber-400">
             Kraken vehicle data is stale. Showing last known readings. Last successful update:{" "}
