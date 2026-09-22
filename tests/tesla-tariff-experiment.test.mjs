@@ -62,13 +62,14 @@ test('intended test preserves exactly 2.99p buy / 17.5p sell without changing HE
   assert.ok(result.warnings.some(d => d.code === 'BUY_BELOW_SELL_EXPERIMENT'));
 });
 
-test('complete exact setting-content capture permits human review and round-trips exact rollback', () => {
+test('structural capture round-trips candidate but cannot prove rollback', () => {
   const original = tariff(); const result = prepare({ before: capture(original) });
-  assert.equal(result.state, 'ready-for-human-approval'); assert.equal(result.blockers.length, 0);
-  assert.deepEqual(plain(result.rollback.tariffContentV2), plain(original));
+  assert.equal(result.state, 'blocked'); assert.ok(result.blockers.some(d => d.code === 'ROLLBACK_UNPROVEN'));
+  assert.equal(result.rollback.tariffContentV2, null);
+  assert.deepEqual(plain(result.before.structuralRestorationCandidate), plain(original));
   assert.deepEqual(plain(result.before.originalTariffSnapshot), plain(original));
   assert.notEqual(result.rollback.tariffContentV2, original);
-  assert.equal(result.rollback.proof, 'validated-exact-setting-content');
+  assert.equal(result.rollback.proof, 'unproven');
   assert.equal(result.writeReady, false); assert.equal(result.writePayload, null);
 });
 
@@ -107,8 +108,9 @@ test('supported multi-rate complete tariff is preserved exactly for rollback', (
   t.seasons.Annual.tou_periods.DAY = { periods: [{ ...period, fromHour: 6, toHour: 0 }] };
   t.energy_charges.Annual.rates.DAY = 0.3;
   const result = prepare({ before: capture(t) });
-  assert.equal(result.state, 'ready-for-human-approval');
-  assert.deepEqual(plain(result.rollback.tariffContentV2), plain(t));
+  assert.equal(result.state, 'blocked');
+  assert.equal(result.rollback.tariffContentV2, null);
+  assert.deepEqual(plain(result.before.structuralRestorationCandidate), plain(t));
 });
 
 test('read-back classifications preserve, raise buy to sell, or report other transformations', () => {

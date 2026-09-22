@@ -39,7 +39,8 @@ export function captureExperimentTariff(input: TariffCaptureInput) {
             ? siteInfo.rate_plan_manager_no_pricing_constraint : null,
         // Structural read-back interpretation is not proof of inverse write mapping.
         interpretedTariff: !ambiguous && siteIdentityMatches ? inspected.tariff : null,
-        exactRollbackTariff: input.format === "tariff-content-v2" ? inspected.tariff : null,
+        structuralRestorationCandidate: input.format === "tariff-content-v2" ? inspected.tariff : null,
+        exactRollbackTariff: null, // Format and shape never establish authoritative observation.
     };
 }
 

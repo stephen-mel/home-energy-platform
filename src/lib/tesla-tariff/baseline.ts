@@ -97,6 +97,8 @@ function currentFingerprint(record: BaselineRecord) {
 }
 export function isBaselineHumanVerified(record: BaselineRecord): boolean {
     return record.state === "human-verified" && record.verification !== null
+        && Number.isFinite(Date.parse(record.verification.verifiedAt))
+        && Date.parse(record.verification.verifiedAt) >= Date.parse(record.asOf)
         && record.verification.fingerprint === record.fingerprint && record.fingerprint === currentFingerprint(record);
 }
 
@@ -106,9 +108,13 @@ export function isBaselineHumanVerified(record: BaselineRecord): boolean {
 export function verifyTariffBaseline(record: BaselineRecord, confirmation: {
     fingerprint: string; verifiedAt: string; verifierReference?: string;
 }): BaselineRecord {
-    if (record.state === "blocked" || confirmation.fingerprint !== record.fingerprint || currentFingerprint(record) !== record.fingerprint)
+    if (!baselineRecordConsistent(record) || record.state === "blocked" || confirmation.fingerprint !== record.fingerprint || currentFingerprint(record) !== record.fingerprint)
         throw new Error("The exact current reviewable representation must be confirmed");
     const verifiedAt = instant(confirmation.verifiedAt);
+    if (!record.effectivePeriod || Date.parse(verifiedAt) >= Date.parse(record.effectivePeriod.end)
+        || Date.parse(verifiedAt) < Date.parse(record.effectivePeriod.start)
+        || Date.parse(verifiedAt) < Date.parse(record.truth.horizon.start) || Date.parse(verifiedAt) >= Date.parse(record.truth.horizon.end))
+        throw new Error("Approval is outside the representation validity/coverage");
     if (Date.parse(verifiedAt) < Date.parse(record.asOf)) throw new Error("Verification cannot predate the review snapshot");
     return { ...record, state: "human-verified", verification: { fingerprint: record.fingerprint, verifiedAt,
         verifierReference: confirmation.verifierReference === undefined ? null : reference(confirmation.verifierReference) } };
@@ -136,3 +142,41 @@ export type ExperimentBaselineEvidence =
     | { kind: "hep-baseline-proven-written"; baselineId: string; fingerprint: string;
         energySiteId: string; writeRecordedAt: string; readBackVerifiedAt: string;
         exactRepresentation: TeslaTariffFragment; readBackEvidenceReference: string };
+
+/** Re-derive display and safety data instead of trusting persisted presentation. */
+export function baselineRecordConsistent(record: BaselineRecord): boolean {
+    try {
+        const t = dryRunTeslaTariff(record.truth, { timeZone: record.timeZone });
+        const diagnostics: Diagnostic[] = [...t.diagnostics];
+        const reviewable = !!record.tariffIdentity && !!record.effectivePeriod && !!t.candidate.tariffContentV2Fragment
+            && Date.parse(record.truth.horizon.start) >= Date.parse(record.effectivePeriod.start)
+            && Date.parse(record.truth.horizon.end) <= Date.parse(record.effectivePeriod.end);
+        if (!reviewable) diagnostics.push({ code: "BASELINE_NOT_REVIEWABLE", severity: "error",
+            message: "A known single effective tariff and an inspectable representation covering the review horizon within its validity are required." });
+        const review = { tariffIdentity: record.tariffIdentity, effectivePeriod: record.effectivePeriod, timeZone: record.timeZone,
+            periods: t.candidate.periods.map(p => ({ localDate: p.localDate, fromMinute: p.fromMinute, toMinute: p.toMinute,
+                utcOffset: p.utcOffset, importPrice: p.buy, exportEconomicValue: p.sell, importKind: p.importKind })), diagnostics };
+        return currentFingerprint(record) === record.fingerprint && canonical(t.candidate) === canonical(record.proposed)
+            && canonical(review) === canonical(record.review) && canonical(diagnostics) === canonical(record.diagnostics)
+            && canonical(diagnostics.filter(d => d.severity === "error")) === canonical(record.compatibilityBlockers)
+            && canonical(diagnostics.filter(d => d.severity === "warning")) === canonical(record.warnings);
+    } catch { return false; }
+}
+
+/** Historical verification stays intact; eligibility for use is a separate question.
+ * Baselines do not have current trusted Tesla rollback evidence in v1.
+ */
+export function assessBaselineCurrentUse(record: BaselineRecord, context: { now: string; currentProposal: BaselineRecord }) {
+    const blockers: string[] = [];
+    const now = Date.parse(context.now);
+    if (!baselineRecordConsistent(record) || !baselineRecordConsistent(context.currentProposal)) blockers.push("RECORD_INCONSISTENT");
+    if (!isBaselineHumanVerified(record)) blockers.push("HUMAN_VERIFICATION_REQUIRED");
+    if (!Number.isFinite(now) || !record.effectivePeriod || now < Date.parse(record.effectivePeriod.start) || now >= Date.parse(record.effectivePeriod.end)
+        || now < Date.parse(record.truth.horizon.start) || now >= Date.parse(record.truth.horizon.end)
+        || !record.verification || now < Date.parse(record.verification.verifiedAt)) blockers.push("OUTSIDE_CURRENT_VALIDITY");
+    if (record.baselineId !== context.currentProposal.baselineId || currentFingerprint(record) !== currentFingerprint(context.currentProposal)) blockers.push("CURRENT_PROPOSAL_CHANGED");
+    blockers.push(...dryRunTeslaTariff(record.truth, { timeZone: record.timeZone }).diagnostics.filter(d => d.severity === "error").map(d => d.code));
+    if (context.currentProposal.authority.requestedMode === "observe") blockers.push("AUTHORITY_OBSERVE_ONLY");
+    blockers.push("ROLLBACK_UNPROVEN");
+    return { eligible: blockers.length === 0, blockers: [...new Set(blockers)], writeReady: false as const };
+}

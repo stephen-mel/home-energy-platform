@@ -41,10 +41,7 @@ non-overlapping coverage of every weekday. Midnight ends use `toHour: 0`,
 `toMinute: 0`. Overnight periods must be explicitly split. Unknown schema
 extensions, non-GBP tariffs, missing fields and incomplete coverage block.
 
-For supported exact setting-content captures, rollback is a lossless structural
-copy of every admitted field, including independent sell tariff, names and rates.
-The record can be `ready-for-human-approval`; this is **not write readiness or
-proof that Tesla will accept restoration**. For site-info-only captures, rollback
+For supported setting-content inputs, `structuralRestorationCandidate` is a lossless structural copy of admitted fields. It is not authoritative capture evidence. The preparation stays `blocked` with `ROLLBACK_UNPROVEN`; a caller format label cannot establish that Tesla held these settings. For site-info-only captures, rollback
 is always `unproven`/null and preparation is `blocked`, even if the tariff is
 readable. Additional legitimate schema fields require future documented support;
 we do not discard them and claim the reduced content is exact.
@@ -105,3 +102,11 @@ Tests: `node --test tests/tesla-tariff-experiment.test.mjs`, full
 `node --test tests/*.test.mjs`, `npx tsc --noEmit`, `npm run lint`.
 Synthetic fixtures only; the pure-module loader allows no network, filesystem,
 OAuth/client imports, timers or wall-clock access. No live calls were made.
+
+
+## Safety hardening
+
+See [tariff safety model](tesla-tariff-safety.md). `exactRollbackTariff` is now
+always null for submitted captures. Structural validity and trusted provenance
+are separate. Generated fixtures, format labels and human baseline verification
+cannot remove the rollback blocker.

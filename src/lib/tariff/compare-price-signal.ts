@@ -7,7 +7,9 @@ import type { PriceSignal, PriceWindow } from "./types";
 export function effectivePriceCurveKey(signal: PriceSignal): string {
     const canonical = (curve: PriceWindow[]) => {
         const result: Array<{ start: string; end: string; terms: string }> = [];
-        for (const window of [...curve].sort((a, b) => a.start.localeCompare(b.start))) {
+        const normalized = curve.map(w => ({ ...w, start: new Date(w.start).toISOString(), end: new Date(w.end).toISOString(),
+            eligibilityPeriods: w.eligibilityPeriods.map(p => ({ ...p, start: new Date(p.start).toISOString(), end: new Date(p.end).toISOString() })) }));
+        for (const window of normalized.sort((a, b) => Date.parse(a.start) - Date.parse(b.start))) {
             const points = [...new Set([window.start, window.end,
                 ...window.eligibilityPeriods.flatMap(p => [p.start, p.end])])].sort();
             for (let i = 0; i < points.length - 1; i++) {

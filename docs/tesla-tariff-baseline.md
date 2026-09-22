@@ -103,3 +103,13 @@ proof can establish a restoration baseline. None of those steps occurs here.
 Validation: `node --test tests/tesla-tariff-baseline.test.mjs`, full
 `node --test tests/*.test.mjs`, `npx tsc --noEmit`, `npm run lint`, `git diff --check`.
 Tests run synthetic inputs with an import allowlist and no clock/network/I/O globals.
+
+
+## Current-use and persisted-record validation
+
+See [tariff safety model](tesla-tariff-safety.md). Historical verification is
+independent of current-use eligibility. Approval must occur inside effective
+validity and coverage; `assessBaselineCurrentUse` requires explicit now and a
+current proposal. Review/diagnostics/blockers are recomputed from fingerprint-bound
+inputs, and inconsistent persisted copies are rejected. Human approval still
+cannot authorize a separate transient SMART proposal.

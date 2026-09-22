@@ -26,8 +26,9 @@ const { getSitePriceSignal } = load('src/lib/site/get-site-price-signal.ts', {
   '../tariff/price-signal': curve, '../tariff/kraken-dispatches': kraken, '../tariff/effective-tariff': effective,
 });
 const dryRun = load('src/lib/tesla-tariff/dry-run.ts', { '../tariff/compare-price-signal': comparison });
+const domains = load('src/lib/tariff/comparison-domain.ts', { './compare-price-signal': comparison, './price-signal': curve });
 const { planTeslaTariffSync, decideSyncStatus } = load('src/lib/tesla-tariff/sync-planner.ts', {
-  '../tariff/compare-price-signal': comparison, './dry-run': dryRun,
+  '../tariff/compare-price-signal': comparison, './dry-run': dryRun, '../tariff/comparison-domain': domains,
 });
 const date = time => `2026-09-22T${time}:00+01:00`;
 const ds = (start, end, type = 'SMART') => ({ start, end, type, energyAddedKwh: null });
@@ -36,7 +37,7 @@ function signal(dispatches = []) {
   return getSitePriceSignal(currentSite, { stale: false, lastSuccessfulUpdate: date('00:00'),
     vehicles: [{ id: 'ev', name: 'Family car', plannedDispatches: dispatches }] }, date('00:00')).signal;
 }
-const plan = (current, previous) => planTeslaTariffSync({ signal: current, previousSignal: previous, timeZone: 'Europe/London' });
+const plan = (current, previous, comparisonDomain = current.horizon) => planTeslaTariffSync({ signal: current, previousSignal: previous, comparisonDomain, timeZone: 'Europe/London' });
 const plain = value => JSON.parse(JSON.stringify(value));
 const codes = result => result.compatibility.blockers.map(d => d.code);
 
@@ -142,22 +143,24 @@ test('incomplete coverage and unknown prices keep original adapter diagnostics',
 test('missing/invalid baseline does not invent unchanged status; changed horizon is explicit', () => {
   const current = signal();
   const first = plan(current);
-  assert.equal(first.status, 'blocked'); assert.equal(first.comparison.state, 'unestablished');
+  assert.equal(first.status, 'blocked'); assert.equal(first.comparison.state, 'indeterminate');
   assert.equal(first.comparison.changedPeriods, null);
   assert.ok(first.reasons.some(r => r.code === 'BASELINE_MISSING'));
   const invalid = structuredClone(current); invalid.export = [];
   const result = plan(current, invalid);
-  assert.equal(result.comparison.state, 'unestablished');
+  assert.equal(result.comparison.state, 'indeterminate');
   assert.ok(result.reasons.some(r => r.code === 'BASELINE_INVALID'));
   const shifted = structuredClone(current);
   shifted.horizon.start = new Date(Date.parse(current.horizon.start) + 3600_000).toISOString();
   for (const side of ['import', 'export']) shifted[side][0].start = shifted.horizon.start;
   const moved = plan(shifted, current);
-  assert.equal(moved.comparison.state, 'changed');
-  assert.ok(moved.limitations.some(l => l.code === 'HORIZON_CHANGED'));
-  assert.deepEqual(plain(moved.comparison.changedPeriods), [{
-    start: '2026-09-21T23:00:00.000Z', end: '2026-09-22T00:00:00.000Z', channels: ['import', 'export'],
-  }]);
+  assert.equal(moved.comparison.state, 'unchanged');
+  assert.equal(moved.status, 'no-update');
+  assert.deepEqual(plain(moved.comparison.changedPeriods), []);
+  const insufficient = plan(shifted, current, current.horizon);
+  assert.equal(insufficient.status, 'blocked');
+  assert.equal(insufficient.comparison.state, 'indeterminate');
+  assert.equal(insufficient.comparison.changedPeriods, null);
 });
 
 test('deterministic pure planner never produces an executable write or command', () => {
@@ -170,4 +173,67 @@ test('deterministic pure planner never produces an executable write or command',
     assert.equal('command' in result, false); assert.equal('endpoint' in result, false);
     assert.doesNotMatch(JSON.stringify(result), /energy_cmds|access_token|\/api\/1\//);
   }
+});
+
+test('Item 7: invalid domain or source horizons return structured indeterminate, never unchanged', () => {
+  const base = signal();
+  for (const domain of [
+    { start: 'invalid', end: base.horizon.end }, { start: base.horizon.start, end: 'invalid' },
+    { start: base.horizon.end, end: base.horizon.start }, { start: base.horizon.start, end: base.horizon.start },
+  ]) {
+    const comparison = domains.comparePriceSignalsInDomain(base, base, domain);
+    assert.equal(comparison.status, 'indeterminate'); assert.equal(comparison.diagnostic.code, 'INVALID_DOMAIN');
+    assert.equal(plan(base, base, domain).status, 'blocked');
+    assert.equal(plan(base, base, domain).comparison.state, 'indeterminate');
+  }
+  for (const horizon of [
+    { start: 'bad', end: base.horizon.end }, { start: base.horizon.start, end: 'bad' },
+    { start: base.horizon.end, end: base.horizon.start }, { start: base.horizon.start, end: base.horizon.start },
+  ]) {
+    const broken = { ...base, horizon };
+    for (const [before, after] of [[broken, base], [base, broken]]) {
+      const r = domains.comparePriceSignalsInDomain(before, after, base.horizon);
+      assert.equal(r.status, 'indeterminate'); assert.equal(r.diagnostic.code, 'INVALID_HORIZON');
+      assert.equal(plan(after, before, base.horizon).comparison.state, 'indeterminate');
+    }
+  }
+});
+
+test('Item 7: malformed known monetary values cannot compare equal even against themselves', () => {
+  for (const price of [
+    { amount: null, currency: 'GBP', unit: 'kWh' },
+    ...[NaN, Infinity, -Infinity, '0.0299'].map(amount => ({ amount, currency: 'GBP', unit: 'kWh' })),
+    { amount: 0.1, currency: null, unit: 'kWh' }, { amount: 0.1, currency: 'gbp', unit: 'kWh' },
+    { amount: 0.1, currency: 'GBP', unit: 'day' }, { amount: 0.1, unit: 'kWh' },
+  ]) {
+    const broken = signal(); broken.import[0].price = price;
+    const r = domains.comparePriceSignalsInDomain(broken, broken, broken.horizon);
+    assert.equal(r.status, 'indeterminate'); assert.equal(r.diagnostic.code, 'INVALID_PRICE');
+    const p = plan(broken, broken);
+    assert.equal(p.status, 'blocked'); assert.equal(p.comparison.state, 'indeterminate');
+    assert.equal(p.comparison.changedPeriods, null);
+  }
+});
+
+test('Item 7: rolling 48h horizons agree with common-domain planner and report only in-domain changes', () => {
+  const { currentSite } = load('src/lib/site/current-site.ts');
+  const snapshot = { stale: false, lastSuccessfulUpdate: date('00:00'), vehicles: [] };
+  const previous = getSitePriceSignal(currentSite, snapshot, date('00:00')).signal;
+  const current = getSitePriceSignal(currentSite, snapshot, date('01:00')).signal;
+  const domain = { start: date('02:00'), end: date('22:00') };
+  assert.notEqual(comparison.effectivePriceCurveKey(previous), comparison.effectivePriceCurveKey(current));
+  assert.equal(domains.comparePriceSignalsInDomain(previous, current, domain).status, 'unchanged');
+  const same = plan(current, previous, domain);
+  assert.equal(same.status, 'no-update'); assert.equal(same.comparison.state, 'unchanged');
+  assert.deepEqual(plain(same.comparison.changedPeriods), []);
+  // Both windows exceed the comparison domain; reporting must clip them.
+  const changed = structuredClone(current); changed.import.find(w => w.kind === 'standard').price.amount = 0.3;
+  const result = plan(changed, previous, domain);
+  assert.equal(result.comparison.state, 'changed');
+  assert.deepEqual(plain(result.comparison.changedPeriods), [{ start: '2026-09-22T05:00:00.000Z', end: '2026-09-22T21:00:00.000Z', channels: ['import'] }]);
+  assert.ok(codes(result).includes('BUY_BELOW_SELL')); assert.ok(codes(result).includes('BOUNDED_FORECAST'));
+  const outside = { start: date('02:00'), end: date('05:00') };
+  assert.equal(plan(changed, previous, outside).status, 'no-update');
+  const gap = structuredClone(current); gap.export = [];
+  assert.equal(plan(gap, previous, domain).comparison.state, 'indeterminate');
 });

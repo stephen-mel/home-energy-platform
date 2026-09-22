@@ -1,10 +1,11 @@
+import { comparePriceSignalsInDomain } from "../tariff/comparison-domain";
 import { effectivePriceCurveKey } from "../tariff/compare-price-signal";
 import type { PriceSignal, PriceWindow } from "../tariff/types";
 import { dryRunTeslaTariff, type Diagnostic } from "./dry-run";
 
 type Translation = ReturnType<typeof dryRunTeslaTariff>;
 export type SyncStatus = "no-update" | "update-required" | "blocked";
-export type EconomicChange = "unchanged" | "changed" | "unestablished";
+export type EconomicChange = "unchanged" | "changed" | "unestablished" | "indeterminate";
 export type ChangedPeriod = {
     start: string;
     end: string;
@@ -14,6 +15,8 @@ export type SyncPlan = {
     status: SyncStatus;
     comparison: {
         state: EconomicChange;
+        domain: { start: string; end: string };
+        diagnostic: { code: string; source?: "previous" | "current" } | null;
         baselineEconomicKey: string | null;
         economicKey: string | null;
         // null means comparison unavailable, [] means no changed intervals.
@@ -21,7 +24,7 @@ export type SyncPlan = {
     };
     reasons: Array<{
         code: "ECONOMICS_UNCHANGED" | "ECONOMICS_CHANGED" | "BASELINE_MISSING" | "BASELINE_INVALID"
-            | "CURRENT_CURVE_INVALID" | "REPRESENTATION_BLOCKED" | "REPRESENTATION_AVAILABLE";
+            | "COMMON_DOMAIN_UNAVAILABLE" | "CURRENT_CURVE_INVALID" | "REPRESENTATION_BLOCKED" | "REPRESENTATION_AVAILABLE";
         diagnosticCodes?: string[];
     }>;
     hep: PriceSignal;
@@ -43,6 +46,7 @@ export type SyncPlan = {
  * No-update describes HEP change only; it does not certify a stored Tesla tariff.
  */
 export function decideSyncStatus(change: EconomicChange, blockers: readonly Diagnostic[]): SyncStatus {
+    if (change === "indeterminate") return "blocked";
     if (change === "unchanged") return "no-update";
     return blockers.length ? "blocked" : "update-required";
 }
@@ -92,45 +96,54 @@ function changedPeriods(before: PriceSignal, after: PriceSignal): ChangedPeriod[
 }
 
 /** Pure, read-only planning against a caller-supplied HEP baseline, never Tesla state.
- * The baseline should describe the same horizon. No baseline means representation
- * must be assessed, not that a change or a successful past sync is known.
+ * An explicit fixed comparison domain is required. Rolling horizon movement is
+ * not compared; unavailable/unsafe comparison coverage blocks the decision.
  */
 export function planTeslaTariffSync(input: {
     signal: PriceSignal;
     previousSignal?: PriceSignal;
     timeZone: string;
+    comparisonDomain: { start: string; end: string };
 }): SyncPlan {
-    // Reuse adapter validation for the baseline as well as the proposed curve.
-    const baselineEconomicKey = input.previousSignal
-        ? dryRunTeslaTariff(input.previousSignal, { timeZone: input.timeZone }).comparison.economicKey : null;
-    const translation = dryRunTeslaTariff(input.signal, { timeZone: input.timeZone,
-        ...(baselineEconomicKey !== null ? { previousEconomicKey: baselineEconomicKey } : {}) });
-    const economicKey = translation.comparison.economicKey;
-    const state: EconomicChange = translation.comparison.economicChanged === false ? "unchanged"
-        : translation.comparison.economicChanged === true ? "changed" : "unestablished";
+    const comparison = input.previousSignal
+        ? comparePriceSignalsInDomain(input.previousSignal, input.signal, input.comparisonDomain) : null;
+    const state: EconomicChange = comparison?.status ?? "indeterminate";
+    const baselineEconomicKey = comparison && comparison.status !== "indeterminate" ? comparison.previousKey : null;
+    const economicKey = comparison && comparison.status !== "indeterminate" ? comparison.currentKey : null;
+    const diagnostic = !comparison ? { code: "BASELINE_MISSING" }
+        : comparison.status === "indeterminate" ? comparison.diagnostic : null;
+    // Retain full proposed-curve Tesla diagnostics; never translate a clipped
+    // comparison interval as though it were the complete intended tariff.
+    let translation: Translation;
+    try { translation = dryRunTeslaTariff(input.signal, { timeZone: input.timeZone }); }
+    catch {
+        translation = { dryRun: true, hep: input.signal, comparison: { economicKey: null, economicChanged: null },
+            candidate: { timeZone: input.timeZone, horizon: input.signal.horizon, periods: [], tariffContentV2Fragment: null },
+            diagnostics: [{ code: "INVALID_COVERAGE", severity: "error", message: "Malformed current signal cannot be translated safely." }],
+            pricingCompatible: false, writeReady: false, writePayload: null };
+    }
     const blockers = translation.diagnostics.filter(d => d.severity === "error");
     if (!translation.candidate.tariffContentV2Fragment && !blockers.length) {
         blockers.push({ code: "CANDIDATE_UNAVAILABLE", severity: "error", message: "No Tesla inspection representation is available." });
     }
     const reasons: SyncPlan["reasons"] = [];
-    if (state !== "unestablished") reasons.push({ code: state === "unchanged" ? "ECONOMICS_UNCHANGED" : "ECONOMICS_CHANGED" });
+    if (state === "changed" || state === "unchanged") reasons.push({ code: state === "unchanged" ? "ECONOMICS_UNCHANGED" : "ECONOMICS_CHANGED" });
     if (!input.previousSignal) reasons.push({ code: "BASELINE_MISSING" });
-    else if (baselineEconomicKey === null) reasons.push({ code: "BASELINE_INVALID" });
-    if (economicKey === null) reasons.push({ code: "CURRENT_CURVE_INVALID" });
+    if (diagnostic) reasons.push({ code: "COMMON_DOMAIN_UNAVAILABLE", diagnosticCodes: [diagnostic.code] });
+    if (diagnostic && "source" in diagnostic && diagnostic.source === "previous") reasons.push({ code: "BASELINE_INVALID" });
+    if (translation.comparison.economicKey === null) reasons.push({ code: "CURRENT_CURVE_INVALID" });
     reasons.push(blockers.length ? { code: "REPRESENTATION_BLOCKED", diagnosticCodes: [...new Set(blockers.map(d => d.code))] }
         : { code: "REPRESENTATION_AVAILABLE" });
     const limitations = [
         { code: "HEP_BASELINE_ONLY", message: "Comparison is against the supplied HEP baseline, not confirmation of Tesla's stored tariff or a previous successful write." },
         { code: "INSPECTION_ONLY", message: "A candidate is an inspection-only draft, including when blocked. No command or write-ready payload is produced." },
     ];
-    if (input.previousSignal && (Date.parse(input.previousSignal.horizon.start) !== Date.parse(input.signal.horizon.start)
-        || Date.parse(input.previousSignal.horizon.end) !== Date.parse(input.signal.horizon.end))) {
-        limitations.push({ code: "HORIZON_CHANGED", message: "The comparison horizon changed. Added/removed coverage counts as change; it does not establish that overlapping prices changed." });
-    }
+    limitations.push({ code: "EXPLICIT_COMPARISON_DOMAIN", message: "Economic change and changed periods describe only the requested comparison domain; full candidate compatibility is assessed separately." });
     return {
         status: decideSyncStatus(state, blockers),
-        comparison: { state, baselineEconomicKey, economicKey,
-            changedPeriods: state === "unchanged" ? [] : state === "changed" ? changedPeriods(input.previousSignal!, input.signal) : null },
+        comparison: { state, domain: comparison?.domain ?? input.comparisonDomain, diagnostic, baselineEconomicKey, economicKey,
+            changedPeriods: comparison?.status === "unchanged" ? [] : comparison?.status === "changed"
+                ? changedPeriods(comparison.projected.previous, comparison.projected.current) : null },
         reasons, hep: translation.hep, candidate: translation.candidate,
         compatibility: { pricingCompatible: translation.pricingCompatible, representable: !blockers.length,
             blockers, warnings: translation.diagnostics.filter(d => d.severity === "warning") },

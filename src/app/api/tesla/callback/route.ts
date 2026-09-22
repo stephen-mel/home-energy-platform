@@ -1,14 +1,18 @@
+import { consumeTeslaOAuthState, TESLA_STATE_COOKIE } from "../../../../lib/tesla/oauth-state";
 import { NextRequest, NextResponse } from "next/server";
 import { writeFile } from "fs/promises";
 import path from "path";
 
 export async function GET(request: NextRequest) {
+  if (!consumeTeslaOAuthState(request.nextUrl.searchParams.get("state"), request.cookies.get(TESLA_STATE_COOKIE)?.value)) {
+    return NextResponse.json({ success: false, error: "Invalid or expired OAuth state" }, { status: 400 });
+  }
   const code = request.nextUrl.searchParams.get("code");
   const error = request.nextUrl.searchParams.get("error");
 
   if (error) {
     return NextResponse.json(
-      { success: false, error },
+      { success: false, error: "Tesla authorization was not completed" },
       { status: 400 }
     );
   }
@@ -56,14 +60,6 @@ export async function GET(request: NextRequest) {
     );
 
     if (!response.ok) {
-      const errorText = await response.text();
-
-      console.error(
-        "Tesla token exchange failed:",
-        response.status,
-        errorText
-      );
-
       return NextResponse.json(
         {
           success: false,
@@ -95,7 +91,6 @@ export async function GET(request: NextRequest) {
       "utf8"
     );
 
-    console.log("Tesla OAuth tokens saved locally");
 
     return NextResponse.json({
       success: true,
@@ -104,18 +99,7 @@ export async function GET(request: NextRequest) {
       hasRefreshToken: Boolean(tokens.refresh_token),
       expiresIn: tokens.expires_in ?? null,
     });
-  } catch (error) {
-    console.error("Tesla OAuth callback failed:", error);
-
-    return NextResponse.json(
-      {
-        success: false,
-        error:
-          error instanceof Error
-            ? error.message
-            : "Unknown Tesla OAuth error",
-      },
-      { status: 500 }
-    );
+  } catch {
+    return NextResponse.json({ success: false, error: "Tesla OAuth callback failed" }, { status: 500 });
   }
 }

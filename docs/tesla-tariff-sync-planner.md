@@ -1,7 +1,7 @@
 # Tesla tariff sync planner v1
 
 `src/lib/tesla-tariff/sync-planner.ts` exports the pure
-`planTeslaTariffSync({ signal, previousSignal?, timeZone })` function.
+`planTeslaTariffSync({ signal, previousSignal?, timeZone, comparisonDomain })` function.
 It accepts the current HEP `PriceSignal` and an optional previous HEP signal.
 It does not fetch Tesla state, persist a baseline, load a client, use a clock,
 poll, access credentials or execute a command.
@@ -11,6 +11,7 @@ const plan = planTeslaTariffSync({
     signal: currentHepSignal,
     previousSignal: previousHepSignal,
     timeZone: "Europe/London",
+    comparisonDomain: fixedOperationInterval,
 });
 ```
 
@@ -23,11 +24,10 @@ const plan = planTeslaTariffSync({
 - `blocked`: new/changed economics need representation, but translation reports
   errors. Every adapter error is retained, including future diagnostic codes.
 
-`comparison` supplies canonical keys, `unchanged` / `changed` / `unestablished`,
+`comparison` supplies canonical keys, `unchanged` / `changed` / `indeterminate`,
 and changed UTC intervals with independent import/export channel attribution.
 An empty interval list means no change; null means comparison was unavailable.
-Missing or invalid baseline means unestablished, not proven change/no-change.
-A missing baseline requires representation assessment. An invalid current curve
+Missing or invalid baseline means indeterminate and blocked, not proven change/no-change. An invalid current curve
 is blocked by adapter validation.
 
 `reasons` supplies structured decision codes. `compatibility` separates numerical
@@ -39,19 +39,18 @@ All results have `inspectionOnly: true`, `writeReady: false`, `writePayload: nul
 
 ## Reuse and boundaries
 
-The planner uses `dryRunTeslaTariff` for current/baseline validation, translation
-and comparison via the existing `effectivePriceCurveKey`. Changed interval evidence
-uses the same canonical comparison on boundary slices, including eligibility
-boundaries; it does not define new price equality rules. Metadata, freshness and
-provenance changes do not change the key. Evidence-state changes remain relevant
-under the existing comparison; nothing promotes planned evidence.
+The planner uses `comparePriceSignalsInDomain` and its existing canonical economic
+keys for decisions. `comparisonDomain` is required: both snapshots must fully and
+safely cover that fixed interval. Changed-period evidence uses the same validated,
+clipped snapshots. Horizon movement outside that domain is not an economic change.
+Invalid timestamps, invalid/unknown prices, malformed horizons or missing coverage
+produce `indeterminate`, a structured diagnostic and a blocked plan. No implicit
+intersection is selected. Effects outside the requested domain are not assessed.
 
-Use the same horizon when comparing snapshots. Changing the horizon also changes
-the existing key; the planner reports `HORIZON_CHANGED` and the added/removed
-coverage rather than silently treating it as a price change within the overlap.
-The baseline is a caller-supplied previous HEP signal, not a claim that Tesla was
-successfully updated. v1 accepts signals, not opaque saved keys, so changed-period
-evidence can be computed without introducing a key parser or second key format.
+`dryRunTeslaTariff` still assesses the full proposed signal, retaining its original
+compatibility diagnostics and candidate. Comparison failure does not hide those
+diagnostics. The baseline remains a caller-supplied HEP signal, never a claim about
+Tesla state or a successful prior write.
 The supplied timezone is passed unchanged to the adapter, retaining its DST
 splits, warnings and blockers. Timezone-configuration changes are outside the HEP
 economic key and require a separate future configuration checkpoint.
