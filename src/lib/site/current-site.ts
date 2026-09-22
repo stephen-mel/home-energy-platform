@@ -34,6 +34,23 @@ export const currentSite: Site = {
         timeZone: "Europe/London",
         normalImport: null,
         export: null,
+        versions: [{
+            id: "eon-next-drive-smart-v5.2",
+            name: "E.ON Next Drive Smart V5.2 (VAT inclusive)",
+            provider: "eon-next",
+            // Prototype validity: known as of 22 September; October rates unknown.
+            effectiveFrom: "2026-09-22T00:00:00+01:00",
+            effectiveTo: "2026-10-01T00:00:00+01:00",
+            pricesIncludeVat: true,
+            normalImport: { amount: 0.2518, currency: "GBP", unit: "kWh" },
+            export: { amount: 0.175, currency: "GBP", unit: "kWh" },
+            scheduledChargingImport: { amount: 0.0299, currency: "GBP", unit: "kWh" },
+            standingCharge: { amount: 0.60, currency: "GBP", unit: "day" },
+            dailyImportWindows: [{
+                start: "00:00", end: "06:00", kind: "guaranteed-off-peak",
+                price: { amount: 0.0299, currency: "GBP", unit: "kWh" },
+            }],
+        }],
     },
 
     constraints: {

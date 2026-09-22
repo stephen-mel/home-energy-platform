@@ -8,6 +8,7 @@ export function krakenDispatchPriceWindows(
     state: KrakenState, importPrice: EnergyPrice | null,
 ): PriceInputWindow[] {
     return state.vehicles.flatMap(vehicle => vehicle.plannedDispatches.flatMap(dispatch => {
+        if (dispatch.type !== "SMART") return [];
         const start = instant(dispatch.start), end = instant(dispatch.end);
         if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return [];
         return [{

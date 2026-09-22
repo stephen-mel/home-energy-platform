@@ -5,6 +5,7 @@ export type EnergyPrice = { amount: number; currency: string; unit: "kWh" };
 export type PriceSource = {
     provider: string;
     description: string;
+    tariffVersion?: string;
     // Source snapshot timestamp, not evidence that EV charging occurred.
     observedAt: string | null;
     stale: boolean;
@@ -40,7 +41,7 @@ export type PriceWindow = {
     end: string;
     price: EnergyPrice | null;
     priceStatus: "known" | "unknown" | "conflicting";
-    kind: "standard" | "cheap-opportunity";
+    kind: "standard" | "guaranteed-off-peak" | "cheap-opportunity";
     condition: "none" | "scheduled-ev-charging";
     stale: boolean;
     sources: PriceSource[];
@@ -55,10 +56,32 @@ export type PriceInputWindow = Omit<PriceWindow, "priceStatus" | "stale" | "elig
     // assessment cadence; the generic curve does not assume all tariffs are half-hourly.
     eligibility?: { state: EligibilityState; intervalMinutes: number };
 };
-export type TariffConfig = {
-    timeZone: string;
+export type TariffVersion = {
+    id: string;
+    name: string;
+    provider: string;
+    // Explicit instants, inclusive start/exclusive end. No automatic extrapolation.
+    effectiveFrom: string;
+    effectiveTo: string;
+    pricesIncludeVat: boolean;
     normalImport: EnergyPrice | null;
     export: EnergyPrice | null;
+    scheduledChargingImport: EnergyPrice | null;
+    standingCharge: { amount: number; currency: string; unit: "day" } | null;
+    dailyImportWindows: Array<{
+        start: string; // HH:mm in TariffConfig.timeZone
+        end: string; // HH:mm; an earlier end crosses midnight
+        price: EnergyPrice | null;
+        kind: "standard" | "guaranteed-off-peak";
+    }>;
+};
+
+export type TariffConfig = {
+    timeZone: string;
+    // Legacy/other-provider defaults; ignored when versions is present.
+    normalImport: EnergyPrice | null;
+    export: EnergyPrice | null;
+    versions?: TariffVersion[];
     importWindows?: PriceInputWindow[];
     exportWindows?: PriceInputWindow[];
 };

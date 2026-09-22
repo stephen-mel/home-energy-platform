@@ -64,7 +64,7 @@ export default function HomeEnergyPlan({ plan }: { plan: SitePricePlan }) {
                         <time dateTime={window.end}>{time(window.end)}</time>
                     </p>
                     <p className="mt-1 font-medium">
-                        {window.kind === "cheap-opportunity" ? "Whole-home cheap opportunity" : "Standard tariff"}
+                        {window.kind === "cheap-opportunity" ? "Whole-home cheap opportunity" : window.kind === "guaranteed-off-peak" ? "Guaranteed off-peak tariff" : "Standard tariff"}
                         {" · "}{formatPrice(window.price)}
                     </p>
                     {window.priceStatus === "conflicting" && (

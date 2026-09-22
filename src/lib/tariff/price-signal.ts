@@ -15,7 +15,8 @@ function uniqueSources(sources: PriceSource[]): PriceSource[] {
 }
 
 // Produces a complete, ordered, non-overlapping half-open [start, end) curve.
-// Opportunity windows override the baseline, but are still explicitly conditional.
+// Guaranteed off-peak windows take precedence over conditional opportunities;
+// opportunities otherwise override the standard baseline. Neither implies billing verification.
 // Conflicting prices in the same layer become unknown instead of picking a winner.
 export function buildPriceCurve(
     horizon: { start: string; end: string },
@@ -44,7 +45,8 @@ export function buildPriceCurve(
         const from = points[i], to = points[i + 1];
         const active = inputs.filter(w => w.from <= from && w.to >= to);
         const opportunities = active.filter(w => w.kind === "cheap-opportunity");
-        const selected = opportunities.length ? opportunities : active;
+        const guaranteed = active.filter(w => w.kind === "guaranteed-off-peak");
+        const selected = guaranteed.length ? guaranteed : opportunities.length ? opportunities : active;
         const prices = selected.length ? selected.map(w => w.price) : [validPrice(baseline)];
         const conflicting = new Set(prices.map(price => JSON.stringify(price))).size > 1;
         const price = conflicting ? null : prices[0];
@@ -55,7 +57,7 @@ export function buildPriceCurve(
         const window: PriceWindow = {
             start: new Date(from).toISOString(), end: new Date(to).toISOString(), price,
             priceStatus: conflicting ? "conflicting" : price === null ? "unknown" : "known",
-            kind: opportunities.length ? "cheap-opportunity" : "standard",
+            kind: guaranteed.length ? "guaranteed-off-peak" : opportunities.length ? "cheap-opportunity" : "standard",
             condition: selected.some(w => w.condition === "scheduled-ev-charging") ? "scheduled-ev-charging" : "none",
             stale: sources.some(source => source.stale), sources,
             eligibilityPeriods: selected.flatMap(input => {

@@ -19,9 +19,12 @@ function load(file, dependencies = {}) {
   return exports;
 }
 const curve = load('src/lib/tariff/price-signal.ts');
+const effectiveTariff = load('src/lib/tariff/effective-tariff.ts', { './price-signal': curve });
+const { effectivePriceCurveKey } = load('src/lib/tariff/compare-price-signal.ts');
 const adapter = load('src/lib/tariff/kraken-dispatches.ts', { './price-signal': curve });
 const { getSitePriceSignal } = load('src/lib/site/get-site-price-signal.ts', {
   '../tariff/price-signal': curve, '../tariff/kraken-dispatches': adapter,
+  '../tariff/effective-tariff': effectiveTariff,
 });
 const { default: HomeEnergyPlan } = load('src/components/HomeEnergyPlan.tsx', { 'react/jsx-runtime': jsxRuntime });
 const now = '2026-09-18T00:00:00.000Z';
@@ -161,7 +164,7 @@ test('neutral representation supports arbitrary import/export curves and does no
   assert.ok(conflict); assert.equal(conflict.price, null);
 });
 
-test('current site has no invented monetary prices', () => {
+test('current site does not backdate configured prices before their effective date', () => {
   const { currentSite } = load('src/lib/site/current-site.ts');
   const plan = getSitePriceSignal(currentSite, state([dispatch(2, 3)]), now);
   assert.equal(cheap(plan).length, 1);
@@ -178,8 +181,8 @@ test('homeowner UI exposes conditionality, sources, known/unknown prices, dates 
 });
 
 test('adjacent opportunities name each vehicle and show the exact original dispatches beneath the HEP grouping', () => {
-  const first = { ...dispatch(2, 3), start: '2026-09-18T02:00:12.345Z', type: 'TYPE_A' };
-  const second = { ...dispatch(3, 4), type: 'TYPE_B' };
+  const first = { ...dispatch(2, 3), start: '2026-09-18T02:00:12.345Z', type: 'SMART' };
+  const second = { ...dispatch(3, 4), type: 'SMART' };
   const snapshot = state([]);
   snapshot.vehicles = [
     { id: 'vehicle-a', name: 'Family car', plannedDispatches: [first] },
@@ -191,8 +194,8 @@ test('adjacent opportunities name each vehicle and show the exact original dispa
   assert.equal(cheap(plan)[0].start, first.start);
   assert.equal(cheap(plan)[0].end, second.end);
   assert.deepEqual(plain(cheap(plan)[0].sources.map(s => s.cause)), [
-    { kind: 'ev-dispatch', assetId: 'vehicle-a', assetName: 'Family car', start: first.start, end: first.end, dispatchType: 'TYPE_A' },
-    { kind: 'ev-dispatch', assetId: 'vehicle-b', assetName: 'City car', start: second.start, end: second.end, dispatchType: 'TYPE_B' },
+    { kind: 'ev-dispatch', assetId: 'vehicle-a', assetName: 'Family car', start: first.start, end: first.end, dispatchType: 'SMART' },
+    { kind: 'ev-dispatch', assetId: 'vehicle-b', assetName: 'City car', start: second.start, end: second.end, dispatchType: 'SMART' },
   ]);
   const html = renderToStaticMarkup(createElement(HomeEnergyPlan, { plan }));
   assert.match(html, /HEP grouping of planned Kraken opportunities/);
@@ -210,10 +213,10 @@ test('adjacent opportunities name each vehicle and show the exact original dispa
   assert.match(items, /03:00:12.345/); // Display preserves seconds/fractions, in the site's timezone.
 });
 
-test('overlapping/clipped opportunities retain original intervals and fall back to vehicle IDs and missing types', () => {
+test('overlapping/clipped opportunities retain original intervals and fall back to vehicle IDs', () => {
   const snapshot = state([]);
   const originals = [
-    { start: '2026-09-17T23:00:00Z', end: at(3), type: '', energyAddedKwh: null },
+    { start: '2026-09-17T23:00:00Z', end: at(3), type: 'SMART', energyAddedKwh: null },
     dispatch(2, 4),
   ];
   snapshot.vehicles = originals.map((d, i) => ({ id: `ev-${i}`, name: '', plannedDispatches: [d] }));
@@ -222,7 +225,7 @@ test('overlapping/clipped opportunities retain original intervals and fall back 
   const html = renderToStaticMarkup(createElement(HomeEnergyPlan, { plan }));
   const items = html.split('aria-label="Original Kraken dispatches"')[1].split('</ul>')[0];
   assert.match(items, /ev-0/); assert.match(items, /ev-1/);
-  assert.match(items, /Dispatch type: Not supplied/); assert.match(items, /Dispatch type: SMART/);
+  assert.match(items, /Dispatch type: SMART/);
   for (const original of originals) {
     assert.ok(items.includes(`dateTime="${original.start}"`));
     assert.ok(items.includes(`dateTime="${original.end}"`));
@@ -309,4 +312,161 @@ test('UI explains planned status, half-hour billing and early charging completio
   for (const text of ['Planned / conditional', 'half-hourly meter readings', 'actually charging',
     'If charging finishes early or the schedule changes', 'shorter than this planned range',
     'not confirmed billed rates', 'Price not configured / unknown']) assert.ok(html.includes(text), text);
+});
+
+const eonSite = () => load('src/lib/site/current-site.ts').currentSite;
+const eonDispatch = (start, end, type = 'SMART') => ({ start, end, type, energyAddedKwh: null });
+const eonPlan = (dispatches = [], date = '2026-09-22T11:00:00Z', config = eonSite(), stale = false) =>
+  getSitePriceSignal(config, state(dispatches, stale), date);
+const windowAt = (windows, date) => windows.find(w => Date.parse(w.start) <= Date.parse(date) && Date.parse(w.end) > Date.parse(date));
+
+test('E.ON supplies 25.18p daytime and guaranteed 2.99p London overnight without Kraken; export is independent', () => {
+  const config = eonSite(); config.integrations.kraken.enabled = false;
+  const plan = eonPlan([], '2026-09-22T00:00:00+01:00', config);
+  const overnight = windowAt(plan.signal.import, '2026-09-22T05:59:59+01:00');
+  assert.equal(overnight.price.amount, 0.0299);
+  assert.equal(overnight.kind, 'guaranteed-off-peak'); assert.equal(overnight.condition, 'none');
+  assert.equal(overnight.eligibilityPeriods.length, 0);
+  assert.equal(overnight.start, '2026-09-21T23:00:00.000Z');
+  assert.equal(overnight.end, '2026-09-22T05:00:00.000Z');
+  const daytime = windowAt(plan.signal.import, '2026-09-22T06:00:00+01:00');
+  assert.equal(daytime.price.amount, 0.2518); assert.equal(daytime.condition, 'none');
+  assert.equal(windowAt(plan.signal.import, '2026-09-23T00:00:00+01:00').price.amount, 0.0299);
+  assert.equal(plan.signal.export.length, 1); assert.equal(plan.signal.export[0].price.amount, 0.175);
+  assert.equal(plan.signal.export[0].condition, 'none');
+  assert.equal(plan.signal.export[0].eligibilityPeriods.length, 0);
+  assert.equal(config.tariff.versions[0].standingCharge.amount, 0.60);
+  assert.equal(config.tariff.versions[0].pricesIncludeVat, true);
+  assert.ok(!JSON.stringify(plan.signal).includes('standingCharge'));
+  assert.ok(!JSON.stringify(plan.signal).includes('0.6'));
+  // With the integration enabled but no dispatch, the same base economics apply.
+  assert.equal(effectivePriceCurveKey(eonPlan([], '2026-09-22T00:00:00+01:00').signal), effectivePriceCurveKey(plan.signal));
+});
+
+test('only SMART daytime dispatches create planned/conditional 2.99p opportunities', () => {
+  const d = eonDispatch('2026-09-22T12:00:00+01:00', '2026-09-22T14:00:00+01:00');
+  for (const stale of [false, true]) {
+    const plan = eonPlan([d], '2026-09-22T10:00:00+01:00', eonSite(), stale);
+    const opportunity = windowAt(plan.signal.import, d.start);
+    assert.equal(opportunity.price.amount, 0.0299); assert.equal(opportunity.kind, 'cheap-opportunity');
+    assert.equal(opportunity.condition, 'scheduled-ev-charging'); assert.equal(opportunity.stale, stale);
+    assert.ok(opportunity.eligibilityPeriods.every(p => p.state === 'planned-conditional'));
+    assert.equal(windowAt(plan.signal.import, d.end).price.amount, 0.2518);
+    assert.equal(plan.signal.export[0].price.amount, 0.175);
+  }
+  const base = effectivePriceCurveKey(eonPlan([]).signal);
+  for (const type of ['BOOST', 'OTHER', 'smart', '', undefined]) {
+    const plan = eonPlan([{ ...d, type }]);
+    assert.equal(cheap(plan).length, 0);
+    assert.equal(effectivePriceCurveKey(plan.signal), base);
+  }
+});
+
+test('22:30–04:00 SMART dispatch becomes conditional until midnight then guaranteed to 06:00', () => {
+  const d = eonDispatch('2026-09-22T22:30:00+01:00', '2026-09-23T04:00:00+01:00');
+  const plan = eonPlan([d], '2026-09-22T22:00:00+01:00');
+  const conditional = windowAt(plan.signal.import, d.start);
+  assert.equal(conditional.start, '2026-09-22T21:30:00.000Z');
+  assert.equal(conditional.end, '2026-09-22T23:00:00.000Z');
+  assert.equal(conditional.price.amount, 0.0299); assert.equal(conditional.condition, 'scheduled-ev-charging');
+  const cause = conditional.sources.find(s => s.cause).cause;
+  assert.equal(cause.start, d.start); assert.equal(cause.end, d.end);
+  const guaranteed = windowAt(plan.signal.import, '2026-09-23T00:00:00+01:00');
+  assert.equal(guaranteed.start, '2026-09-22T23:00:00.000Z');
+  assert.equal(guaranteed.end, '2026-09-23T05:00:00.000Z');
+  assert.equal(guaranteed.kind, 'guaranteed-off-peak'); assert.equal(guaranteed.price.amount, 0.0299);
+  assert.equal(guaranteed.condition, 'none'); assert.equal(guaranteed.stale, false);
+  assert.equal(guaranteed.eligibilityPeriods.length, 0);
+  assert.ok(guaranteed.sources.every(s => s.provider === 'eon-next'));
+  assert.equal(windowAt(plan.signal.import, '2026-09-23T06:00:00+01:00').price.amount, 0.2518);
+});
+
+test('SMART dispatch wholly overnight cannot make guaranteed tariff conditional or stale', () => {
+  const date = '2026-09-22T00:00:00+01:00';
+  const d = eonDispatch('2026-09-22T01:15:00+01:00', '2026-09-22T04:45:00+01:00');
+  const plan = eonPlan([d], date, eonSite(), true);
+  assert.equal(cheap(plan).length, 0);
+  assert.equal(effectivePriceCurveKey(plan.signal), effectivePriceCurveKey(eonPlan([], date).signal));
+  assert.ok(plan.signal.import.every(w => w.condition === 'none' && !w.stale && w.eligibilityPeriods.length === 0));
+});
+
+test('effective dates clip all rates precisely; unknown October prices are never extrapolated', () => {
+  const config = eonSite();
+  const before = eonPlan([], '2026-09-21T23:30:00+01:00');
+  assert.equal(before.signal.import[0].price, null); assert.equal(before.signal.export[0].price, null);
+  assert.equal(windowAt(before.signal.import, '2026-09-22T00:00:00+01:00').price.amount, 0.0299);
+  const d = eonDispatch('2026-09-30T22:30:00+01:00', '2026-10-01T04:00:00+01:00');
+  const plan = eonPlan([d], '2026-09-30T22:00:00+01:00');
+  assert.equal(windowAt(plan.signal.import, d.start).price.amount, 0.0299);
+  const unknown = windowAt(plan.signal.import, '2026-10-01T00:00:00+01:00');
+  assert.equal(unknown.price, null); assert.equal(unknown.kind, 'cheap-opportunity');
+  assert.ok(unknown.eligibilityPeriods.every(p => p.state === 'planned-conditional'));
+  assert.equal(windowAt(plan.signal.export, '2026-10-01T00:00:00+01:00').price, null);
+  assert.ok(eonPlan([], '2026-10-01T00:00:00+01:00').signal.import.every(w => w.price === null));
+  // Synthetic second version tests selection, not a claim about future E.ON prices.
+  const second = plain(config.tariff.versions[0]);
+  config.tariff.versions[0].effectiveTo = '2026-09-23T12:00:00+01:00';
+  second.id = 'test-version'; second.effectiveFrom = '2026-09-23T12:00:00+01:00';
+  second.normalImport = price(0.40); second.scheduledChargingImport = price(0.05);
+  config.tariff.versions.push(second);
+  const change = eonPlan([], '2026-09-23T10:00:00+01:00', config);
+  assert.equal(windowAt(change.signal.import, '2026-09-23T11:59:59+01:00').price.amount, 0.2518);
+  assert.equal(windowAt(change.signal.import, '2026-09-23T12:00:00+01:00').price.amount, 0.40);
+  const smartChange = eonPlan([eonDispatch('2026-09-23T11:00:00+01:00', '2026-09-23T13:00:00+01:00')], '2026-09-23T10:00:00+01:00', config);
+  assert.equal(windowAt(smartChange.signal.import, '2026-09-23T11:59:59+01:00').price.amount, 0.0299);
+  assert.equal(windowAt(smartChange.signal.import, '2026-09-23T12:00:00+01:00').price.amount, 0.05);
+});
+
+test('Europe/London local midnight–06:00 is five elapsed hours at spring DST and seven at autumn DST', () => {
+  // Widen only this synthetic fixture's validity to exercise timezone arithmetic.
+  // The real site has no configured March/October version.
+  const config = eonSite();
+  config.tariff.versions[0].id = 'dst-test-fixture';
+  config.tariff.versions[0].effectiveFrom = '2026-01-01T00:00:00Z';
+  config.tariff.versions[0].effectiveTo = '2027-01-01T00:00:00Z';
+  for (const [start, end, hours] of [
+    ['2026-03-29T00:00:00Z', '2026-03-29T05:00:00.000Z', 5],
+    ['2026-10-24T23:00:00Z', '2026-10-25T06:00:00.000Z', 7],
+  ]) {
+    const first = eonPlan([], start, config).signal.import[0];
+    assert.equal(first.kind, 'guaranteed-off-peak'); assert.equal(first.price.amount, 0.0299);
+    assert.equal(first.end, end); assert.equal((Date.parse(first.end) - Date.parse(first.start)) / 3600000, hours);
+  }
+});
+
+test('canonical economics ignore freshness/order/timestamps/standing charge but detect prices, conditions and evidence changes', () => {
+  const ds = [eonDispatch('2026-09-22T12:00:00+01:00', '2026-09-22T13:00:00+01:00'),
+    eonDispatch('2026-09-22T13:00:00+01:00', '2026-09-22T14:00:00+01:00')];
+  const date = '2026-09-22T10:00:00+01:00';
+  const original = eonPlan(ds, date).signal;
+  const key = effectivePriceCurveKey(original);
+  const reordered = eonPlan([...ds].reverse(), date, eonSite(), true).signal;
+  reordered.generatedAt = '2026-09-22T10:00:01Z';
+  for (const w of reordered.import) for (const source of w.sources) source.observedAt = '2026-09-22T09:59:59Z';
+  assert.equal(effectivePriceCurveKey(reordered), key);
+  const config = eonSite(); config.tariff.versions[0].standingCharge.amount = 99;
+  assert.equal(effectivePriceCurveKey(eonPlan(ds, date, config).signal), key);
+  config.tariff.versions[0].normalImport.amount = 0.30;
+  assert.notEqual(effectivePriceCurveKey(eonPlan(ds, date, config).signal), key);
+  const observed = plain(original);
+  observed.import.find(w => w.kind === 'cheap-opportunity').eligibilityPeriods[0].state = 'observed-qualified';
+  assert.notEqual(effectivePriceCurveKey(observed), key);
+  assert.notEqual(effectivePriceCurveKey(eonPlan([], date).signal), key);
+});
+
+test('UI keeps existing structure and labels guaranteed off-peak separately from planned opportunities', () => {
+  const html = renderToStaticMarkup(createElement(HomeEnergyPlan, { plan: eonPlan() }));
+  for (const label of ['Guaranteed off-peak tariff', '2.99p/kWh', '25.18p/kWh', '17.5p/kWh']) assert.ok(html.includes(label), label);
+  assert.ok(!html.includes('60p/kWh'));
+});
+
+test('equivalent horizon instants compare identically and ambiguous versions remain unknown', () => {
+  const a = eonPlan([], '2026-09-22T10:00:00+01:00');
+  const b = eonPlan([], '2026-09-22T09:00:00Z');
+  assert.equal(effectivePriceCurveKey(a.signal), effectivePriceCurveKey(b.signal));
+  const config = eonSite();
+  config.tariff.versions.push({ ...config.tariff.versions[0], id: 'accidental-overlap' });
+  const ambiguous = eonPlan([], '2026-09-22T10:00:00+01:00', config);
+  assert.ok([...ambiguous.signal.import, ...ambiguous.signal.export].every(w => w.price === null));
+  assert.match(ambiguous.signal.import[0].sources[0].description, /Overlapping tariff versions/);
 });

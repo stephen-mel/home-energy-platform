@@ -1,3 +1,4 @@
+import { resolveEffectiveTariff, applyDispatchRates } from "../tariff/effective-tariff";
 import type { Site } from "./types";
 import type { KrakenState } from "./kraken-state";
 import type { PriceSignal } from "../tariff/types";
@@ -19,7 +20,9 @@ export function getSitePriceSignal(site: Site, kraken: KrakenState | null, now: 
     const rule = site.integrations.kraken.wholeHomeDispatchRate;
     const enabled = site.integrations.kraken.enabled && rule?.enabled === true;
     const horizon = { start: now, end: new Date(Date.parse(now) + 48 * 60 * 60 * 1000).toISOString() };
-    const opportunities = enabled && kraken ? krakenDispatchPriceWindows(kraken, rule.importPrice) : [];
+    const effective = tariff?.versions ? resolveEffectiveTariff(tariff, horizon) : null;
+    const dispatches = enabled && kraken ? krakenDispatchPriceWindows(kraken, rule.importPrice) : [];
+    const opportunities = effective ? applyDispatchRates(dispatches, effective.dispatchRates) : dispatches;
     return {
         timeZone: tariff?.timeZone ?? "UTC",
         kraken: {
@@ -28,8 +31,8 @@ export function getSitePriceSignal(site: Site, kraken: KrakenState | null, now: 
         },
         signal: {
             scope: "whole-home", generatedAt: now, horizon,
-            import: buildPriceCurve(horizon, tariff?.normalImport ?? null, [...(tariff?.importWindows ?? []), ...opportunities]),
-            export: buildPriceCurve(horizon, tariff?.export ?? null, tariff?.exportWindows ?? []),
+            import: buildPriceCurve(horizon, effective ? null : tariff?.normalImport ?? null, [...(effective?.import ?? tariff?.importWindows ?? []), ...opportunities]),
+            export: buildPriceCurve(horizon, effective ? null : tariff?.export ?? null, effective?.export ?? tariff?.exportWindows ?? []),
         },
     };
 }
