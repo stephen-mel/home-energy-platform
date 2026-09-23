@@ -9,6 +9,7 @@ import { representationKey } from "./rollback-evidence";
 export type ObservedSmartInput = {
     observation: ObservedTariff;
     generatedAt: string;
+    preserveLabels?: boolean;
     // Original, exact source boundaries; a changed dispatch must be reselected.
     dispatch: { assetId: string; start: string; end: string };
     previousSignal: PriceSignal;
@@ -61,7 +62,7 @@ export function prepareObservedSmart(input: ObservedSmartInput, signal: PriceSig
     const toMinute = b.date === a.date ? b.minute : b.minute === 0 && last.date === a.date ? 1440 : -1;
     if (toMinute <= a.minute || (toMinute - a.minute) * 60000 !== end - start) return fail("UNSUPPORTED_LOCAL_SMART_INTERVAL");
     const simulation = simulateObservedSmartDate(observation, { date: a.date, fromMinute: a.minute, toMinute,
-        buy: price.amount, currency: price.currency, compareDates: [] });
+        buy: price.amount, currency: price.currency, compareDates: [], preserveLabels: input.preserveLabels });
     const inspected = inspectObservedProposalTariff(simulation.simulated?.tariff);
     if (!inspected.exact) return fail("REPRESENTATION_UNAVAILABLE");
     const syncPlan = planTeslaTariffSync({ signal, previousSignal: input.previousSignal, comparisonDomain: input.comparisonDomain, timeZone });

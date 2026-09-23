@@ -1,0 +1,328 @@
+{
+  "fixtureNote": "Live-captured tariff fields and Q7 dispatch boundaries; synthetic IDs and freshness timestamps. Not a live approval.",
+  "before": {
+    "source": {
+      "kind": "tesla-site-info",
+      "energySiteId": "12345",
+      "observedAt": "2026-09-23T08:11:50.000Z",
+      "timeZone": "Europe/London"
+    },
+    "tariff": {
+      "name": "Next Drive Smart V5.2",
+      "utility": "Eon Next",
+      "currency": "GBP",
+      "code": "FLATPEAK",
+      "version": 1,
+      "seasons": {
+        "ThreeDays": {
+          "fromMonth": 9,
+          "fromDay": 25,
+          "toMonth": 9,
+          "toDay": 20,
+          "tou_periods": {
+            "hour_0_minute_0": {
+              "periods": [
+                {
+                  "toDayOfWeek": 6,
+                  "toHour": 6
+                }
+              ]
+            },
+            "hour_6_minute_0": {
+              "periods": [
+                {
+                  "toDayOfWeek": 6,
+                  "fromHour": 6
+                }
+              ]
+            }
+          }
+        },
+        "Today": {
+          "fromMonth": 9,
+          "fromDay": 22,
+          "toMonth": 9,
+          "toDay": 22,
+          "tou_periods": {
+            "hour_0_minute_0": {
+              "periods": [
+                {
+                  "toDayOfWeek": 6,
+                  "toHour": 6
+                }
+              ]
+            },
+            "hour_6_minute_0": {
+              "periods": [
+                {
+                  "toDayOfWeek": 6,
+                  "fromHour": 6
+                }
+              ]
+            }
+          }
+        },
+        "Tomorrow": {
+          "fromMonth": 9,
+          "fromDay": 23,
+          "toMonth": 9,
+          "toDay": 23,
+          "tou_periods": {
+            "hour_0_minute_0": {
+              "periods": [
+                {
+                  "toDayOfWeek": 6,
+                  "toHour": 6
+                }
+              ]
+            },
+            "hour_6_minute_0": {
+              "periods": [
+                {
+                  "toDayOfWeek": 6,
+                  "fromHour": 6
+                }
+              ]
+            }
+          }
+        },
+        "TwoDays": {
+          "fromMonth": 9,
+          "fromDay": 24,
+          "toMonth": 9,
+          "toDay": 24,
+          "tou_periods": {
+            "hour_0_minute_0": {
+              "periods": [
+                {
+                  "toDayOfWeek": 6,
+                  "toHour": 6
+                }
+              ]
+            },
+            "hour_6_minute_0": {
+              "periods": [
+                {
+                  "toDayOfWeek": 6,
+                  "fromHour": 6
+                }
+              ]
+            }
+          }
+        },
+        "Yesterday": {
+          "fromMonth": 9,
+          "fromDay": 21,
+          "toMonth": 9,
+          "toDay": 21,
+          "tou_periods": {
+            "hour_0_minute_0": {
+              "periods": [
+                {
+                  "toDayOfWeek": 6,
+                  "toHour": 6
+                }
+              ]
+            },
+            "hour_6_minute_0": {
+              "periods": [
+                {
+                  "toDayOfWeek": 6,
+                  "fromHour": 6
+                }
+              ]
+            }
+          }
+        }
+      },
+      "energy_charges": {
+        "ThreeDays": {
+          "rates": {
+            "hour_0_minute_0": 0.02993,
+            "hour_6_minute_0": 0.25177
+          }
+        },
+        "Today": {
+          "rates": {
+            "hour_0_minute_0": 0.02993,
+            "hour_6_minute_0": 0.25177
+          }
+        },
+        "Tomorrow": {
+          "rates": {
+            "hour_0_minute_0": 0.02993,
+            "hour_6_minute_0": 0.25177
+          }
+        },
+        "TwoDays": {
+          "rates": {
+            "hour_0_minute_0": 0.02993,
+            "hour_6_minute_0": 0.25177
+          }
+        },
+        "Yesterday": {
+          "rates": {
+            "hour_0_minute_0": 0.02993,
+            "hour_6_minute_0": 0.25177
+          }
+        }
+      },
+      "demand_charges": {
+        "ALL": {
+          "rates": {
+            "ALL": 0
+          }
+        },
+        "ThreeDays": {},
+        "Today": {},
+        "Tomorrow": {},
+        "TwoDays": {},
+        "Yesterday": {}
+      },
+      "sell_tariff": {
+        "name": "Premium export",
+        "utility": "EON Next",
+        "currency": "GBP",
+        "code": "FLATPEAK",
+        "seasons": {
+          "ThreeDays": {
+            "fromMonth": 9,
+            "fromDay": 25,
+            "toMonth": 9,
+            "toDay": 20,
+            "tou_periods": {
+              "hour_0_minute_0": {
+                "periods": [
+                  {
+                    "toDayOfWeek": 6
+                  }
+                ]
+              }
+            }
+          },
+          "Today": {
+            "fromMonth": 9,
+            "fromDay": 22,
+            "toMonth": 9,
+            "toDay": 22,
+            "tou_periods": {
+              "hour_0_minute_0": {
+                "periods": [
+                  {
+                    "toDayOfWeek": 6
+                  }
+                ]
+              }
+            }
+          },
+          "Tomorrow": {
+            "fromMonth": 9,
+            "fromDay": 23,
+            "toMonth": 9,
+            "toDay": 23,
+            "tou_periods": {
+              "hour_0_minute_0": {
+                "periods": [
+                  {
+                    "toDayOfWeek": 6
+                  }
+                ]
+              }
+            }
+          },
+          "TwoDays": {
+            "fromMonth": 9,
+            "fromDay": 24,
+            "toMonth": 9,
+            "toDay": 24,
+            "tou_periods": {
+              "hour_0_minute_0": {
+                "periods": [
+                  {
+                    "toDayOfWeek": 6
+                  }
+                ]
+              }
+            }
+          },
+          "Yesterday": {
+            "fromMonth": 9,
+            "fromDay": 21,
+            "toMonth": 9,
+            "toDay": 21,
+            "tou_periods": {
+              "hour_0_minute_0": {
+                "periods": [
+                  {
+                    "toDayOfWeek": 6
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "energy_charges": {
+          "ThreeDays": {
+            "rates": {
+              "hour_0_minute_0": 0.17
+            }
+          },
+          "Today": {
+            "rates": {
+              "hour_0_minute_0": 0.17
+            }
+          },
+          "Tomorrow": {
+            "rates": {
+              "hour_0_minute_0": 0.17
+            }
+          },
+          "TwoDays": {
+            "rates": {
+              "hour_0_minute_0": 0.17
+            }
+          },
+          "Yesterday": {
+            "rates": {
+              "hour_0_minute_0": 0.17
+            }
+          }
+        },
+        "demand_charges": {
+          "ALL": {
+            "rates": {
+              "ALL": 0
+            }
+          },
+          "ThreeDays": {},
+          "Today": {},
+          "Tomorrow": {},
+          "TwoDays": {},
+          "Yesterday": {}
+        }
+      }
+    },
+    "diagnostics": [
+      "SPARSE_TOU_ZERO_DEFAULT_ASSUMPTION"
+    ],
+    "rollbackProven": false
+  },
+  "kraken": {
+    "vehicles": [
+      {
+        "id": "q7-fixture",
+        "name": "Audi Q7",
+        "plannedDispatches": [
+          {
+            "start": "2026-09-23T08:00:00+00:00",
+            "end": "2026-09-23T10:00:00+00:00",
+            "type": "SMART",
+            "energyAddedKwh": "-4.6"
+          }
+        ]
+      }
+    ],
+    "lastSuccessfulUpdate": "2026-09-23T08:11:50.000Z",
+    "stale": false
+  }
+}

@@ -1,0 +1,318 @@
+{
+  "tou_settings": {
+    "tariff_content_v2": {
+      "code": "FLATPEAK",
+      "currency": "GBP",
+      "demand_charges": {
+        "ALL": {
+          "rates": {
+            "ALL": 0
+          }
+        },
+        "ThreeDays": {},
+        "Today": {},
+        "Tomorrow": {},
+        "TwoDays": {},
+        "Yesterday": {}
+      },
+      "energy_charges": {
+        "ThreeDays": {
+          "rates": {
+            "hour_0_minute_0": 0.02993,
+            "hour_6_minute_0": 0.25177
+          }
+        },
+        "Today": {
+          "rates": {
+            "hour_0_minute_0": 0.02993,
+            "hour_6_minute_0": 0.25177
+          }
+        },
+        "Tomorrow": {
+          "rates": {
+            "hour_0_minute_0": 0.02993,
+            "hour_6_minute_0": 0.25177,
+            "hour_9_minute_0": 0.0299
+          }
+        },
+        "TwoDays": {
+          "rates": {
+            "hour_0_minute_0": 0.02993,
+            "hour_6_minute_0": 0.25177
+          }
+        },
+        "Yesterday": {
+          "rates": {
+            "hour_0_minute_0": 0.02993,
+            "hour_6_minute_0": 0.25177
+          }
+        }
+      },
+      "name": "Next Drive Smart V5.2",
+      "seasons": {
+        "ThreeDays": {
+          "fromDay": 25,
+          "fromMonth": 9,
+          "toDay": 20,
+          "toMonth": 9,
+          "tou_periods": {
+            "hour_0_minute_0": {
+              "periods": [
+                {
+                  "toDayOfWeek": 6,
+                  "toHour": 6
+                }
+              ]
+            },
+            "hour_6_minute_0": {
+              "periods": [
+                {
+                  "fromHour": 6,
+                  "toDayOfWeek": 6
+                }
+              ]
+            }
+          }
+        },
+        "Today": {
+          "fromDay": 22,
+          "fromMonth": 9,
+          "toDay": 22,
+          "toMonth": 9,
+          "tou_periods": {
+            "hour_0_minute_0": {
+              "periods": [
+                {
+                  "toDayOfWeek": 6,
+                  "toHour": 6
+                }
+              ]
+            },
+            "hour_6_minute_0": {
+              "periods": [
+                {
+                  "fromHour": 6,
+                  "toDayOfWeek": 6
+                }
+              ]
+            }
+          }
+        },
+        "Tomorrow": {
+          "fromDay": 23,
+          "fromMonth": 9,
+          "toDay": 23,
+          "toMonth": 9,
+          "tou_periods": {
+            "hour_0_minute_0": {
+              "periods": [
+                {
+                  "toDayOfWeek": 6,
+                  "toHour": 6
+                }
+              ]
+            },
+            "hour_6_minute_0": {
+              "periods": [
+                {
+                  "fromHour": 6,
+                  "toDayOfWeek": 6,
+                  "toHour": 9,
+                  "toMinute": 0
+                },
+                {
+                  "fromHour": 11,
+                  "fromMinute": 0,
+                  "toDayOfWeek": 6
+                }
+              ]
+            },
+            "hour_9_minute_0": {
+              "periods": [
+                {
+                  "fromHour": 9,
+                  "fromMinute": 0,
+                  "toDayOfWeek": 6,
+                  "toHour": 11,
+                  "toMinute": 0
+                }
+              ]
+            }
+          }
+        },
+        "TwoDays": {
+          "fromDay": 24,
+          "fromMonth": 9,
+          "toDay": 24,
+          "toMonth": 9,
+          "tou_periods": {
+            "hour_0_minute_0": {
+              "periods": [
+                {
+                  "toDayOfWeek": 6,
+                  "toHour": 6
+                }
+              ]
+            },
+            "hour_6_minute_0": {
+              "periods": [
+                {
+                  "fromHour": 6,
+                  "toDayOfWeek": 6
+                }
+              ]
+            }
+          }
+        },
+        "Yesterday": {
+          "fromDay": 21,
+          "fromMonth": 9,
+          "toDay": 21,
+          "toMonth": 9,
+          "tou_periods": {
+            "hour_0_minute_0": {
+              "periods": [
+                {
+                  "toDayOfWeek": 6,
+                  "toHour": 6
+                }
+              ]
+            },
+            "hour_6_minute_0": {
+              "periods": [
+                {
+                  "fromHour": 6,
+                  "toDayOfWeek": 6
+                }
+              ]
+            }
+          }
+        }
+      },
+      "sell_tariff": {
+        "code": "FLATPEAK",
+        "currency": "GBP",
+        "demand_charges": {
+          "ALL": {
+            "rates": {
+              "ALL": 0
+            }
+          },
+          "ThreeDays": {},
+          "Today": {},
+          "Tomorrow": {},
+          "TwoDays": {},
+          "Yesterday": {}
+        },
+        "energy_charges": {
+          "ThreeDays": {
+            "rates": {
+              "hour_0_minute_0": 0.17
+            }
+          },
+          "Today": {
+            "rates": {
+              "hour_0_minute_0": 0.17
+            }
+          },
+          "Tomorrow": {
+            "rates": {
+              "hour_0_minute_0": 0.17
+            }
+          },
+          "TwoDays": {
+            "rates": {
+              "hour_0_minute_0": 0.17
+            }
+          },
+          "Yesterday": {
+            "rates": {
+              "hour_0_minute_0": 0.17
+            }
+          }
+        },
+        "name": "Premium export",
+        "seasons": {
+          "ThreeDays": {
+            "fromDay": 25,
+            "fromMonth": 9,
+            "toDay": 20,
+            "toMonth": 9,
+            "tou_periods": {
+              "hour_0_minute_0": {
+                "periods": [
+                  {
+                    "toDayOfWeek": 6
+                  }
+                ]
+              }
+            }
+          },
+          "Today": {
+            "fromDay": 22,
+            "fromMonth": 9,
+            "toDay": 22,
+            "toMonth": 9,
+            "tou_periods": {
+              "hour_0_minute_0": {
+                "periods": [
+                  {
+                    "toDayOfWeek": 6
+                  }
+                ]
+              }
+            }
+          },
+          "Tomorrow": {
+            "fromDay": 23,
+            "fromMonth": 9,
+            "toDay": 23,
+            "toMonth": 9,
+            "tou_periods": {
+              "hour_0_minute_0": {
+                "periods": [
+                  {
+                    "toDayOfWeek": 6
+                  }
+                ]
+              }
+            }
+          },
+          "TwoDays": {
+            "fromDay": 24,
+            "fromMonth": 9,
+            "toDay": 24,
+            "toMonth": 9,
+            "tou_periods": {
+              "hour_0_minute_0": {
+                "periods": [
+                  {
+                    "toDayOfWeek": 6
+                  }
+                ]
+              }
+            }
+          },
+          "Yesterday": {
+            "fromDay": 21,
+            "fromMonth": 9,
+            "toDay": 21,
+            "toMonth": 9,
+            "tou_periods": {
+              "hour_0_minute_0": {
+                "periods": [
+                  {
+                    "toDayOfWeek": 6
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "utility": "EON Next"
+      },
+      "utility": "Eon Next",
+      "version": 1
+    }
+  }
+}
