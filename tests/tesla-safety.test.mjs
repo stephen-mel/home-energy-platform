@@ -13,7 +13,7 @@ function load(file, dependencies = {}) {
   const exports = {};
   vm.runInNewContext(ts.transpileModule(fs.readFileSync(file, 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
-  }).outputText, { exports, Date: InputDate, require(name) {
+  }).outputText, { exports, structuredClone, Date: InputDate, require(name) {
     assert.ok(name in dependencies, `Unexpected dependency: ${name}`); return dependencies[name];
   } });
   return exports;
@@ -35,11 +35,22 @@ const verify = record => baseline.verifyTariffBaseline(record, { fingerprint: re
 
 const rollback = load('src/lib/tesla-tariff/rollback-evidence.ts');
 const tariffTools = load('src/lib/tesla-tariff/experiment-tariff.ts');
+const domains = load('src/lib/tariff/comparison-domain.ts', { './compare-price-signal': comparison, './price-signal': curve });
+const observed = load('src/lib/tesla-tariff/observed-tariff.ts');
+const simulation = load('src/lib/tesla-tariff/observed-simulation.ts', { './observed-tariff': observed });
+const syncPlanner = load('src/lib/tesla-tariff/sync-planner.ts', {
+  '../tariff/comparison-domain': domains, '../tariff/compare-price-signal': comparison, './dry-run': dryRun,
+});
+const observedProposal = load('src/lib/tesla-tariff/observed-proposal.ts', {
+  '../tariff/comparison-domain': domains, './sync-planner': syncPlanner, './observed-simulation': simulation,
+  './experiment-tariff': tariffTools, './rollback-evidence': rollback,
+});
 const proposals = load('src/lib/tesla-tariff/proposal-approval.ts', {
+  './observed-proposal': observedProposal,
   '../tariff/compare-price-signal': comparison, './dry-run': dryRun,
   './experiment-tariff': tariffTools, './rollback-evidence': rollback,
 });
-const domains = load('src/lib/tariff/comparison-domain.ts', { './compare-price-signal': comparison, './price-signal': curve });
+
 
 test('historical verification survives expiry; delayed/expired approvals and use are independently rejected', () => {
   const r = create(), verified = verify(r);
@@ -172,4 +183,127 @@ test('proposal diagnostic removal and stale evidence cannot authorize a current 
   const signal = structuredClone(p.input.signal); signal.import[0].stale = true;
   const stale = proposal({ signal });
   assert.ok(assess(stale).blockers.includes('STALE_EVIDENCE'));
+});
+
+// Captured 23 September Q7 case. Site/asset IDs are fictitious; prices, sparse
+// fields, season dates and exact UTC dispatch boundaries mirror the live reads.
+const q7Dispatch = { start: '2026-09-23T08:00:00+00:00', end: '2026-09-23T10:00:00+00:00', type: 'SMART', energyAddedKwh: '-4.6' };
+function q7Observation() {
+  const ranges = { Yesterday: [9, 21, 9, 21], Today: [9, 22, 9, 22], Tomorrow: [9, 23, 9, 23], TwoDays: [9, 24, 9, 24], ThreeDays: [9, 25, 9, 20] };
+  const side = sell => ({ code: 'FLATPEAK', name: sell ? 'Premium export' : 'Next Drive Smart V5.2', utility: 'Eon Next', currency: 'GBP',
+    demand_charges: { ALL: { rates: { ALL: 0 } }, ...Object.fromEntries(Object.keys(ranges).map(k => [k, {}])) },
+    energy_charges: Object.fromEntries(Object.keys(ranges).map(k => [k, { rates: sell ? { cheap: 0.17 } : { cheap: 0.02993, standard: 0.25177 } }])),
+    seasons: Object.fromEntries(Object.entries(ranges).map(([k, [fromMonth, fromDay, toMonth, toDay]]) => [k, { fromMonth, fromDay, toMonth, toDay,
+      tou_periods: sell ? { cheap: { periods: [{ toDayOfWeek: 6 }] } } : {
+        cheap: { periods: [{ toDayOfWeek: 6, toHour: 6 }] }, standard: { periods: [{ toDayOfWeek: 6, fromHour: 6 }] },
+      } }])) });
+  return observed.captureObservedTariff({ installation_time_zone: 'Europe/London', tariff_content_v2: { ...side(false), version: 1, sell_tariff: side(true) } }, 'site-q7', '2026-09-23T08:10:28.293Z');
+}
+const krakenAdapter = load('src/lib/tariff/kraken-dispatches.ts', { './price-signal': curve });
+const siteSignals = load('src/lib/site/get-site-price-signal.ts', {
+  '../tariff/price-signal': curve, '../tariff/kraken-dispatches': krakenAdapter, '../tariff/effective-tariff': effective,
+});
+function q7Signal(dispatches = [q7Dispatch]) {
+  return siteSignals.getSitePriceSignal(load('src/lib/site/current-site.ts').currentSite, { stale: false, lastSuccessfulUpdate: '2026-09-23T08:08:31.469Z',
+    vehicles: [{ id: 'q7-fixture', name: 'Audi Q7', plannedDispatches: dispatches }] }, '2026-09-22T23:00:00Z').signal;
+}
+const q7Input = () => ({ proposalId: 'q7-sept23', energySiteId: 'site-q7', purpose: 'tariff-sync', timeZone: 'Europe/London',
+  validFrom: '2026-09-23T09:10:29+01:00', expiresAt: '2026-09-23T11:00:00+01:00', signal: q7Signal(),
+  observedSmart: { observation: q7Observation(), generatedAt: '2026-09-23T08:10:29Z',
+    dispatch: { assetId: 'q7-fixture', start: q7Dispatch.start, end: q7Dispatch.end }, previousSignal: q7Signal([]),
+    comparisonDomain: { start: '2026-09-22T23:00:00Z', end: '2026-09-23T23:00:00Z' } } });
+const approveQ7 = p => proposals.approveTariffProposal(p, { fingerprint: p.fingerprint, approvedAt: '2026-09-23T08:11:00Z' });
+const assessQ7 = (p, overrides = {}) => proposals.assessProposalCurrentUse({ approvedProposal: p, currentProposal: p, approval: null,
+  now: '2026-09-23T08:12:00Z', targetEnergySiteId: 'site-q7', authority: 'confirm', rollback: { representation: q7Observation().tariff, maxAgeMs: 300000 }, ...overrides });
+
+test('Q7 09:00–11:00 observed simulation binds exact representation, economic/evidence keys, local validity and generation', () => {
+  const input = q7Input(), p = proposals.createTariffProposal(input), prepared = p.observedPreparation;
+  assert.equal(p.structurallyValid, true);
+  assert.equal(tariffTools.inspectTariff(p.bound.representation).exact, false, 'existing explicit schema is not weakened');
+  assert.equal(tariffTools.inspectObservedProposalTariff(p.bound.representation).exact, true);
+  assert.equal(rollback.representationKey(p.bound.representation), rollback.representationKey(prepared.simulation.simulated.tariff));
+  assert.equal(rollback.representationKey(p.bound.representation.sell_tariff), rollback.representationKey(input.observedSmart.observation.tariff.sell_tariff));
+  assert.equal(p.bound.generatedAt, input.observedSmart.generatedAt);
+  assert.equal(p.bound.economicKey, comparison.effectivePriceCurveKey(input.signal));
+  assert.ok(p.bound.dispatchEvidenceKey.includes('q7-fixture'));
+  assert.equal(p.bound.localValidity.fromMinute, 540); assert.equal(p.bound.localValidity.toMinute, 660);
+  assert.ok(p.bound.evidence.every(e => e.state === 'planned-conditional'));
+  assert.equal(prepared.syncPlan.comparison.state, 'changed');
+  assert.deepEqual(JSON.parse(JSON.stringify(prepared.syncPlan.comparison.changedPeriods)), [{ start: '2026-09-23T08:00:00.000Z', end: '2026-09-23T10:00:00.000Z', channels: ['import'] }]);
+  assert.equal(prepared.simulation.differences[0].newBuy, 0.0299);
+  assert.equal(prepared.simulation.differences[0].newSell, 0.17);
+  assert.equal(input.signal.export[0].price.amount, 0.175);
+  assert.equal(proposals.createTariffProposal(input).fingerprint, p.fingerprint);
+});
+
+test('structural validity, approval, compatibility, rollback and write readiness remain independent', () => {
+  const p = proposals.createTariffProposal(q7Input()), unapproved = assessQ7(p);
+  assert.equal(unapproved.structurallyValid, true); assert.equal(unapproved.humanApproved, false);
+  const result = assessQ7(p, { approval: approveQ7(p) });
+  assert.equal(result.humanApproved, true); assert.equal(result.writeCompatible, false); assert.equal(result.rollbackProven, false);
+  assert.equal(result.writeReady, false); assert.equal(result.executorAvailable, false); assert.equal(result.eligible, false);
+  for (const code of ['BUY_BELOW_SELL', 'BOUNDED_FORECAST', 'ROLLBACK_UNPROVEN', 'RESTORATION_REQUIRED', 'OBSERVED_TOU_ASSUMPTIONS_UNVERIFIED']) assert.ok(result.blockers.includes(code), code);
+  assert.ok(!result.blockers.includes('REPRESENTATION_UNAVAILABLE'));
+  const exceptionInput = q7Input(); exceptionInput.exceptions = ['BUY_BELOW_SELL'];
+  const attempted = proposals.createTariffProposal(exceptionInput);
+  assert.ok(assessQ7(attempted).blockers.includes('BUY_BELOW_SELL'));
+  exceptionInput.purpose = 'pricing-constraint-experiment';
+  const wrongPurpose = proposals.createTariffProposal(exceptionInput);
+  assert.equal(wrongPurpose.structurallyValid, false); assert.throws(() => approveQ7(wrongPurpose));
+});
+
+test('cancelled, removed, moved, shortened or changed-type Q7 dispatch invalidates original approval', () => {
+  const p = proposals.createTariffProposal(q7Input()), approval = approveQ7(p);
+  for (const dispatches of [[], [{ ...q7Dispatch, start: '2026-09-23T08:30:00+00:00' }],
+    [{ ...q7Dispatch, end: '2026-09-23T09:30:00+00:00' }], [{ ...q7Dispatch, type: 'BOOST' }]]) {
+    const input = q7Input(); input.signal = q7Signal(dispatches);
+    const currentProposal = proposals.createTariffProposal(input);
+    assert.equal(currentProposal.structurallyValid, false);
+    const r = assessQ7(p, { currentProposal, approval });
+    assert.ok(r.blockers.includes('CURRENT_PROPOSAL_CHANGED')); assert.equal(r.humanApproved, false);
+  }
+  const moved = q7Input(); moved.signal = q7Signal([{ ...q7Dispatch, start: '2026-09-23T08:30:00+00:00' }]);
+  moved.observedSmart.dispatch.start = '2026-09-23T08:30:00+00:00';
+  const reselection = proposals.createTariffProposal(moved);
+  assert.equal(reselection.structurallyValid, true);
+  assert.ok(assessQ7(p, { currentProposal: reselection, approval }).blockers.includes('CURRENT_PROPOSAL_CHANGED'));
+});
+
+test('11:00 BST expires Q7 proposal exactly, cannot extend expiry or backdate generation', () => {
+  const p = proposals.createTariffProposal(q7Input()), approval = approveQ7(p);
+  assert.ok(!assessQ7(p, { approval, now: '2026-09-23T09:59:59.999Z' }).blockers.includes('OUTSIDE_CURRENT_VALIDITY'));
+  assert.ok(assessQ7(p, { approval, now: '2026-09-23T10:00:00Z' }).blockers.includes('OUTSIDE_CURRENT_VALIDITY'));
+  assert.throws(() => proposals.approveTariffProposal(p, { fingerprint: p.fingerprint, approvedAt: '2026-09-23T10:00:00Z' }));
+  for (const edit of [i => { i.expiresAt = '2026-09-23T11:01:00+01:00'; },
+    i => { i.observedSmart.generatedAt = '2026-09-23T08:00:00Z'; }, i => { i.observedSmart.generatedAt = '2026-09-23T10:00:00Z'; }]) {
+    const input = q7Input(); edit(input); const invalid = proposals.createTariffProposal(input);
+    assert.equal(invalid.structurallyValid, false); assert.throws(() => approveQ7(invalid));
+  }
+});
+
+test('Q7 site/representation/evidence/generation tampering and insufficient comparison coverage fail closed', () => {
+  const p = proposals.createTariffProposal(q7Input());
+  for (const edit of [x => { x.bound.representation.name = 'Changed'; }, x => { x.bound.generatedAt = '2026-09-23T08:11:00Z'; },
+    x => { x.bound.dispatchEvidenceKey = 'different'; }, x => { x.compatibilityBlockers = []; }]) {
+    const altered = structuredClone(p); edit(altered); assert.throws(() => approveQ7(altered));
+    assert.ok(assessQ7(p, { currentProposal: altered }).blockers.includes('RECORD_INCONSISTENT'));
+  }
+  const mismatch = q7Input(); mismatch.energySiteId = 'another-site';
+  assert.equal(proposals.createTariffProposal(mismatch).structurallyValid, false);
+  const gap = q7Input(); gap.observedSmart.previousSignal.horizon.start = '2026-09-23T09:00:00Z';
+  assert.ok(proposals.createTariffProposal(gap).compatibilityBlockers.includes('COMMON_DOMAIN_UNAVAILABLE'));
+  const regenerated = q7Input(); regenerated.observedSmart.generatedAt = '2026-09-23T08:10:28.500Z';
+  assert.notEqual(proposals.createTariffProposal(regenerated).fingerprint, p.fingerprint);
+});
+
+test('observed strict validation rejects unknown fields, nonzero demand, malformed prices, gaps and overlaps', () => {
+  const original = q7Observation().tariff;
+  assert.equal(tariffTools.inspectObservedProposalTariff(original).exact, true);
+  for (const edit of [t => { t.unknown = true; }, t => { t.demand_charges.ALL.rates.ALL = 1; },
+    t => { t.energy_charges.Today.rates.cheap = NaN; }, t => { delete t.seasons.Today; },
+    t => { t.seasons.Today.toDay = 23; }, t => { t.seasons.Today.tou_periods.standard.periods[0].fromHour = 7; },
+    t => { t.seasons.Today.tou_periods.standard.periods[0].fromHour = 5; }, t => { t.sell_tariff.version = 2; }]) {
+    const invalid = structuredClone(original); edit(invalid);
+    assert.equal(tariffTools.inspectObservedProposalTariff(invalid).exact, false);
+  }
 });

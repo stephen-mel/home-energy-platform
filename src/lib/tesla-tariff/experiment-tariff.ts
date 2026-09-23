@@ -1,3 +1,4 @@
+import type { ObservedContent } from "./observed-tariff";
 import type { TeslaTariffFragment } from "./dry-run";
 
 type ObjectValue = Record<string, unknown>;
@@ -9,7 +10,7 @@ const number = (value: unknown) => typeof value === "number" && Number.isFinite(
 /** Allowlisted capture, never a raw API/auth envelope. Unknown fields are omitted
  * and make reconstruction inexact. Accepted tariff fields retain original values.
  */
-export function inspectTariff(value: unknown) {
+function inspectRepresentation(value: unknown, observed = false) {
     let exact = true;
     const copy = (raw: unknown, schema: string): unknown => {
         if (!object(raw)) { exact = false; return null; }
@@ -21,6 +22,9 @@ export function inspectTariff(value: unknown) {
                 : schema === "season" ? { fromMonth: "number", fromDay: "number", toMonth: "number", toDay: "number", tou_periods: "tous" }
                     : schema === "tou" ? { periods: "periods" }
                         : schema === "period" ? { fromDayOfWeek: "number", toDayOfWeek: "number", fromHour: "number", fromMinute: "number", toHour: "number", toMinute: "number" } : {};
+        if (observed && (schema === "tariff" || schema === "side")) {
+            fields.code = "text"; fields.demand_charges = "charges";
+        }
         const dictionary = ({ charges: "charge", seasons: "season", rates: "number", tous: "tou" } as Record<string, string>)[schema];
         for (const key of Object.keys(raw).sort()) {
             const kind = dictionary ?? fields[key];
@@ -38,8 +42,13 @@ export function inspectTariff(value: unknown) {
     };
     const snapshot = copy(value, "tariff");
     const validSide = (side: unknown) => {
-        if (!object(side) || side.version !== 1 || side.currency !== "GBP" || !text(side.name) || !text(side.utility)
+        if (!object(side) || (observed ? side.version !== undefined && side.version !== 1 : side.version !== 1) || side.currency !== "GBP" || !text(side.name) || !text(side.utility)
             || !object(side.seasons) || !object(side.energy_charges)) return false;
+        if (observed && side.demand_charges !== undefined) {
+            if (!object(side.demand_charges) || Object.entries(side.demand_charges).some(([key, charge]) =>
+                (key !== "ALL" && !Object.hasOwn(side.seasons as object, key)) || !object(charge)
+                || (charge.rates !== undefined && (!object(charge.rates) || Object.values(charge.rates).some(n => n !== 0))))) return false;
+        }
         const seasonNames = Object.keys(side.seasons);
         if (!seasonNames.length || JSON.stringify(seasonNames.sort()) !== JSON.stringify(Object.keys(side.energy_charges).sort())) return false;
         // Enumerate leap-year calendar dates: every possible recurring date must
@@ -66,7 +75,7 @@ export function inspectTariff(value: unknown) {
                 if (!object(tou) || !Array.isArray(tou.periods) || !tou.periods.length) return false;
                 for (const p of tou.periods) {
                     if (!object(p) || Object.values(p).some(n => !Number.isInteger(n))) return false;
-                    const { fromDayOfWeek: fd, toDayOfWeek: td, fromHour: fh, toHour: th, fromMinute: fm, toMinute: tm } = p as Record<string, number>;
+                    const { fromDayOfWeek: fd, toDayOfWeek: td, fromHour: fh, toHour: th, fromMinute: fm, toMinute: tm } = (observed ? { fromDayOfWeek: 0, toDayOfWeek: 0, fromHour: 0, toHour: 0, fromMinute: 0, toMinute: 0, ...p } : p) as Record<string, number>;
                     if (![fd, td, fh, th, fm, tm].every(Number.isInteger) || fd < 0 || td > 6 || td < fd
                         || fh < 0 || fh > 23 || th < 0 || th > 23 || fm < 0 || fm > 59 || tm < 0 || tm > 59) return false;
                     const start = fh * 60 + fm, end = th === 0 && tm === 0 ? 1440 : th * 60 + tm;
@@ -83,7 +92,21 @@ export function inspectTariff(value: unknown) {
         return coverage.every(n => n === 1);
     };
     const valid = object(snapshot) && validSide(snapshot) && validSide(snapshot.sell_tariff);
-    return { snapshot, exact: exact && valid, tariff: exact && valid ? snapshot as TeslaTariffFragment : null };
+    return { snapshot, exact: exact && valid, tariff: exact && valid ? snapshot as ObservedContent : null };
+}
+
+/** Existing explicit experiment schema remains unchanged. */
+export function inspectTariff(value: unknown) {
+    const result = inspectRepresentation(value);
+    return { ...result, tariff: result.tariff as TeslaTariffFragment | null };
+}
+
+/** Exact observed representation, including sparse fields and zero demand charges.
+ * Coverage uses the analyser's explicit zero-default assumption. Structural
+ * acceptance is NOT acceptance of that assumption by Tesla or write compatibility.
+ */
+export function inspectObservedProposalTariff(value: unknown) {
+    return inspectRepresentation(value, true);
 }
 
 /** Synthetic full-year flat test, not a HEP production forecast or request body. */

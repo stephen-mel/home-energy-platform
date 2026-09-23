@@ -111,3 +111,54 @@ splits, deterministic output, zero extra endpoint reads and safe capture. Only
 the initial products/site-info investigation used live GETs; all tests are local
 fixtures. Run `node --test tests/tesla-observed-tariff.test.mjs`, full Node suite,
 TypeScript, ESLint and whitespace checks.
+
+## Observed SMART proposals (inspection only)
+
+`createTariffProposal` accepts an optional `observedSmart` input for the existing
+`tariff-sync` purpose. It rebuilds the simulation from an original site-info
+observation and an exact SMART dispatch selected from the supplied current HEP
+signal. It never accepts an independently supplied simulation as authoritative.
+The caller supplies the previous HEP signal and explicit comparison domain; the
+existing Sync Planner and common-domain comparison provide economic change evidence.
+A HEP baseline's `truth` can supply that previous signal. Tesla observations do not
+replace the HEP baseline or confer human baseline verification.
+
+The strict validator has an explicit observed-representation entry point. It
+retains `code`, absent optional versions, sparse TOU fields, and zero demand
+charges exactly. It verifies annual season and weekly time coverage, finite
+nonnegative prices and matching rate labels. Unknown fields, nonzero demand
+charges and gaps/overlaps are rejected. The original explicit experiment validator
+is unchanged. Sparse-zero and weekday interpretation remain unverified assumptions,
+so structural acceptance does not remove the execution compatibility barrier.
+
+The existing canonical proposal fingerprint binds the exact proposed tariff,
+site, HEP economic key, original observation, SMART evidence key, generation time,
+comparison domain, timezone/local dispatch interval and validity bounds. The
+proposal expiry cannot extend beyond the dispatch end. Changed/removed evidence
+requires rebuilding the current proposal and invalidates earlier approval. A pure
+model cannot discover cancellation itself: any future caller must supply current
+HEP evidence before using an approval. No polling or executor is provided.
+
+For the captured 23 September 2026 Audi Q7 SMART interval, 09:00–11:00 Europe/London
+(08:00–10:00 UTC), the proposed import rate is GBP 0.0299/kWh. Four half-hour
+assessments remain `planned-conditional`. Existing observed import prices outside
+that interval and observed GBP 0.17 export are preserved; HEP independently retains
+GBP 0.175 export, GBP 0.2518 standard import and GBP 0.0299 guaranteed import.
+This is a scoped observed-tariff exception, not a claim that the complete observed
+annual tariff matches HEP's economic curve.
+
+Assessment exposes separate `structurallyValid`, `humanApproved`, `writeCompatible`,
+`rollbackProven` and `writeReady` fields. Human approval only records an exact,
+in-validity confirmation. Production `BUY_BELOW_SELL` cannot be waived through the
+experiment exception path. `BOUNDED_FORECAST` remains because complete observed
+season coverage does not extend HEP's bounded economic knowledge. `ROLLBACK_UNPROVEN`
+remains without the existing trusted rollback ledger evidence. The additional
+`OBSERVED_TOU_ASSUMPTIONS_UNVERIFIED` and `RESTORATION_REQUIRED` blockers explicitly
+retain the sparse/weekday assumptions and annual-recurrence/restoration limitation.
+A GET capture alone is still not trusted rollback evidence.
+
+The proposal expires at 11:00 BST (or an earlier caller-selected expiry); schedule
+changes must invalidate it earlier. An eventual executor would also need separately
+validated restoration, including earlier charging termination, and prevention of
+next-year recurrence. None is implemented. `writeReady` remains false and there is
+no executor, network, token, OAuth, filesystem or UI integration in this domain path.
