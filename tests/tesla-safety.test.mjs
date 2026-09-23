@@ -307,3 +307,86 @@ test('observed strict validation rejects unknown fields, nonzero demand, malform
     assert.equal(tariffTools.inspectObservedProposalTariff(invalid).exact, false);
   }
 });
+
+
+const restoration = load('src/lib/tesla-tariff/restoration-review.ts', {
+  './experiment-tariff': tariffTools, './observed-tariff': observed, './rollback-evidence': rollback,
+  './baseline': baseline, './proposal-approval': proposals,
+});
+const restoreReview = (overrides = {}) => restoration.reviewObservedRestoration({ before: q7Observation(),
+  temporaryProposal: proposals.createTariffProposal(q7Input()), asOf: '2026-09-23T08:12:00Z', maxCaptureAgeMs: 300000, ...overrides });
+
+test('restoration retains exact observed before-state/envelope and binds site, capture, provenance and proposal without minting proof', () => {
+  const r = restoreReview(), before = q7Observation();
+  assert.equal(r.structurallyComplete, true); assert.equal(r.boundToProposal, true); assert.equal(r.captureFresh, true);
+  assert.equal(rollback.representationKey(r.documentedEnvelopeCandidate.tou_settings.tariff_content_v2), rollback.representationKey(before.tariff));
+  assert.equal(r.bound.representationKey, rollback.representationKey(before.tariff));
+  assert.equal(r.bound.energySiteId, 'site-q7'); assert.equal(r.bound.capturedAt, before.source.observedAt);
+  assert.equal(r.bound.provenance.source, 'tesla-site-info');
+  assert.equal(r.fingerprint, restoreReview().fingerprint);
+  for (const field of ['exactWriteMappingProven', 'acceptanceProven', 'rollbackProven', 'writeReady', 'executorAvailable']) assert.equal(r[field], false);
+  assert.equal(r.writePayload, null);
+  for (const code of ['ROLLBACK_UNPROVEN', 'BUY_BELOW_SELL', 'BOUNDED_FORECAST', 'RESTORATION_PRICE_TRANSFORMATION_RISK', 'RESTORATION_REQUIRED']) assert.ok(r.blockers.includes(code));
+  assert.equal(r.pricingConstraintWitness.buy, 0.02993); assert.equal(r.pricingConstraintWitness.sell, 0.17);
+  for (const code of ['SPARSE_DEFAULTS_UNDOCUMENTED', 'SELL_VERSION_ABSENT_PRESERVED', 'EXAMPLE_NOT_EXHAUSTIVE_SCHEMA', 'FIELDS_PRESERVED']) assert.ok(r.mappingFindings.some(f => f.code === code));
+  assert.equal('version' in r.documentedEnvelopeCandidate.tou_settings.tariff_content_v2.sell_tariff, false);
+  assert.equal(r.lifecycle.length, 6); assert.ok(r.lifecycle.slice(2).every(s => s.status === 'not-performed'));
+  assert.equal(r.baselineContext.rollbackProven, false);
+});
+
+test('restoration rejects omitted fields, mismatched site/representation/capture, simulation provenance, future or stale captures', () => {
+  for (const edit of [b => { b.source.energySiteId = 'other'; }, b => { b.source.observedAt = '2026-09-23T08:10:29Z'; },
+    b => { b.tariff.name = 'different'; }, b => { b.source.kind = 'simulation'; }, b => { b.source.observedAt = '2026-09-23T09:00:00Z'; }]) {
+    const before = q7Observation(); edit(before); const r = restoreReview({ before });
+    assert.equal(r.boundToProposal, false); assert.ok(r.blockers.includes('BEFORE_STATE_BINDING_MISMATCH'));
+    assert.ok(r.blockers.includes('ROLLBACK_UNPROVEN'));
+  }
+  const missing = q7Observation(); missing.diagnostics.push('UNSUPPORTED_FIELDS_OMITTED');
+  const incomplete = restoreReview({ before: missing });
+  assert.equal(incomplete.structurallyComplete, false); assert.equal(incomplete.documentedEnvelopeCandidate, null);
+  assert.ok(incomplete.blockers.includes('CAPTURE_INEXACT'));
+  const stale = restoreReview({ asOf: '2026-09-23T09:00:00Z' });
+  assert.equal(stale.captureFresh, false); assert.ok(stale.blockers.includes('BEFORE_STATE_RECAPTURE_REQUIRED'));
+  const verified = verify(create());
+  assert.equal(restoreReview({ baseline: verified }).baselineContext.rollbackProven, false, 'human baseline verification is not restoration proof');
+});
+
+const readBackCheck = (intended, readBack) => restoration.compareObservedTariffReadBack({ intended, readBack,
+  after: '2026-09-23T08:12:00Z', dates: ['2026-09-23'] });
+const laterCapture = intended => ({ ...structuredClone(intended), source: { ...intended.source, kind: 'tesla-site-info', observedAt: '2026-09-23T08:13:00Z' } });
+test('exact restoration GET match is observation only; reordered object keys match but metadata change does not prove exact restoration', () => {
+  const intended = q7Observation(), readBack = laterCapture(intended);
+  readBack.tariff.seasons = Object.fromEntries(Object.entries(readBack.tariff.seasons).reverse());
+  const r = readBackCheck(intended, readBack);
+  assert.equal(r.outcome, 'exact-observed-match'); assert.equal(r.representationMatches, true);
+  assert.equal(r.differences.length, 0); assert.equal(r.writeAcceptance, 'not-established'); assert.equal(r.rollbackProven, false);
+  readBack.tariff.name = 'renamed';
+  const changed = readBackCheck(intended, readBack);
+  assert.equal(changed.outcome, 'different-observed-representation'); assert.equal(changed.differences.length, 0);
+  assert.ok(changed.blockers.includes('ROLLBACK_UNPROVEN'));
+});
+
+test('buy-raised-to-sell is detected during BOTH temporary and restoration read-back, without altering expected prices', () => {
+  const original = q7Observation();
+  const temporary = proposals.createTariffProposal(q7Input()).observedPreparation.simulation.simulated;
+  for (const intended of [original, temporary]) {
+    const readBack = laterCapture(intended);
+    for (const c of Object.values(readBack.tariff.energy_charges)) for (const label of Object.keys(c.rates)) if (c.rates[label] < 0.17) c.rates[label] = 0.17;
+    const r = readBackCheck(intended, readBack);
+    assert.equal(r.outcome, 'different-observed-representation'); assert.ok(r.differences.some(d => d.buyRaisedToSell));
+    assert.equal(r.rollbackProven, false); assert.equal(r.causation, 'not-inferred');
+    assert.ok(r.differences.some(d => d.expectedBuy < d.actualBuy));
+  }
+  assert.equal(original.tariff.energy_charges.Tomorrow.rates.cheap, 0.02993);
+});
+
+test('missing/wrong-site/out-of-order/omitted read-back is insufficient; empty dates never claim timeline completeness', () => {
+  const intended = q7Observation();
+  for (const r of [null, { ...laterCapture(intended), source: { ...intended.source, energySiteId: 'wrong' } },
+    { ...laterCapture(intended), source: { ...intended.source, observedAt: '2026-09-23T08:12:00Z' } },
+    { ...laterCapture(intended), diagnostics: ['UNSUPPORTED_FIELDS_OMITTED'] }]) assert.equal(readBackCheck(intended, r).outcome, 'insufficient-evidence');
+  const empty = restoration.compareObservedTariffReadBack({ intended, readBack: laterCapture(intended), after: '2026-09-23T08:12:00Z', dates: [] });
+  assert.equal(empty.timelineScope.complete, false); assert.equal(empty.rollbackProven, false);
+  const invalidZone = structuredClone(intended); invalidZone.source.timeZone = 'invalid/zone';
+  assert.equal(readBackCheck(invalidZone, laterCapture(invalidZone)).outcome, 'insufficient-evidence');
+});
