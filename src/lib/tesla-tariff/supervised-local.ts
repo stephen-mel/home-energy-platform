@@ -14,6 +14,30 @@ import { claimExperimentJournal } from "./supervised-journal";
 import { runSupervisedExperiment, interpretWriteResponse } from "./supervised-experiment";
 
 const ROOT = "https://fleet-api.prd.eu.vn.cloud.tesla.com/api/1/energy_sites/";
+// Only these fixed identifiers may cross the CLI boundary. Never emit an
+// upstream message, cause, response body or stack (including authentication errors).
+const SAFE_FAILURE_CODES = new Set([
+    "INTERACTIVE_SUPERVISION_REQUIRED", "EXACT_SELECTION_REQUIRED", "INVALID_ARGUMENTS",
+    "FRESH_CAPTURE_AND_EVIDENCE_REQUIRED", "CURRENT_SMART_DISPATCH_REQUIRED", "TARGET_MISMATCH",
+    "STRUCTURALLY_VALID_BOUND_PROPOSAL_REQUIRED", "EXACT_HUMAN_APPROVAL_REQUIRED", "STALE_APPROVAL_OR_EVIDENCE",
+    "TESLA_BEFORE_STATE_CHANGED", "SMART_EVIDENCE_CHANGED", "CURRENT_PROPOSAL_CHANGED", "CURRENT_SAFETY_GATE_BLOCKED",
+    "APPROVAL_EXPIRED", "APPROVAL_EXPIRED_AFTER_CLAIM", "SUPERVISED_EXPERIMENT_GATE_BLOCKED", "COMMON_DOMAIN_UNAVAILABLE",
+    "DAY_COVERAGE_REQUIRED", "SUPERVISED_AUTHORITY_REQUIRED", "READ_ACCESS_REQUIRED", "WRITE_DISABLED",
+    "TESLA_TOKEN_READ_FAILED", "TESLA_READ_FAILED", "TESLA_READ_DECODE_FAILED", "SITE_MISMATCH",
+    "TESLA_CAPTURE_FAILED", "KRAKEN_DEVICE_READ_FAILED", "KRAKEN_PLANNED_DISPATCH_READ_FAILED",
+    "CAPTURE_PREPARATION_FAILED", "PREPARATION_FAILED",
+]);
+export function safeExperimentFailureCode(error: unknown): string {
+    if (typeof error !== "object" || error === null) return "READ_OR_EXECUTION_FAILED";
+    if ("code" in error && error.code === "EEXIST") return "SITE_ATTEMPT_ALREADY_RECORDED";
+    if ("message" in error && typeof error.message === "string" && SAFE_FAILURE_CODES.has(error.message)) return error.message;
+    return "READ_OR_EXECUTION_FAILED";
+}
+
+async function readBoundary<T>(code: string, read: () => Promise<T>): Promise<T> {
+    try { return await read(); } catch { throw new Error(code); }
+}
+
 export async function runLocalExperiment(args: string[]) {
     if (args.includes("--help")) {
         console.log("Local Tesla tariff experiment (default: dry-run).\nUsage: node scripts/tesla-tariff-experiment.mjs --site SITE_ID --vehicle KRAKEN_DEVICE_ID --dispatch-start EXACT_ISO [--execute-supervised]\nNo saved approval can be loaded. Execution requires an interactive foreground terminal and three exact confirmations. No automatic restore or retry.");
@@ -38,41 +62,50 @@ export async function runLocalExperiment(args: string[]) {
     const digest = (text: string) => createHash("sha256").update(text).digest("hex");
     // The body and endpoint are fixed to tariff settings. Token never enters any record.
     const request = async (suffix: "site_info" | "time_of_use_settings", body?: string) => {
-        const tokens = JSON.parse(await readFile(path.join(process.cwd(), ".tesla-tokens.json"), "utf8"));
-        if (typeof tokens.access_token !== "string" || !tokens.access_token) throw new Error("READ_ACCESS_REQUIRED");
-        return fetch(`${ROOT}${selection.energySiteId}/${suffix}`, {
+        const tokens = await readBoundary("TESLA_TOKEN_READ_FAILED", async () =>
+            JSON.parse(await readFile(path.join(process.cwd(), ".tesla-tokens.json"), "utf8")));
+        if (!tokens || typeof tokens.access_token !== "string" || !tokens.access_token) throw new Error("READ_ACCESS_REQUIRED");
+        const send = () => fetch(`${ROOT}${selection.energySiteId}/${suffix}`, {
             method: body === undefined ? "GET" : "POST", redirect: "manual", cache: "no-store",
             headers: { Authorization: `Bearer ${tokens.access_token}`, ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
             body, signal: AbortSignal.timeout(15_000),
         });
+        return body === undefined ? readBoundary("TESLA_READ_FAILED", send) : send();
     };
     const readBefore = async () => {
         const response = await request("site_info");
         if (!response.ok) throw new Error("TESLA_READ_FAILED");
-        const raw = await response.json();
+        const raw = await readBoundary("TESLA_READ_DECODE_FAILED", () => response.json());
         const id = raw?.response?.energy_site_id;
         if (id !== undefined && String(id) !== selection.energySiteId) throw new Error("SITE_MISMATCH");
-        return captureObservedTariff(raw, selection.energySiteId, now());
+        return readBoundary("TESLA_CAPTURE_FAILED", async () => captureObservedTariff(raw, selection.energySiteId, now()));
     };
     // Read-only queries through the existing integration; auth session acquisition
     // is its existing obtainKrakenToken flow. Never invoke a preference mutation.
     const capture = async () => {
-        const readStartedAt = now();
-        const devices = await getKrakenDevices();
-        const vehicles = [];
-        for (const device of devices) {
-            vehicles.push({ ...device, plannedDispatches: await getKrakenPlannedDispatches(device.id),
-                status: { currentState: null, isSuspended: null, stateOfCharge: null, activePower: null } });
+        try {
+            const readStartedAt = now();
+            const devices = await readBoundary("KRAKEN_DEVICE_READ_FAILED", getKrakenDevices);
+            const vehicles = [];
+            for (const device of devices) {
+                vehicles.push({ ...device, plannedDispatches: await readBoundary("KRAKEN_PLANNED_DISPATCH_READ_FAILED", () => getKrakenPlannedDispatches(device.id)),
+                    status: { currentState: null, isSuspended: null, stateOfCharge: null, activePower: null } });
+            }
+            const kraken: KrakenState = { vehicles, stale: false, lastSuccessfulUpdate: readStartedAt };
+            return { before: await readBefore(), kraken };
+        } catch (error) {
+            if (safeExperimentFailureCode(error) === "READ_OR_EXECUTION_FAILED") throw new Error("CAPTURE_PREPARATION_FAILED");
+            throw error;
         }
-        const kraken: KrakenState = { vehicles, stale: false, lastSuccessfulUpdate: readStartedAt };
-        return { before: await readBefore(), kraken };
     };
     let writeAttempted = false;
+    let beforeConfirmation = true;
     const result = await runSupervisedExperiment({ site: currentSite, selection,
         mode: execute ? "execute-supervised" : "dry-run", authority: execute ? "supervised-experiment" : "observe" }, {
         now, capture, readBack: readBefore,
         challenge: binding => `EXECUTE ${selection.energySiteId} ${digest(binding + randomUUID())}`,
         async confirm(review, challenge) {
+            beforeConfirmation = false;
             await mkdir(directory, { recursive: true, mode: 0o700 });
             const file = path.join(directory, `review-${randomUUID()}.json`);
             await writeFile(file, JSON.stringify(review, null, 2), { mode: 0o600 });
@@ -96,6 +129,9 @@ export async function runLocalExperiment(args: string[]) {
             try { body = await response.json(); } catch { /* unknown response must not cause retry */ }
             return interpretWriteResponse(response.status, body);
         },
+    }).catch(error => {
+        if (beforeConfirmation && safeExperimentFailureCode(error) === "READ_OR_EXECUTION_FAILED") throw new Error("PREPARATION_FAILED");
+        throw error;
     });
     if (result.status === "dry-run") {
         console.log(JSON.stringify({ status: result.status, site: selection.energySiteId,
