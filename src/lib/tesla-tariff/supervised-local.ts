@@ -11,7 +11,7 @@ import { getKrakenDevices, getKrakenPlannedDispatches } from "../kraken/client";
 import type { KrakenState } from "../site/kraken-state";
 import { captureObservedTariff } from "./observed-tariff";
 import { claimExperimentJournal } from "./supervised-journal";
-import { runSupervisedExperiment, interpretWriteResponse } from "./supervised-experiment";
+import { runSupervisedExperiment, interpretWriteResponse, StaleApprovalOrEvidenceError } from "./supervised-experiment";
 
 const ROOT = "https://fleet-api.prd.eu.vn.cloud.tesla.com/api/1/energy_sites/";
 // Only these fixed identifiers may cross the CLI boundary. Never emit an
@@ -32,6 +32,21 @@ export function safeExperimentFailureCode(error: unknown): string {
     if ("code" in error && error.code === "EEXIST") return "SITE_ATTEMPT_ALREADY_RECORDED";
     if ("message" in error && typeof error.message === "string" && SAFE_FAILURE_CODES.has(error.message)) return error.message;
     return "READ_OR_EXECUTION_FAILED";
+}
+
+/** Render only fixed labels and primitive, allowlisted diagnostic fields. */
+export function safeExperimentFreshnessDetails(error: unknown): string[] {
+    if (!(error instanceof StaleApprovalOrEvidenceError)) return [];
+    const d = error.diagnostics;
+    const checks = [
+        ["Approval", d.approval], ["Original Tesla capture", d.originalTeslaCapture],
+        ["Current Tesla capture", d.currentTeslaCapture], ["Current Kraken evidence", d.currentKrakenEvidence],
+    ] as const;
+    const reasons = new Set(["fresh", "expired", "future-timestamp", "invalid-timestamp"]);
+    const seconds = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? `${value}s` : "unavailable";
+    return [...checks.map(([label, check]) =>
+        `${label}: ${check.pass === true ? "PASS" : "FAIL"}; age=${seconds(check.ageSeconds)}; TTL=${seconds(check.ttlSeconds)}; ${reasons.has(check.reason) ? check.reason : "unavailable"}`),
+        `Kraken stale flag: ${d.krakenStale.pass === true ? "PASS" : "FAIL"}; stale=${d.krakenStale.value === true ? "true" : d.krakenStale.value === false ? "false" : "unavailable"}`];
 }
 
 async function readBoundary<T>(code: string, read: () => Promise<T>): Promise<T> {

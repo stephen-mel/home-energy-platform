@@ -117,3 +117,24 @@ test('CLI sanitizer discards arbitrary messages, causes, response bodies and non
   assert.match(cli, /console\.error\(safeExperimentFailureCode\(error\)\)/);
   assert.doesNotMatch(cli, /console\.error\(error[.)]/);
 });
+
+test('CLI freshness details show only fixed checks, PASS/FAIL and safe seconds, retaining the top-level code', () => {
+  const { api } = harness();
+  const error = new core.StaleApprovalOrEvidenceError('2026-09-23T08:10:59Z',
+    '2026-09-23T08:12:00Z', '2026-09-23T08:12:01Z', secret, true, '2026-09-23T08:12:00Z');
+  error.rawResponse = { access_token: secret }; error.cause = new Error(secret);
+  error.diagnostics.extra = secret;
+  assert.equal(api.safeExperimentFailureCode(error), 'STALE_APPROVAL_OR_EVIDENCE');
+  assert.deepEqual(Array.from(api.safeExperimentFreshnessDetails(error)), [
+    'Approval: FAIL; age=61s; TTL=60s; expired',
+    'Original Tesla capture: PASS; age=0s; TTL=120s; fresh',
+    'Current Tesla capture: FAIL; age=-1s; TTL=120s; future-timestamp',
+    'Current Kraken evidence: FAIL; age=unavailable; TTL=60s; invalid-timestamp',
+    'Kraken stale flag: FAIL; stale=true',
+  ]);
+  error.diagnostics.approval.ageSeconds = secret;
+  error.diagnostics.approval.reason = secret;
+  assert.ok(!api.safeExperimentFreshnessDetails(error).join('\n').includes(secret));
+  assert.deepEqual(Array.from(api.safeExperimentFreshnessDetails({ message: 'STALE_APPROVAL_OR_EVIDENCE', diagnostics: secret })), []);
+  assert.match(fs.readFileSync('scripts/tesla-tariff-experiment.mjs', 'utf8'), /for \(const detail of safeExperimentFreshnessDetails\(error\)\) console\.error\(detail\)/);
+});

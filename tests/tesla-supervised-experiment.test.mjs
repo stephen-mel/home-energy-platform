@@ -227,3 +227,61 @@ test('stale preparation, BOOST-only, unknown future prices and non-isolated date
 test('committed example is the exact deterministic fixture payload, not a live approval', () => {
   assert.equal(JSON.stringify(JSON.parse(prepared().payloadJson)), JSON.stringify(JSON.parse(fs.readFileSync('docs/examples/tesla-q7-2026-09-23-payload.json', 'utf8'))));
 });
+
+test('each freshness failure retains its code and identifies the failed check before any claim/write', async () => {
+  for (const failed of ['approval', 'originalTeslaCapture', 'currentTeslaCapture', 'currentKrakenEvidence', 'krakenStale']) {
+    const h = harness(), capture = h.ports.capture, confirm = h.ports.confirm;
+    if (failed === 'originalTeslaCapture') h.ports.confirm = async (...args) => { h.advance(121000); return confirm(...args); };
+    let reads = 0;
+    h.ports.capture = async () => {
+      const c = await capture();
+      if (++reads === 2) {
+        if (failed === 'approval') {
+          h.advance(61000);
+          c.before.source.observedAt = h.ports.now();
+          c.kraken.lastSuccessfulUpdate = h.ports.now();
+        }
+        if (failed === 'currentTeslaCapture') c.before.source.observedAt = new Date(Date.parse(h.ports.now()) - 121000).toISOString();
+        if (failed === 'currentKrakenEvidence') c.kraken.lastSuccessfulUpdate = new Date(Date.parse(h.ports.now()) - 61000).toISOString();
+        if (failed === 'krakenStale') c.kraken.stale = true;
+        c.rawResponse = { access_token: 'SECRET_RAW_CAPTURE', Authorization: 'SECRET_AUTH_HEADER' };
+      }
+      return c;
+    };
+    await assert.rejects(h.run(), error => {
+      assert.equal(error.message, 'STALE_APPROVAL_OR_EVIDENCE');
+      assert.ok(error instanceof api.StaleApprovalOrEvidenceError);
+      for (const [key, check] of Object.entries(error.diagnostics)) assert.equal(check.pass, key !== failed, key);
+      assert.equal(error.diagnostics.approval.ttlSeconds, 60);
+      assert.equal(error.diagnostics.originalTeslaCapture.ttlSeconds, 120);
+      assert.equal(error.diagnostics.currentTeslaCapture.ttlSeconds, 120);
+      assert.equal(error.diagnostics.currentKrakenEvidence.ttlSeconds, 60);
+      if (failed !== 'krakenStale') {
+        assert.equal(error.diagnostics[failed].reason, 'expired');
+        assert.ok(error.diagnostics[failed].ageSeconds > error.diagnostics[failed].ttlSeconds);
+      }
+      assert.equal(error.diagnostics.krakenStale.value, failed === 'krakenStale');
+      assert.doesNotMatch(JSON.stringify(error), /SECRET|rawResponse|Authorization|access_token/);
+      return true;
+    });
+    assert.equal(h.calls.confirmations, 1);
+    assert.equal(h.calls.claims.length, 0);
+    assert.equal(h.calls.writes.length, 0);
+    assert.equal(h.calls.reads, 0);
+  }
+});
+
+test('freshness diagnostics use inclusive TTL, reject future/invalid times and never retain raw timestamp input', () => {
+  const now = '2026-09-23T08:12:00.000Z';
+  const diagnostic = new api.StaleApprovalOrEvidenceError('2026-09-23T08:11:00.000Z',
+    '2026-09-23T08:10:00.000Z', '2026-09-23T08:12:01.000Z', 'SECRET_INVALID_TIMESTAMP', false, now).diagnostics;
+  assert.equal(diagnostic.approval.pass, true);
+  assert.equal(diagnostic.originalTeslaCapture.pass, true);
+  assert.equal(diagnostic.currentTeslaCapture.pass, false);
+  assert.equal(diagnostic.currentTeslaCapture.ageSeconds, -1);
+  assert.equal(diagnostic.currentTeslaCapture.reason, 'future-timestamp');
+  assert.equal(diagnostic.currentKrakenEvidence.pass, false);
+  assert.equal(diagnostic.currentKrakenEvidence.ageSeconds, null);
+  assert.equal(diagnostic.currentKrakenEvidence.reason, 'invalid-timestamp');
+  assert.doesNotMatch(JSON.stringify(diagnostic), /SECRET/);
+});

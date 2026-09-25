@@ -23,6 +23,37 @@ export type WriteResult = { status: "accepted" | "rejected" | "unknown"; httpSta
 const fresh = (at: string, now: string, ttl: number) => Number.isFinite(Date.parse(at)) && Number.isFinite(Date.parse(now))
     && Date.parse(at) <= Date.parse(now) && Date.parse(now) - Date.parse(at) <= ttl;
 
+type FreshnessCheck = {
+    pass: boolean;
+    ageSeconds: number | null;
+    ttlSeconds: number;
+    reason: "fresh" | "expired" | "future-timestamp" | "invalid-timestamp";
+};
+function freshnessCheck(at: string, now: string, ttl: number): FreshnessCheck {
+    const age = Date.parse(now) - Date.parse(at);
+    return { pass: fresh(at, now, ttl), ageSeconds: Number.isFinite(age) ? age / 1000 : null,
+        ttlSeconds: ttl / 1000,
+        reason: !Number.isFinite(age) ? "invalid-timestamp" : age < 0 ? "future-timestamp" : age > ttl ? "expired" : "fresh" };
+}
+
+/** Diagnostic data only: no source timestamps, captures, responses or credentials.
+ * Constructed only AFTER the unchanged freshness gate fails, using its same `now`.
+ */
+export class StaleApprovalOrEvidenceError extends Error {
+    readonly diagnostics;
+    constructor(approvedAt: string, originalCaptureAt: string, currentCaptureAt: string,
+        evidenceAt: string, stale: boolean, now: string) {
+        super("STALE_APPROVAL_OR_EVIDENCE");
+        this.diagnostics = {
+            approval: freshnessCheck(approvedAt, now, APPROVAL_TTL_MS),
+            originalTeslaCapture: freshnessCheck(originalCaptureAt, now, CAPTURE_TTL_MS),
+            currentTeslaCapture: freshnessCheck(currentCaptureAt, now, CAPTURE_TTL_MS),
+            currentKrakenEvidence: freshnessCheck(evidenceAt, now, EVIDENCE_TTL_MS),
+            krakenStale: { pass: !stale, value: typeof stale === "boolean" ? stale : null },
+        };
+    }
+}
+
 /** Compare actual SMART data independently of freshness timestamps. Includes
  * original boundaries, vehicle identity, type and energy; BOOST is not a price event.
  */
@@ -107,7 +138,8 @@ export async function runSupervisedExperiment(input: {
         const now = ports.now();
         if (!fresh(approvedAt, now, APPROVAL_TTL_MS) || !fresh(review.before.source.observedAt, now, CAPTURE_TTL_MS)
             || !fresh(current.before.source.observedAt, now, CAPTURE_TTL_MS)
-            || !fresh(current.kraken.lastSuccessfulUpdate, now, EVIDENCE_TTL_MS) || current.kraken.stale) throw new Error("STALE_APPROVAL_OR_EVIDENCE");
+            || !fresh(current.kraken.lastSuccessfulUpdate, now, EVIDENCE_TTL_MS) || current.kraken.stale) throw new StaleApprovalOrEvidenceError(approvedAt, review.before.source.observedAt,
+                current.before.source.observedAt, current.kraken.lastSuccessfulUpdate, current.kraken.stale, now);
         if (current.before.source.kind !== "tesla-site-info" || current.before.source.energySiteId !== input.selection.energySiteId
             || current.before.source.timeZone !== review.before.source.timeZone || current.before.diagnostics.includes("UNSUPPORTED_FIELDS_OMITTED")
             || representationKey(current.before.tariff) !== representationKey(review.before.tariff)) throw new Error("TESLA_BEFORE_STATE_CHANGED");
