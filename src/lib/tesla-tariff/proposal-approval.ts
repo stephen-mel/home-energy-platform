@@ -4,6 +4,7 @@ import { dryRunTeslaTariff, type TeslaTariffFragment } from "./dry-run";
 import { inspectTariff } from "./experiment-tariff";
 import { representationKey, assessRollbackEvidence, type TrustedRollbackObservation } from "./rollback-evidence";
 import { prepareObservedSmart, type ObservedSmartInput } from "./observed-proposal";
+import { prepareObservedReplacement, type ObservedReplacementInput } from "./observed-replacement";
 import type { AuthorityMode } from "./baseline";
 
 export type ProposalInput = {
@@ -13,14 +14,16 @@ export type ProposalInput = {
     experimentRepresentation?: TeslaTariffFragment;
     exceptions?: Array<"BUY_BELOW_SELL">;
     observedSmart?: ObservedSmartInput;
+    observedReplacement?: ObservedReplacementInput;
 };
 export type Proposal = ReturnType<typeof createTariffProposal>;
 export function createTariffProposal(input: ProposalInput) {
     const translation = dryRunTeslaTariff(input.signal, { timeZone: input.timeZone });
     const observed = input.observedSmart ? prepareObservedSmart(input.observedSmart, input.signal, input.energySiteId, input.timeZone) : null;
-    const experiment = !observed && input.purpose === "pricing-constraint-experiment";
+    const replacement = input.observedReplacement ? prepareObservedReplacement(input.observedReplacement, input.signal, input.energySiteId, input.timeZone) : null;
+    const experiment = !observed && !replacement && input.purpose === "pricing-constraint-experiment";
     const inspected = experiment ? inspectTariff(input.experimentRepresentation) : null;
-    const representation = observed ? observed.representation : experiment ? inspected?.tariff ?? null : translation.candidate.tariffContentV2Fragment;
+    const representation = observed ? observed.representation : replacement ? replacement.representation : experiment ? inspected?.tariff ?? null : translation.candidate.tariffContentV2Fragment;
     const blockers = translation.diagnostics.filter(d => d.severity === "error").map(d => d.code);
     // A complete, independently validated annual experiment is NOT the bounded
     // forecast fragment. Record this distinction; never waive bounded sync coverage.
@@ -34,6 +37,13 @@ export function createTariffProposal(input: ProposalInput) {
         if (!Number.isFinite(Date.parse(input.validFrom)) || !Number.isFinite(Date.parse(input.expiresAt))
             || Date.parse(input.validFrom) < generation || Date.parse(input.validFrom) >= Date.parse(input.expiresAt)
             || Date.parse(input.expiresAt) > Date.parse(input.observedSmart!.dispatch.end)) compatibilityBlockers.push("INVALID_SMART_VALIDITY");
+    }
+    if (replacement) {
+        compatibilityBlockers.push(...replacement.blockers);
+        if (input.purpose !== "tariff-sync" || input.observedSmart) compatibilityBlockers.push("INVALID_REPLACEMENT_PURPOSE");
+        const generated = Date.parse(input.observedReplacement!.generatedAt), start = Date.parse(input.validFrom), end = Date.parse(input.expiresAt);
+        if (![generated, start, end].every(Number.isFinite) || start < generated || end <= start
+            || end > Date.parse(input.observedReplacement!.comparisonDomain.end)) compatibilityBlockers.push("INVALID_REPLACEMENT_VALIDITY");
     }
     if (!representation) compatibilityBlockers.push("REPRESENTATION_UNAVAILABLE");
     if (experiment && inspected?.exact) {
@@ -52,13 +62,20 @@ export function createTariffProposal(input: ProposalInput) {
         ...(observed ? { generatedAt: input.observedSmart!.generatedAt, localValidity: observed.localValidity,
             dispatchEvidenceKey: observed.dispatchEvidenceKey, observationKey: representationKey(input.observedSmart!.observation),
             comparisonDomain: input.observedSmart!.comparisonDomain } : {}),
+        ...(replacement ? { generatedAt: input.observedReplacement!.generatedAt,
+            dispatchEvidenceKey: input.observedReplacement!.dispatchEvidenceKey,
+            observationKey: representationKey(input.observedReplacement!.observation),
+            comparisonDomain: input.observedReplacement!.comparisonDomain } : {}),
         tariffIdentities: [...new Set([...input.signal.import, ...input.signal.export].flatMap(w =>
             w.sources.filter(s => s.tariffVersion).map(s => representationKey({ provider: s.provider, version: s.tariffVersion }))))].sort(),
         exceptions: [...new Set(input.exceptions ?? [])].sort() };
     return { input, bound, fingerprint: representationKey(bound), compatibilityBlockers: [...new Set(compatibilityBlockers)],
         structurallyValid: observed ? observed.structurallyValid && input.purpose === "tariff-sync"
-            && !compatibilityBlockers.includes("INVALID_SMART_VALIDITY") : !!representation,
+            && !compatibilityBlockers.includes("INVALID_SMART_VALIDITY") && !replacement
+            : replacement ? replacement.structurallyValid && !compatibilityBlockers.includes("INVALID_REPLACEMENT_PURPOSE")
+                && !compatibilityBlockers.includes("INVALID_REPLACEMENT_VALIDITY") : !!representation,
         observedPreparation: observed,
+        ...(replacement ? { replacementPreparation: replacement } : {}),
         sourceDiagnostics: translation.diagnostics, coverageBasis: experiment && inspected?.exact ? "complete-experiment" : "bounded-hep-forecast",
         inspectionOnly: true as const, writeReady: false as const };
 }
@@ -69,7 +86,7 @@ function consistent(proposal: Proposal) {
 export type ProposalApproval = { fingerprint: string; approvedAt: string };
 export function approveTariffProposal(proposal: Proposal, confirmation: ProposalApproval): ProposalApproval {
     const now = Date.parse(confirmation.approvedAt);
-    if (!consistent(proposal) || (proposal.input.observedSmart && !proposal.structurallyValid) || proposal.fingerprint !== confirmation.fingerprint || !Number.isFinite(now)
+    if (!consistent(proposal) || ((proposal.input.observedSmart || proposal.input.observedReplacement) && !proposal.structurallyValid) || proposal.fingerprint !== confirmation.fingerprint || !Number.isFinite(now)
         || now < Date.parse(proposal.bound.validFrom) || now >= Date.parse(proposal.bound.expiresAt)
         || !Number.isFinite(Date.parse(proposal.bound.validFrom)) || !Number.isFinite(Date.parse(proposal.bound.expiresAt)))
         throw new Error("Exact current proposal and in-validity explicit confirmation required");
@@ -96,7 +113,7 @@ export function assessProposalCurrentUse(input: {
     if (current.bound.energySiteId !== input.targetEnergySiteId) blockers.push("TARGET_SITE_MISMATCH");
     if (!["confirm", "automatic"].includes(input.authority)) blockers.push("AUTHORITY_OBSERVE_ONLY");
     const rebuilt = createTariffProposal(current.input);
-    const acceptedExceptions = !rebuilt.input.observedSmart && rebuilt.bound.purpose === "pricing-constraint-experiment" && rebuilt.bound.exceptions.includes("BUY_BELOW_SELL") ? ["BUY_BELOW_SELL"] : [];
+    const acceptedExceptions = !rebuilt.input.observedSmart && !rebuilt.input.observedReplacement && rebuilt.bound.purpose === "pricing-constraint-experiment" && rebuilt.bound.exceptions.includes("BUY_BELOW_SELL") ? ["BUY_BELOW_SELL"] : [];
     blockers.push(...rebuilt.compatibilityBlockers.filter(code => !acceptedExceptions.includes(code)));
     if ([...current.input.signal.import, ...current.input.signal.export].some(w => w.stale || w.sources.some(s => s.stale))) blockers.push("STALE_EVIDENCE");
     const rollback = assessRollbackEvidence({ ...input.rollback, now: input.now, energySiteId: input.targetEnergySiteId }, trustedObservations);

@@ -45,7 +45,13 @@ const observedProposal = load('src/lib/tesla-tariff/observed-proposal.ts', {
   '../tariff/comparison-domain': domains, './sync-planner': syncPlanner, './observed-simulation': simulation,
   './experiment-tariff': tariffTools, './rollback-evidence': rollback,
 });
+const observedEconomic = load('src/lib/tesla-tariff/observed-economic.ts', { './observed-tariff': observed });
+const replacement = load('src/lib/tesla-tariff/observed-replacement.ts', {
+  '../tariff/comparison-domain': domains, './observed-economic': observedEconomic,
+  './observed-simulation': simulation, './dry-run': dryRun, './experiment-tariff': tariffTools,
+});
 const proposals = load('src/lib/tesla-tariff/proposal-approval.ts', {
+  './observed-replacement': replacement,
   './observed-proposal': observedProposal,
   '../tariff/compare-price-signal': comparison, './dry-run': dryRun,
   './experiment-tariff': tariffTools, './rollback-evidence': rollback,
