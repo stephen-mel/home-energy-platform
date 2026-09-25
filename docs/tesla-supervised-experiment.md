@@ -158,3 +158,16 @@ payload. Enter both acknowledgements and its one-use challenge. After the attemp
 inspect the recorded API result, read-back and Tesla app separately. Do not retry
 an ambiguous result or remove the site latch simply to run again. This implementation
 task itself provides no approval for a real write.
+
+## Experiment #1 close-out (25 September 2026)
+
+[Permanent experiment record](experiments/tesla-tariff-experiment-1-2026-09-25.md)
+records the initial ambiguous HTTP-200 outcome separately from later tariff/app and
+optimiser observations. Manual Tesla-app recovery, followed by reported read-only
+API verification, is now demonstrated for this experiment. API rollback and
+automatic reconciliation remain unproven. This adds no trusted rollback evidence,
+changes no classifier, and neither rewrites nor unlocks the site journal.
+
+Kraken changed its schedule after the write. The next bounded task is Confirm-mode
+economic divergence detection and an exact replacement proposal for human approval,
+following Observe → Confirm → Automatic. Reconciliation is not implemented here.

@@ -111,3 +111,14 @@ stop for explicit approval and a separate safety review; this task grants none.
 A successful controlled write/restore/read-back cycle, bound to the exact site and
 representations in the existing trusted evidence model, would be needed to establish
 actual restoration capability. No inspection-only result can supply that evidence.
+
+## Manual recovery evidence — 25 September 2026
+
+[Experiment #1](experiments/tesla-tariff-experiment-1-2026-09-25.md) demonstrates
+manual recovery through Tesla's app, with subsequent operator-reported Fleet API
+verification of the normal buy/export schedule and removal of temporary boundaries.
+This is `manual-recovery-demonstrated` historical evidence, not a
+`TrustedRollbackObservation`. It proves neither API restore acceptance nor exact
+whole-representation restoration. `rollbackProven` remains false and all existing
+production/restoration blockers remain applicable. No trusted ledger or runtime
+safety state is updated by this report.
