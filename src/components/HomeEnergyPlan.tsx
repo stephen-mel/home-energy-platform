@@ -1,3 +1,6 @@
+"use client";
+import { useDashboardTime } from "./use-dashboard-time";
+import { formatLocalDateTime } from "../lib/presentation/local-time";
 import { homeEnergyPlanView, rateLabel, vehicleNames } from "./home-energy-plan-view";
 import type { SitePricePlan } from "../lib/site/get-site-price-signal";
 import type { EnergyPrice, PriceSource, PriceWindow } from "../lib/tariff/types";
@@ -13,15 +16,7 @@ function KrakenDispatches({ sources, timeZone }: { sources: PriceSource[]; timeZ
         source.provider === "kraken" && source.cause?.kind === "ev-dispatch" ? [source.cause] : []
     ).sort((a, b) => Date.parse(a.start) - Date.parse(b.start) || a.assetId.localeCompare(b.assetId));
     if (!dispatches.length) return null;
-    const exactTime = (value: string) => {
-        const date = new Date(value);
-        return date.toLocaleString("en-GB", {
-            timeZone, year: "numeric", month: "short", day: "2-digit",
-            hour: "2-digit", minute: "2-digit", second: "2-digit",
-            fractionalSecondDigits: date.getUTCMilliseconds() ? 3 : undefined,
-            timeZoneName: "short",
-        });
-    };
+    const exactTime = (value: string) => formatLocalDateTime(value, timeZone, true);
     return (
         <div className="mt-3 border-t border-zinc-700 pt-3">
             <p className="text-sm font-medium">HEP grouping of planned Kraken opportunities</p>
@@ -52,13 +47,9 @@ function KrakenDispatches({ sources, timeZone }: { sources: PriceSource[]; timeZ
 
 export default function HomeEnergyPlan({ plan }: { plan: SitePricePlan }) {
     const { signal, timeZone, kraken } = plan;
-    const time = (value: string) => new Date(value).toLocaleString("en-GB", {
-        timeZone, day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", timeZoneName: "short",
-    });
-    const view = homeEnergyPlanView(signal);
-    const shortTime = (value: string) => new Date(value).toLocaleString("en-GB", {
-        timeZone, day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", timeZoneName: "short",
-    });
+    const time = (value: string) => formatLocalDateTime(value, timeZone);
+    const view = homeEnergyPlanView(signal, useDashboardTime(signal.generatedAt));
+    const shortTime = time;
     const tone = (window: PriceWindow | null) => !window || window.price === null
         ? "bg-zinc-700" : window.kind === "guaranteed-off-peak" ? "bg-emerald-400"
         : window.kind === "cheap-opportunity" ? "bg-amber-400" : "bg-sky-600";
@@ -95,7 +86,10 @@ export default function HomeEnergyPlan({ plan }: { plan: SitePricePlan }) {
     return (
         <section aria-label="Home energy price signal" className="mb-10 rounded-3xl border border-zinc-800 bg-zinc-900 p-6">
             <h2 className="text-2xl font-semibold">Home Energy Plan</h2>
-            <p className="mt-2 text-xs text-zinc-400">As of {shortTime(signal.generatedAt)} · {timeZone}</p>
+            <p className="mt-2 text-xs text-zinc-400">Plan calculated {shortTime(signal.generatedAt)} · {timeZone}</p>
+            {kraken.lastSuccessfulUpdate && <p className="mt-1 text-xs text-zinc-400">
+                Kraken schedule snapshot: {shortTime(kraken.lastSuccessfulUpdate)}. Reload to retrieve schedule changes.
+            </p>}
             <div className="mt-5 grid gap-3 sm:grid-cols-3" aria-label="Electricity price summary">
                 <div className="rounded-2xl bg-zinc-800/70 p-4">
                     <h3 className="text-xs uppercase tracking-wide text-zinc-400">Now</h3>

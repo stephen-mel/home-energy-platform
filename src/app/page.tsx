@@ -1,3 +1,5 @@
+import VehicleActivity from "../components/VehicleActivity";
+import { formatLocalTime, formatLocalDateTime } from "../lib/presentation/local-time";
 import HomeEnergyPlan from "../components/HomeEnergyPlan";
 import { getSitePriceSignal } from "../lib/site/get-site-price-signal";
 import LiveHomeEnergy from "../components/LiveHomeEnergy";
@@ -60,10 +62,7 @@ export default async function Home() {
           <p role="status" className="mb-6 text-sm text-amber-400">
             Kraken vehicle data is stale. Showing last known readings. Last successful update:{" "}
             <time dateTime={kraken.lastSuccessfulUpdate}>
-              {new Date(kraken.lastSuccessfulUpdate).toLocaleString("en-GB", {
-                timeZone: "Europe/London",
-                timeZoneName: "short",
-              })}
+              {formatLocalDateTime(kraken.lastSuccessfulUpdate, "Europe/London")}
             </time>.
           </p>
         )}
@@ -74,7 +73,7 @@ export default async function Home() {
         <div className="grid gap-6 md:grid-cols-2">
           {vehicles.map((vehicle) => {
             const soc = Number(vehicle.status.stateOfCharge?.value ?? 0);
-            const activePower = Number(vehicle.status.activePower?.value ?? 0);
+
             const schedule = vehicle.preferences?.schedules?.[0];
             const readyBy = schedule?.time?.slice(0, 5) ?? "Not set";
             const targetSoc = schedule?.max ?? null;
@@ -218,11 +217,7 @@ export default async function Home() {
                     <p className="text-xs uppercase tracking-wide text-zinc-500">
                       Charging
                     </p>
-                    <p className="mt-2 font-medium">
-                      {activePower > 0
-                        ? `${activePower.toFixed(1)} kW`
-                        : "Not charging"}
-                    </p>
+                    <VehicleActivity vehicle={vehicle} asOf={siteState.updatedAt} />
                   </div>
                 </div>
                 <div className="mt-6 border-t border-zinc-800 pt-6">
@@ -238,23 +233,8 @@ export default async function Home() {
 
                       <div className="mt-3 space-y-2">
                         {plannedDispatches.map((dispatch, index) => {
-                          const start = new Date(dispatch.start).toLocaleTimeString(
-                            "en-GB",
-                            {
-                              hour: "2-digit",
-                              minute: "2-digit",
-                              timeZone: "Europe/London",
-                            }
-                          );
-
-                          const end = new Date(dispatch.end).toLocaleTimeString(
-                            "en-GB",
-                            {
-                              hour: "2-digit",
-                              minute: "2-digit",
-                              timeZone: "Europe/London",
-                            }
-                          );
+                          const start = formatLocalTime(dispatch.start, "Europe/London");
+                          const end = formatLocalTime(dispatch.end, "Europe/London");
 
                           const energy = Math.abs(
                             Number(dispatch.energyAddedKwh ?? 0)

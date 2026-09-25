@@ -8,11 +8,11 @@ import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
 // No network or integration client dependencies are allowed in this graph.
-function load(file, dependencies = {}) {
+function load(file, dependencies = {}, globals = {}) {
   const exports = {};
   vm.runInNewContext(ts.transpileModule(fs.readFileSync(file, 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX },
-  }).outputText, { exports, require(name) {
+  }).outputText, { ...globals, exports, require(name) {
     assert.ok(name in dependencies, `Unexpected dependency: ${name}`);
     return dependencies[name];
   } });
@@ -26,7 +26,7 @@ const { getSitePriceSignal } = load('src/lib/site/get-site-price-signal.ts', {
   '../tariff/price-signal': curve, '../tariff/kraken-dispatches': adapter,
   '../tariff/effective-tariff': effectiveTariff,
 });
-const { default: HomeEnergyPlan } = load('src/components/HomeEnergyPlan.tsx', { 'react/jsx-runtime': jsxRuntime, './home-energy-plan-view': load('src/components/home-energy-plan-view.ts') });
+const { default: HomeEnergyPlan } = load('src/components/HomeEnergyPlan.tsx', { 'react/jsx-runtime': jsxRuntime, './home-energy-plan-view': load('src/components/home-energy-plan-view.ts'), './use-dashboard-time': { useDashboardTime: value => value }, '../lib/presentation/local-time': load('src/lib/presentation/local-time.ts') });
 const now = '2026-09-18T00:00:00.000Z';
 const at = hour => `2026-09-18T${String(hour).padStart(2, '0')}:00:00.000Z`;
 const price = amount => ({ amount, currency: 'GBP', unit: 'kWh' });
@@ -175,7 +175,7 @@ test('homeowner UI exposes conditionality, sources, known/unknown prices, dates 
   const html = renderToStaticMarkup(createElement(HomeEnergyPlan, { plan: build([dispatch(2, 3)], site(), true) }));
   for (const text of ['Whole-home price signal', 'Whole-home cheap opportunity', '10p/kWh',
     'Kraken planned EV dispatch', 'Price not configured / unknown', 'Kraken schedule is stale',
-    'Last successful update', 'Conditional on scheduled vehicle charging', 'Export', '18 Sept']) assert.ok(html.includes(text), text);
+    'Last successful update', 'Conditional on scheduled vehicle charging', 'Export', '18 Sep']) assert.ok(html.includes(text), text);
   const unavailable = renderToStaticMarkup(createElement(HomeEnergyPlan, { plan: getSitePriceSignal(site(), null, now) }));
   assert.match(unavailable, /Kraken schedule is unavailable/);
 });
@@ -545,4 +545,70 @@ test('unknown rates and missing coverage remain unknown in presentation, never z
   assert.equal(empty.segments.length, 1); assert.equal(empty.segments[0].percent, 100);
   assert.equal(empty.currentImport, null);
   assert.match(defaultUI(eonPlan([], '2026-10-01T00:00:00+01:00')), /Rate unknown/);
+});
+
+test('25 September Q7 UTC dispatches are current at 13:15 BST and remain conditional in the timeline', () => {
+  const config = load('src/lib/site/current-site.ts').currentSite;
+  const dispatches = [
+    { start: '2026-09-25T12:00:00+00:00', end: '2026-09-25T13:30:00+00:00', type: 'SMART' },
+    { start: '2026-09-25T13:30:00+00:00', end: '2026-09-25T14:00:00+00:00', type: 'SMART' },
+  ];
+  const snapshot = state(dispatches); snapshot.vehicles[0].status = { activePower: null };
+  const current = '2026-09-25T12:15:00Z';
+  const activity = load('src/lib/kraken/vehicle-activity.ts').vehicleActivity;
+  assert.equal(activity(snapshot.vehicles[0], current).currentDispatches[0].start, dispatches[0].start);
+  assert.equal(activity(snapshot.vehicles[0], current).charging, 'Charging power unavailable');
+  assert.equal(activity(snapshot.vehicles[0], dispatches[1].start).currentDispatches.length, 1);
+  assert.equal(activity(snapshot.vehicles[0], dispatches[1].end).currentDispatches.length, 0);
+  snapshot.vehicles[0].status.activePower = { value: 7 };
+  assert.equal(activity(snapshot.vehicles[0], current).charging, '7.0 kW');
+  // Page loaded before the window; local clock must select the later interval.
+  const plan = getSitePriceSignal(config, snapshot, '2026-09-25T11:00:00Z');
+  const view = load('src/components/home-energy-plan-view.ts').homeEnergyPlanView(plan.signal, current);
+  assert.equal(view.currentImport.price.amount, 0.0299);
+  assert.equal(view.currentImport.condition, 'scheduled-ev-charging');
+  assert.ok(view.currentImport.eligibilityPeriods.every(p => p.state === 'planned-conditional'));
+  assert.equal(view.segments[0].window.kind, 'cheap-opportunity');
+  assert.equal(view.segments[0].start, '2026-09-25T12:15:00.000Z');
+  assert.equal(view.segments[0].end, '2026-09-25T14:00:00.000Z');
+  const format = load('src/lib/presentation/local-time.ts');
+  assert.equal(format.formatLocalTime(dispatches[0].start, 'Europe/London'), '13:00');
+  assert.equal(format.formatLocalTime(dispatches[0].end, 'Europe/London'), '14:30');
+  assert.equal(format.formatLocalTime(dispatches[1].end, 'Europe/London'), '15:00');
+  assert.equal(format.formatLocalDateTime(current, 'Europe/London'), '25 Sep, 13:15 UTC+01:00');
+  const html = renderToStaticMarkup(createElement(HomeEnergyPlan, { plan: getSitePriceSignal(config, snapshot, current) }));
+  assert.match(html, /2\.99p\/kWh/);
+  assert.match(html, /25 Sep, 13:15 UTC\+01:00/);
+  assert.match(html, /Smart charge · Conditional/);
+});
+
+test('GMT and repeated DST hour use absolute dispatch boundaries and explicit 24-hour London formatting', () => {
+  const format = load('src/lib/presentation/local-time.ts');
+  assert.equal(format.formatLocalDateTime('2026-10-25T00:30:00Z', 'Europe/London'), '25 Oct, 01:30 UTC+01:00');
+  assert.equal(format.formatLocalDateTime('2026-10-25T01:30:00Z', 'Europe/London'), '25 Oct, 01:30 UTC+00:00');
+  assert.equal(format.formatLocalTime('2026-12-25T13:00:00Z', 'Europe/London'), '13:00');
+  const activity = load('src/lib/kraken/vehicle-activity.ts').vehicleActivity;
+  const vehicle = { status: { activePower: null }, plannedDispatches: [{ start: '2026-10-25T00:15:00Z', end: '2026-10-25T01:15:00Z', type: 'SMART' }] };
+  assert.equal(activity(vehicle, '2026-10-25T01:00:00Z').currentDispatches.length, 1);
+  assert.equal(activity(vehicle, '2026-10-25T01:30:00Z').currentDispatches.length, 0);
+});
+
+
+test('dashboard clock hydrates from server time then advances locally without any network or refresh', () => {
+  const initial = '2026-09-25T11:00:00Z';
+  let effect, tick, cleanup, latest, interval;
+  const hook = load('src/components/use-dashboard-time.ts', { react: {
+    useState: value => [value, value => { latest = value; }],
+    useEffect: callback => { effect = callback; },
+  } }, {
+    setInterval: (callback, ms) => { tick = callback; interval = ms; return 123; },
+    clearInterval: id => { cleanup = id; },
+  });
+  assert.equal(hook.useDashboardTime(initial), initial);
+  const stop = effect();
+  assert.ok(Number.isFinite(Date.parse(latest)));
+  assert.equal(interval, 30000);
+  tick(); stop(); assert.equal(cleanup, 123);
+  const component = fs.readFileSync('src/components/HomeEnergyPlan.tsx', 'utf8');
+  assert.match(component, /homeEnergyPlanView\(signal, useDashboardTime\(signal.generatedAt\)\)/);
 });

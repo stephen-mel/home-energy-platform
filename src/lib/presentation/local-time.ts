@@ -15,14 +15,14 @@ function localParts(timestamp: string, timeZone: string) {
         hour: value("hour"), minute: value("minute"), second: value("second") };
 }
 
-export function formatLocalDateTime(timestamp: string, timeZone: string): string {
+export function formatLocalDateTime(timestamp: string, timeZone: string, exact = false): string {
     const p = localParts(timestamp, timeZone);
     const offsetMinutes = Math.round((Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second)
         - Math.floor(p.date.getTime() / 1000) * 1000) / 60_000);
     const offset = Math.abs(offsetMinutes);
     // Numeric offset is deterministic even where runtimes disagree on short names.
     const zone = `UTC${offsetMinutes < 0 ? "-" : "+"}${pad(Math.floor(offset / 60))}:${pad(offset % 60)}`;
-    return `${pad(p.day)} ${months[p.month - 1]}, ${pad(p.hour)}:${pad(p.minute)} ${zone}`;
+    return `${pad(p.day)} ${months[p.month - 1]}${exact ? ` ${p.year}` : ""}, ${pad(p.hour)}:${pad(p.minute)}${exact ? `:${pad(p.second)}${p.date.getUTCMilliseconds() ? `.${String(p.date.getUTCMilliseconds()).padStart(3, "0")}` : ""}` : ""} ${zone}`;
 }
 
 export function isNextLocalMidnight(timestamp: string, asOf: string, timeZone: string): boolean {
@@ -34,4 +34,9 @@ export function isNextLocalMidnight(timestamp: string, asOf: string, timeZone: s
         && target.hour === 0 && target.minute === 0 && target.second === 0 && target.date.getUTCMilliseconds() === 0
         && target.year === nextDay.getUTCFullYear() && target.month === nextDay.getUTCMonth() + 1
         && target.day === nextDay.getUTCDate();
+}
+
+export function formatLocalTime(timestamp: string, timeZone: string): string {
+    const p = localParts(timestamp, timeZone);
+    return `${pad(p.hour)}:${pad(p.minute)}`;
 }
