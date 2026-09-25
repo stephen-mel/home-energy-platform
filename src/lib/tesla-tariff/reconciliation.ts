@@ -1,3 +1,4 @@
+import { managedSmartTarget, type ManagedImportEvidence } from "./managed-smart";
 import type { Site } from "../site/types";
 import type { KrakenState } from "../site/kraken-state";
 import { getSitePriceSignal } from "../site/get-site-price-signal";
@@ -16,6 +17,7 @@ export type ReconciliationInput = {
     energySiteId: string;
     kraken: KrakenState;
     previousKraken?: KrakenState;
+    managedImport?: ManagedImportEvidence;
     observation: ObservedTariff;
     now: string;
     comparisonDomain: { start: string; end: string };
@@ -56,7 +58,13 @@ export function reconcileTeslaTariff(input: ReconciliationInput) {
         const observed = observedEconomicSignal(input.observation, domain);
         const comparison = comparePriceSignalsInDomain(observed.signal, monetarySignal(validated.projected.current), domain);
         if (comparison.status === "indeterminate") return fail(comparison.diagnostic.code);
-        const planner = planTeslaTariffSync({ previousSignal: observed.signal, signal: monetarySignal(validated.projected.current),
+        const managedScope = { baseSignal: getSitePriceSignal(input.site, null, input.now).signal, previous: input.managedImport };
+        let managed;
+        try { managed = managedSmartTarget(hep, input.observation, domain, managedScope); }
+        catch (error) { return fail(error instanceof Error ? error.message : "MANAGED_SCOPE_UNAVAILABLE"); }
+        const exactPlanner = planTeslaTariffSync({ previousSignal: observed.signal, signal: monetarySignal(validated.projected.current),
+            comparisonDomain: domain, timeZone: input.site.tariff.timeZone });
+        const planner = planTeslaTariffSync({ previousSignal: observed.signal, signal: monetarySignal(managed.target),
             comparisonDomain: domain, timeZone: input.site.tariff.timeZone });
         const currentKey = smartEvidenceKey(input.kraken);
         const previousKey = input.previousKraken ? smartEvidenceKey(input.previousKraken) : null;
@@ -64,23 +72,26 @@ export function reconcileTeslaTariff(input: ReconciliationInput) {
             ...dispatches.map(d => instant(d.end)).filter(t => t > now));
         const common = { ...safety, requestedDomain: input.comparisonDomain, domain,
             ignoredPastUntil: start < now ? domain.start : null, hep, observed,
-            comparison: planner.comparison,
+            comparison: planner.comparison, exactComparison: exactPlanner.comparison,
+            managed: { ownership: managed.ownership, target: managed.target },
+            unmanaged: { comparison: managed.unmanaged, differences: planTeslaTariffSync({ previousSignal: monetarySignal(managed.target),
+                signal: monetarySignal(validated.projected.current), comparisonDomain: domain, timeZone: input.site.tariff.timeZone }).comparison.changedPeriods },
             evidence: { previousKey, currentKey, changed: previousKey === null ? null : previousKey !== currentKey,
                 currentDispatches: dispatches, previousDispatches: input.previousKraken ? scheduled(input.previousKraken) : null, state: "planned-conditional" as const },
             freshness: { generatedAt: input.now, krakenObservedAt: input.kraken.lastSuccessfulUpdate,
                 teslaObservedAt: input.observation.source.observedAt, expiresAt: new Date(expiry).toISOString(),
                 captureAgeSeconds: (now - captureAt) / 1000, evidenceAgeSeconds: (now - krakenAt) / 1000,
                 captureTtlSeconds: CAPTURE_TTL_MS / 1000, evidenceTtlSeconds: EVIDENCE_TTL_MS / 1000 },
-            limitations: ["Economic comparison is exact, including export; no price tolerance or silent substitution.",
+            limitations: ["Exact comparison includes export; only managed SMART import divergence triggers replacement.",
                 "Comparison-only monetary views do not promote planned charging or establish billing eligibility.",
-                "No earlier Kraken snapshot means dispatch history is unknown; observed Tesla prices remain the comparison baseline.",
+                "Removing old SMART periods requires explicit represented-signal and underlying observed-baseline evidence; price resemblance alone establishes no ownership.",
                 "Proposals require new exact approval and fresh validation; this result grants no execution authority."] };
-        const blockers = [...new Set([...productionBlockers, ...planner.compatibility.blockers.map(d => d.code)])];
-        if (comparison.status === "unchanged") return { ...common, status: "in-sync" as const, proposal: null, blockers };
+        const blockers = [...new Set([...productionBlockers, ...planner.compatibility.blockers.map(d => d.code), ...exactPlanner.compatibility.blockers.map(d => d.code)])];
+        if (planner.comparison.state === "unchanged") return { ...common, status: "in-sync" as const, proposal: null, blockers };
         const proposal = createTariffProposal({ proposalId: "confirm-tariff-reconciliation", energySiteId: input.energySiteId,
             purpose: "tariff-sync", timeZone: input.site.tariff.timeZone, validFrom: input.now, expiresAt: new Date(expiry).toISOString(),
             signal: hep, observedReplacement: { observation: input.observation, generatedAt: input.now,
-                comparisonDomain: domain, dispatchEvidenceKey: currentKey } });
+                comparisonDomain: domain, dispatchEvidenceKey: currentKey, managedScope } });
         const restoration = reviewObservedRestoration({ before: input.observation, temporaryProposal: proposal,
             asOf: input.now, maxCaptureAgeMs: CAPTURE_TTL_MS });
         blockers.push(...proposal.compatibilityBlockers, ...restoration.blockers);

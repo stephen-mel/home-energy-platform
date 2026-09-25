@@ -25,6 +25,7 @@ const { reconcileTeslaTariff } = load('src/lib/tesla-tariff/reconciliation.ts');
 const { observedEconomicSignal, monetarySignal } = load('src/lib/tesla-tariff/observed-economic.ts');
 const { comparePriceSignalsInDomain } = load('src/lib/tariff/comparison-domain.ts');
 const { createTariffProposal, approveTariffProposal, assessProposalCurrentUse } = load('src/lib/tesla-tariff/proposal-approval.ts');
+const { getSitePriceSignal } = load('src/lib/site/get-site-price-signal.ts');
 const siteConfig = load('src/lib/site/current-site.ts').currentSite;
 const at = time => `2026-09-25T${time}:00+01:00`;
 const dispatch = (start, end, type = 'SMART') => ({ start: at(start), end: at(end), type, energyAddedKwh: '3' });
@@ -40,11 +41,18 @@ function side(smart = [], sell = false) {
     seasons:{Annual:{fromMonth:1,fromDay:1,toMonth:12,toDay:31,tou_periods}},energy_charges:{Annual:{rates}} };
 }
 function input(dispatches=[], represented=[], now=at('12:00')) {
-  return { site:structuredClone(siteConfig),energySiteId:'12345',now,
+  const result = { site:structuredClone(siteConfig),energySiteId:'12345',now,
     comparisonDomain:{start:at('00:00'),end:at('18:00')},
     kraken:{stale:false,lastSuccessfulUpdate:now,vehicles:[{id:'q7',name:'Q7',plannedDispatches:dispatches}]},
     observation:{source:{kind:'tesla-site-info',energySiteId:'12345',observedAt:now,timeZone:'Europe/London'},
       tariff:{...side(represented),sell_tariff:side([],true)},diagnostics:[],rollbackProven:false} };
+  if (represented.length) {
+    const old = structuredClone(result.kraken);
+    old.vehicles[0].plannedDispatches = represented.map(([a,b]) => dispatch(`${String(Math.floor(a/60)).padStart(2,'0')}:${String(a%60).padStart(2,'0')}`, `${String(Math.floor(b/60)).padStart(2,'0')}:${String(b%60).padStart(2,'0')}`));
+    result.managedImport = { baseline: { ...structuredClone(result.observation), tariff: { ...side(), sell_tariff:side([],true) } },
+      representedSignal: getSitePriceSignal(result.site,old,now).signal };
+  }
+  return result;
 }
 function assertReplacement(r) {
   assert.equal(r.status,'update-required', JSON.stringify(r.blockers));
@@ -53,7 +61,7 @@ function assertReplacement(r) {
   for(const b of ['BUY_BELOW_SELL','ROLLBACK_UNPROVEN','BOUNDED_FORECAST','RESTORATION_REQUIRED','OBSERVED_TOU_ASSUMPTIONS_UNVERIFIED']) assert.ok(r.blockers.includes(b),b);
   const observation={...r.observed,source:{kind:'simulation',energySiteId:'12345',observedAt:r.freshness.generatedAt,timeZone:'Europe/London'},tariff:r.proposal.bound.representation,diagnostics:[],rollbackProven:false};
   const curve=observedEconomicSignal(observation,r.domain).signal;
-  assert.equal(comparePriceSignalsInDomain(curve,monetarySignal(r.hep),r.domain).status,'unchanged');
+  assert.equal(comparePriceSignalsInDomain(curve,monetarySignal(r.managed.target),r.domain).status,'unchanged');
   assert.ok(r.hep.import.flatMap(w=>w.eligibilityPeriods).every(p=>p.state==='planned-conditional'));
 }
 
@@ -104,10 +112,10 @@ test('freshness, future timestamps, malformed evidence and unknown coverage fail
   ];
   for(const change of changes){const i=input();change(i);const r=reconcileTeslaTariff(i);assert.equal(r.status,'indeterminate',r.diagnostic);assert.equal(r.proposal,null);assert.equal(r.writeReady,false);}
 });
-test('exact tariff differences are not rounded away; export changes independently',()=>{
+test('exact base/export differences remain visible but unmanaged',()=>{
   const i=input();i.observation.tariff.energy_charges.Annual.rates.arbitrary_1=0.25177;
   Object.keys(i.observation.tariff.sell_tariff.energy_charges.Annual.rates).forEach(k=>{i.observation.tariff.sell_tariff.energy_charges.Annual.rates[k]=0.17;});
-  const r=reconcileTeslaTariff(i);assertReplacement(r);assert.ok(r.comparison.changedPeriods.some(p=>p.channels.includes('export')));
+  const r=reconcileTeslaTariff(i);assert.equal(r.status,'in-sync');assert.equal(r.exactComparison.state,'changed');assert.ok(r.unmanaged.differences.some(p=>p.channels.includes('export')));assert.equal(r.proposal,null);
 });
 test('short validity and sub-minute proposals stay blocked; cancellation invalidates earlier proposal approval',()=>{
   const i=input([dispatch('13:00','14:00')]);i.kraken.lastSuccessfulUpdate='2026-09-25T10:59:30Z';
@@ -122,7 +130,7 @@ test('short validity and sub-minute proposals stay blocked; cancellation invalid
 });
 test('identical inputs give identical fingerprints and output; metadata changes alone do not create a rate difference',()=>{
   const i=input([dispatch('13:00','14:00')]);assert.equal(JSON.stringify(reconcileTeslaTariff(i)),JSON.stringify(reconcileTeslaTariff(i)));
-  const same=input([dispatch('13:00','14:00')],[[780,840]]);same.observation.source.observedAt='2026-09-25T10:59:59Z';
+  const same=input([dispatch('13:00','14:00')],[[780,840]]);same.managedImport.baseline.source.observedAt='2026-09-25T10:59:58Z';same.observation.source.observedAt='2026-09-25T10:59:59Z';
   assert.equal(reconcileTeslaTariff(same).status,'in-sync');
 });
 
@@ -200,4 +208,48 @@ test('strict replacement preparation rejects invalid generation/capture binding 
     assert.equal(assessed.acceptedExceptions.length,0);
     assert.equal(assessed.writeReady,false);
   }
+});
+
+
+test('17p Tesla export versus 17.5p HEP is unmanaged even with aligned SMART', () => {
+  const i=input([dispatch('13:00','14:00')],[[780,840]]);
+  for(const key of Object.keys(i.observation.tariff.sell_tariff.energy_charges.Annual.rates)) i.observation.tariff.sell_tariff.energy_charges.Annual.rates[key]=0.17;
+  const r=reconcileTeslaTariff(i);
+  assert.equal(r.status,'in-sync');assert.equal(r.exactComparison.state,'changed');
+  assert.ok(r.unmanaged.differences.every(p=>p.channels.join()==='export'));
+  assert.equal(r.unmanaged.comparison.status,'changed');
+});
+test('moved SMART restores observed 25.177p base and preserves the complete observed 17p export representation', () => {
+  const i=input([dispatch('14:00','15:00')],[[780,840]]);
+  for(const side of [i.observation.tariff,i.managedImport.baseline.tariff]) {
+    for(const [key,value] of Object.entries(side.energy_charges.Annual.rates)) if(value===0.2518) side.energy_charges.Annual.rates[key]=0.25177;
+  }
+  for(const key of Object.keys(i.observation.tariff.sell_tariff.energy_charges.Annual.rates)) i.observation.tariff.sell_tariff.energy_charges.Annual.rates[key]=0.17;
+  const r=reconcileTeslaTariff(i);assertReplacement(r);
+  assert.deepEqual(structuredClone(r.proposal.bound.representation.sell_tariff),i.observation.tariff.sell_tariff);
+  const restored=r.managed.target.import.find(w=>Date.parse(w.start)<=Date.parse(at('13:30')) && Date.parse(w.end)>Date.parse(at('13:30')));
+  assert.equal(restored.price.amount,0.25177);
+  assert.ok(r.unmanaged.differences.some(p=>p.channels.includes('import')));
+  assert.ok(r.proposal.bound.managedScopeKey);
+});
+test('unattributed cheap tariff is preserved; previous Kraken data alone cannot claim ownership', () => {
+  const i=input([],[[780,840]]);delete i.managedImport;
+  i.previousKraken=input([dispatch('13:00','14:00')]).kraken;
+  const r=reconcileTeslaTariff(i);assert.equal(r.status,'in-sync');assert.equal(r.exactComparison.state,'changed');
+  assert.equal(r.unmanaged.comparison.status,'changed');assert.equal(r.proposal,null);
+});
+test('intervening import changes and invalid historical site binding are indeterminate, not silently restored', () => {
+  for(const mutate of [
+    i=>{ for(const [key,value] of Object.entries(i.observation.tariff.energy_charges.Annual.rates)) if(value===0.0299) i.observation.tariff.energy_charges.Annual.rates[key]=0.08; },
+    i=>{i.managedImport.baseline.source.energySiteId='other';},
+  ]) {const i=input([],[[780,840]]);mutate(i);const r=reconcileTeslaTariff(i);assert.equal(r.status,'indeterminate');assert.equal(r.proposal,null);assert.equal(r.rollbackProven,false);}
+});
+
+test('baseline import precision difference alone is reported without a managed update', () => {
+  const i=input();
+  for(const [key,value] of Object.entries(i.observation.tariff.energy_charges.Annual.rates)) if(value===0.2518) i.observation.tariff.energy_charges.Annual.rates[key]=0.25177;
+  const r=reconcileTeslaTariff(i);
+  assert.equal(r.status,'in-sync');assert.equal(r.exactComparison.state,'changed');assert.equal(r.proposal,null);
+  assert.ok(r.unmanaged.differences.length>0);
+  assert.ok(r.unmanaged.differences.every(p=>p.channels.join()==='import'));
 });

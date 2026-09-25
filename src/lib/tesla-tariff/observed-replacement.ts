@@ -1,3 +1,4 @@
+import { managedSmartTarget, type ManagedSmartScope } from "./managed-smart";
 import type { PriceSignal } from "../tariff/types";
 import { comparePriceSignalsInDomain } from "../tariff/comparison-domain";
 import type { ObservedTariff } from "./observed-tariff";
@@ -11,6 +12,7 @@ export type ObservedReplacementInput = {
     generatedAt: string;
     comparisonDomain: { start: string; end: string };
     dispatchEvidenceKey: string;
+    managedScope?: ManagedSmartScope;
 };
 
 /** Multi-interval replacement using the existing date-season simulation. No
@@ -29,7 +31,8 @@ export function prepareObservedReplacement(input: ObservedReplacementInput, sign
         if (observation.source.kind !== "tesla-site-info" || observation.source.energySiteId !== energySiteId || observation.source.timeZone !== timeZone)
             return fail("OBSERVATION_TARGET_MISMATCH");
         if (!inspectObservedProposalTariff(observation.tariff).exact || observation.diagnostics.includes("UNSUPPORTED_FIELDS_OMITTED")) return fail("OBSERVATION_INEXACT");
-        const check = comparePriceSignalsInDomain(signal, signal, input.comparisonDomain);
+        const target = input.managedScope ? managedSmartTarget(signal, observation, input.comparisonDomain, input.managedScope).target : signal;
+        const check = comparePriceSignalsInDomain(target, target, input.comparisonDomain);
         if (check.status === "indeterminate") return fail(check.diagnostic.code);
         const translation = dryRunTeslaTariff(check.projected.current, { timeZone });
         blockers.push(...translation.diagnostics.filter(d => d.severity === "error").map(d => d.code));

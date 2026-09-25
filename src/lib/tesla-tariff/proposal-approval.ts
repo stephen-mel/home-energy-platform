@@ -65,7 +65,8 @@ export function createTariffProposal(input: ProposalInput) {
         ...(replacement ? { generatedAt: input.observedReplacement!.generatedAt,
             dispatchEvidenceKey: input.observedReplacement!.dispatchEvidenceKey,
             observationKey: representationKey(input.observedReplacement!.observation),
-            comparisonDomain: input.observedReplacement!.comparisonDomain } : {}),
+            comparisonDomain: input.observedReplacement!.comparisonDomain,
+            ...(input.observedReplacement!.managedScope ? { managedScopeKey: representationKey(input.observedReplacement!.managedScope) } : {}) } : {}),
         tariffIdentities: [...new Set([...input.signal.import, ...input.signal.export].flatMap(w =>
             w.sources.filter(s => s.tariffVersion).map(s => representationKey({ provider: s.provider, version: s.tariffVersion }))))].sort(),
         exceptions: [...new Set(input.exceptions ?? [])].sort() };

@@ -14,9 +14,9 @@ helper; it never calls the supervised execution orchestrator.
 
 ## Results
 
-- `in-sync`: import/export monetary curves match exactly over the remaining common
-  domain. This is not proof of billing, optimiser behaviour or write compatibility.
-- `update-required`: economics differ and an exact, structurally valid replacement
+- `in-sync`: the managed SMART import signal matches over the remaining common
+  domain. Other exact tariff differences may still exist. This is not proof of billing, optimiser behaviour or write compatibility.
+- `update-required`: managed SMART import economics differ and an exact, structurally valid replacement
   representation is prepared for inspection. It is **not write permission**. The
   result and proposal retain all production blockers, including BUY_BELOW_SELL.
 - `indeterminate`: stale/future/malformed evidence, mismatched site/timezone, unknown
@@ -46,7 +46,7 @@ remain alongside those monetary views and in the strict proposal. A stored Tesla
 price is not a guarantee that E.ON awarded it. Raw JSON/labels, source timestamps,
 SMART splits/merges and provenance alone do not constitute economic changes.
 BOOST does not affect the HEP tariff. SMART movement inside a guaranteed overnight
-band has no effect when the already represented prices match HEP.
+band creates no managed increment; any baseline price difference remains unmanaged.
 
 The requested domain is explicit. Elapsed time is excluded by advancing its start
 to `max(requested start, now)`, recorded as `ignoredPastUntil`. Both curves must
@@ -56,34 +56,60 @@ HEP horizon are indeterminate. An entirely elapsed domain is indeterminate, not 
 claim of indefinite equivalence. Expired SMART differences outside the remaining
 domain do not trigger replacement.
 
-**Price precision is deliberate:** production HEP currently configures 0.0299 /
-0.2518 GBP/kWh import and 0.175 export. The Experiment #1 restored Tesla report uses
-0.02993 / 0.25177 and 0.17. These are economically different, even without a SMART
-schedule change. Reconciliation reports them and preserves HEP values in a proposed
-replacement, including export independently. No tariff configuration is changed,
-no epsilon is applied, and 17.5p is never silently replaced by 17p. Confirm UI must
-show these differences explicitly before any future human approval. Tests using
-matching synthetic prices establish SMART equivalence independently of this known
-configuration mismatch; synthetic DST fixtures do not configure October rates.
+## Managed SMART scope and exact unmanaged differences
+
+Kraken reconciliation owns only incremental import prices caused by effective
+SMART opportunities. `managedSmartTarget` starts with observed Tesla prices and
+changes only those import intervals. It compares current HEP SMART prices against
+the HEP base signal without Kraken; an opportunity that does not change the base
+price is not a managed increment. Guaranteed overnight pricing is preserved.
+
+`comparison` drives the decision using the managed target. `exactComparison` still
+reports every HEP-versus-Tesla monetary difference, with no tolerance.
+`unmanaged.comparison` and `unmanaged.differences` report exact residual differences
+between the managed target and HEP truth. Export is always unmanaged. Underlying
+import differences outside managed increments are also unmanaged. Neither alone
+produces `update-required`. HEP truth is never changed to match Tesla.
+
+For example, Tesla 0.17 export versus HEP 0.175 remains visible but cannot cause a
+SMART update. Tesla 0.25177 daytime base versus HEP 0.2518 is likewise preserved.
+When a new daytime SMART interval needs 0.0299, only that increment is proposed;
+export and unrelated base prices remain as observed. No rounding is introduced.
+
+Removing/moving a previously represented SMART interval requires optional
+`managedImport` historical context: the underlying observed Tesla `baseline` and
+HEP `representedSignal` actually represented by the managed operation. This must
+come from retained, site-bound operation evidence, not inference from a cheap
+price or a prior Kraken schedule. The pure caller supplies it; this task adds no
+persistence, trust ledger or inferred successful write. It is not rollback proof.
+
+In removed intervals, the current price must still match either that previous
+managed price or its recorded baseline. A third price is an ownership conflict
+and returns `indeterminate`. Removal restores the recorded Tesla baseline, never
+HEP's unrelated base price. Without historical ownership context, unattributed
+cheap periods remain observable and unmanaged rather than guessed away. This is
+an intentional limit until a future caller supplies the appropriate operation
+record. Baseline identity, coverage and exact structure are validated; a historical
+capture is not subjected to the current live-capture TTL, nor used to satisfy it.
 
 ## Replacement and safety binding
 
 The existing `createTariffProposal` accepts an additional observed-replacement
 preparation input. It reconstructs, rather than trusts, the representation from the
-observed before-state and HEP signal. `prepareObservedReplacement` reuses
+observed before-state, HEP signal and bound managed scope. `prepareObservedReplacement` reuses
 `simulateObservedSmartDate` for each changed price interval and independent tariff
 side. This allows additions, removals, boundary movements and multiple periods;
-obsolete cheap intervals are overwritten with current HEP economics.
+obsolete owned cheap intervals are restored to the recorded Tesla baseline.
 
 Unaffected prices are retained. The existing strict observed representation
 validator checks complete recurring-season coverage. The result is re-expanded and
-compared with HEP over the domain. The portions of touched local dates outside the
+compared with the managed target over the domain. The full HEP signal remains separate. The portions of touched local dates outside the
 domain are checked separately to prevent a DST fold from changing excluded/past
 instants. Unrepresentable sub-minute intervals, conflicting repeated-hour prices,
 unsupported captures/currencies and nonzero demand charges fail closed.
 
 The proposal binds exact representation, site/timezone, HEP economic/evidence key,
-SMART evidence key, observed before-state (including capture provenance), common
+SMART evidence key, managed scope (including historical baseline and represented signal), observed before-state (including capture provenance), common
 domain, generation and expiry. Existing approval consistency reconstruction detects
 representation tampering; changed dispatch evidence produces a new binding even if
 an earlier proposal was approved. Existing `reviewObservedRestoration` supplies the
