@@ -1,3 +1,4 @@
+import EnergyOptimisation from "../components/EnergyOptimisation";
 import VehicleActivity from "../components/VehicleActivity";
 import { formatLocalTime, formatLocalDateTime } from "../lib/presentation/local-time";
 import HomeEnergyPlan from "../components/HomeEnergyPlan";
@@ -54,6 +55,7 @@ export default async function Home() {
           }}>
           <HomeEnergyPlan plan={pricePlan} />
         </LiveHomeEnergy>
+        <EnergyOptimisation result={null} timeZone={site.tariff?.timeZone ?? "Europe/London"} />
         <h2 className="mb-3 text-2xl font-semibold">Electric Vehicles</h2>
         <p className="mb-6 text-sm text-zinc-400">
           {kraken?.stale ? "Last known vehicle data from Kraken Flex" : "Vehicle data from Kraken Flex"}

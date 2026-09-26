@@ -138,3 +138,30 @@ Require a new reconciliation on stale/changed inputs. Human review/approval must
 use the existing exact proposal model, with no executor wiring, polling policy,
 automatic replacement or latch reset in that UI task. Write integration remains
 separate and subject to every existing blocker and explicit authorisation.
+
+## Home dashboard review presentation
+
+`EnergyOptimisation` and its pure `energyOptimisationView` helper accept an existing
+`ReconciliationResult`. The Home section sits between the energy plan and vehicles.
+It renders in-sync, update-required, indeterminate and blocked states without
+running reconciliation, fetching data, generating approvals or wiring an executor.
+Current/proposed rows show only domain-reported managed changes; exact unmanaged
+base/export differences remain in expandable details. An unattributed import
+difference qualifies the in-sync headline and explains the ownership limitation.
+All dates use the existing deterministic timezone formatter; displayed rates retain
+observed precision. Review and source timestamps, expiry, ownership intervals,
+proposal fingerprint and blocker codes remain available in details. A dated review
+is explicitly a snapshot, not an automatically refreshed live status.
+
+**Live wiring remains pending:** the Home loader currently supplies no Tesla tariff
+observation/reconciliation result. It deliberately passes `null` and displays
+“Waiting for fresh information” with that limitation. No stored capture is guessed,
+no journal is read and no live API read is introduced by this presentation task.
+The four populated states are exercised through server-rendered component tests
+using supplied domain-shaped fixtures, not by calling live household integrations.
+
+Next bounded task: an explicitly user-requested read-only review operation that
+obtains correctly site-bound snapshots and retained ownership context, invokes the
+existing reconciliation domain, and supplies the result to this section. It must
+preserve freshness/expiry checks and fail safely if ownership evidence is missing.
+Do not add a Confirm/Apply control or executor as part of that read-only wiring.
