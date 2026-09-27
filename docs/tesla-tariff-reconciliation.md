@@ -168,10 +168,11 @@ hours, explicitly bounded by the completion clock. London dates and DST remain t
 responsibility of the existing tariff model. Snapshot timestamps are not refreshed
 or relabelled by the wiring. Read failure/missing configuration/authentication,
 stale evidence and incomplete tariffs return an indeterminate review. Site-info
-errors no longer log raw upstream bodies. The existing Tesla client does not refresh
-tokens; authentication failure requires separate attention outside this dashboard.
+errors no longer log raw upstream bodies. The authenticated-read client now supports bounded token refresh; see
+[Tesla authenticated reads](tesla-authenticated-reads.md). Failed recovery remains
+indeterminate and may require interactive reconnection.
 
-There is no new periodic polling, retry, browser refresh, write route, confirmation
+There is no new periodic polling, browser refresh, write route, confirmation
 control or executor connection. Reloading the dashboard is a new read review and
 continues to use Kraken's existing cache; rendering the component makes no reads.
 The server result is passed straight to the existing read-only section. Ordinary
@@ -201,6 +202,7 @@ The timer is cleared after success or failure. No request is started after the
 budget has expired during token-file loading.
 
 Timeout follows the existing `TESLA_READ_UNAVAILABLE` → `indeterminate` path.
-Kraken/site data remains available; no second Tesla request, retry, token refresh
-or old Tesla observation is used. This network budget does not change any capture,
+Kraken/site data remains available; a timeout is never retried and no old Tesla
+observation is used. Authentication recovery may retry a rejected GET once within
+the same total budget, as documented in the authenticated-read policy. This network budget does not change any capture,
 evidence, approval or minimum-write TTL, reconciliation blocker or safety flag.

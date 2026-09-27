@@ -2,7 +2,7 @@ import { getTeslaSiteInfo } from "../tesla/client";
 import { captureObservedTariff } from "../tesla-tariff/observed-tariff";
 import type { Site } from "./types";
 
-/** Existing GET-only client; no discovery, token refresh, retries or persistence. */
+/** Existing authenticated read client; no discovery or command execution. */
 export async function getSiteTeslaObservation(site: Site) {
     const id = site.integrations.tesla.energySiteId;
     if (!site.integrations.tesla.enabled) throw new Error("TESLA_DISABLED");

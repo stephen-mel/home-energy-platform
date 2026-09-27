@@ -101,8 +101,7 @@ test('server wiring has no write, executor, journal, timer or duplicate Kraken c
 for (const stall of ['headers','body']) test(`Tesla ${stall} stall aborts at the full-operation deadline; dashboard resolves without retry`,async()=>{
   let deadline, milliseconds, signal, attempts=0, cleared=0, bodyReads=0;
   const client=load('src/lib/tesla/client.ts',{
-    'fs/promises':{readFile:async()=>JSON.stringify({access_token:'secret-test-token',refresh_token:'secret-refresh'})},
-    path:{default:{join:()=>'/mock/token-file'}},
+    './tokens':{readTeslaTokens:async()=>({access_token:'secret-test-token'}),tokenNeedsRefresh:()=>false,refreshTeslaTokens:async()=>assert.fail('Unexpected refresh')},
   },{
     process:{cwd:()=>'/mock'},AbortController,
     setTimeout(fn,ms){deadline=fn;milliseconds=ms;return 1;},
@@ -137,7 +136,7 @@ for (const stall of ['headers','body']) test(`Tesla ${stall} stall aborts at the
 test('successful Tesla body consumption clears its deadline without aborting',async()=>{
   let cleared=0,signal;
   const client=load('src/lib/tesla/client.ts',{
-    'fs/promises':{readFile:async()=>JSON.stringify({access_token:'test'})},path:{default:{join:()=>'/mock'}},
+    './tokens':{readTeslaTokens:async()=>({access_token:'secret-test-token'}),tokenNeedsRefresh:()=>false,refreshTeslaTokens:async()=>assert.fail('Unexpected refresh')},
   },{process:{cwd:()=>'/mock'},AbortController,setTimeout(){return 1;},clearTimeout(){cleared++;},
     async fetch(url,options){signal=options.signal;return {ok:true,json:async()=>({response:{ready:true}})};}});
   assert.equal((await client.getTeslaSiteInfo(123)).response.ready,true);
@@ -148,8 +147,7 @@ test('503 with an open unread body aborts transport before timer cleanup and pre
   let signal,attempts=0,bodyOpen=false,bodyCleaned=false;
   const events=[];
   const client=load('src/lib/tesla/client.ts',{
-    'fs/promises':{readFile:async()=>JSON.stringify({access_token:'secret-test-token',refresh_token:'secret-refresh'})},
-    path:{default:{join:()=>'/mock'}},
+    './tokens':{readTeslaTokens:async()=>({access_token:'secret-test-token'}),tokenNeedsRefresh:()=>false,refreshTeslaTokens:async()=>assert.fail('Unexpected refresh')},
   },{
     process:{cwd:()=>'/mock'},AbortController,
     setTimeout(fn,ms){assert.equal(ms,5000);return 1;},
@@ -181,4 +179,20 @@ test('503 with an open unread body aborts transport before timer cleanup and pre
   assert.equal(result.reconciliation.writeReady,false);assert.equal(result.reconciliation.rollbackProven,false);
   assert.equal(attempts,1);assert.deepEqual(x.calls,{kraken:1,tesla:1});
   assert.doesNotMatch(JSON.stringify(result),/secret-test-token|secret-refresh/);
+});
+
+test('proactive refresh failure remains indeterminate while Kraken/site data survives, without a Fleet read',async()=>{
+  let refreshes=0;
+  const client=load('src/lib/tesla/client.ts',{
+    './tokens':{readTeslaTokens:async()=>({access_token:'private-old-token'}),tokenNeedsRefresh:()=>true,
+      refreshTeslaTokens:async()=>{refreshes++;throw Error('private OAuth response');}},
+  },{process:{cwd:()=>'/mock'},AbortController,setTimeout(){return 1;},clearTimeout(){},
+    async fetch(){assert.fail('Failed refresh must not proceed to Fleet API');}});
+  const boundary=load('src/lib/site/tesla-observation.ts',{'../tesla/client':client,'../tesla-tariff/observed-tariff':{captureObservedTariff}});
+  const k=kraken(),x=loader(k,()=>boundary.getSiteTeslaObservation(site));
+  const result=await x.run();
+  assert.equal(refreshes,1);assert.equal(result.integrations.kraken.data,k);assert.equal(result.site,site);
+  assert.equal(result.reconciliation.status,'indeterminate');assert.equal(result.reconciliation.diagnostic,'TESLA_READ_UNAVAILABLE');
+  assert.equal(result.reconciliation.writeReady,false);assert.equal(result.reconciliation.rollbackProven,false);
+  assert.doesNotMatch(JSON.stringify(result),/private-old-token|private OAuth response/);
 });

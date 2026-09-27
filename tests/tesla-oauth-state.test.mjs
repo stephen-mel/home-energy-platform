@@ -4,7 +4,6 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import ts from 'typescript';
 import * as crypto from 'node:crypto';
-import path from 'node:path';
 function load(file, dependencies, globals = {}) {
   const exports = {};
   vm.runInNewContext(ts.transpileModule(fs.readFileSync(file, 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText,
@@ -27,7 +26,7 @@ test('callback validates and consumes state before exchange or token replacement
   const route = load('src/app/api/tesla/callback/route.ts', {
     '../../../../lib/tesla/oauth-state': state,
     'next/server': { NextResponse: { json: (body, options) => ({ body, status: options?.status ?? 200 }) } },
-    'fs/promises': { writeFile: async () => { writes++; } }, path: { default: path },
+    '../../../../lib/tesla/tokens': { commitTeslaTokens: async () => { writes++; } },
   }, { process: { env: { TESLA_CLIENT_ID: 'test-client', TESLA_CLIENT_SECRET: 'test-only' }, cwd: () => '/unused' },
     fetch: async () => { calls++; return { ok: false, status: 500 }; } });
   const req = (s, binding) => ({ nextUrl: new URL(`http://localhost/api/tesla/callback?code=test${s ? `&state=${s}` : ''}`), cookies: { get: () => binding ? { value: binding } : undefined } });

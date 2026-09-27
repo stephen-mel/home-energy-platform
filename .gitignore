@@ -46,3 +46,6 @@ tesla-private-key.pem
 
 # Local last-known integration state (including atomic-write temporary files)
 /.cache/home-energy-platform/
+
+# Atomic Tesla token replacement files (credentials)
+/.tesla-tokens.json.*.tmp
