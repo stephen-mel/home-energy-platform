@@ -94,9 +94,10 @@ test('London DST repeated hour is distinguished with explicit offsets',()=>{
   input.observed.signal.import=[{...window(0.25177),...fold}];input.managed.target.import=[{...window(0.0299),...fold}];
   assert.match(model(input).current[0],/01:30:00 UTC\+01:00 → 25 Oct 2026, 01:30:00 UTC\+00:00/);
 });
-test('dashboard renders the section without reads, executor, refresh, timers or raw result serialization',()=>{
+test('dashboard passes its single server snapshot to the read-only section',()=>{
   const page=fs.readFileSync('src/app/page.tsx','utf8');
-  assert.match(page,/<EnergyOptimisation result=\{null\}/);
+  assert.match(page,/<EnergyOptimisation result=\{siteState.reconciliation\}/);
+  assert.equal((page.match(/await getHomeDashboardState\(site\)/g)||[]).length,1);
   assert.ok(page.indexOf('<EnergyOptimisation')<page.indexOf('>Electric Vehicles</h2>'));
   for(const file of ['src/components/EnergyOptimisation.tsx','src/components/energy-optimisation-view.ts']) {
     const source=fs.readFileSync(file,'utf8');

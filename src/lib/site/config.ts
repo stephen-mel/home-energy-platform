@@ -25,6 +25,7 @@ export type SiteIntegrationConfig = {
 
     tesla: {
         enabled: boolean;
+        energySiteId?: string;
     };
 };
 

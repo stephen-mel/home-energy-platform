@@ -5,7 +5,7 @@ import HomeEnergyPlan from "../components/HomeEnergyPlan";
 import { getSitePriceSignal } from "../lib/site/get-site-price-signal";
 import LiveHomeEnergy from "../components/LiveHomeEnergy";
 import { getCurrentSite } from "../lib/site/repository";
-import { getSiteState } from "../lib/site/get-site-state";
+import { getHomeDashboardState } from "../lib/site/get-home-dashboard-state";
 
 import ReadyByControl from "../components/ReadyByControl";
 import TargetSocControl from "../components/TargetSocControl";
@@ -32,7 +32,7 @@ function formatSmartControl(state: string | null) {
 
 export default async function Home() {
   const site = await getCurrentSite();
-  const siteState = await getSiteState(site);
+  const siteState = await getHomeDashboardState(site);
 
   const kraken = siteState.integrations.kraken.data;
   const vehicles = kraken?.vehicles ?? [];
@@ -55,7 +55,7 @@ export default async function Home() {
           }}>
           <HomeEnergyPlan plan={pricePlan} />
         </LiveHomeEnergy>
-        <EnergyOptimisation result={null} timeZone={site.tariff?.timeZone ?? "Europe/London"} />
+        <EnergyOptimisation result={siteState.reconciliation} timeZone={site.tariff?.timeZone ?? "Europe/London"} />
         <h2 className="mb-3 text-2xl font-semibold">Electric Vehicles</h2>
         <p className="mb-6 text-sm text-zinc-400">
           {kraken?.stale ? "Last known vehicle data from Kraken Flex" : "Vehicle data from Kraken Flex"}

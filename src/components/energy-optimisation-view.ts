@@ -9,6 +9,11 @@ const copy = {
     blocked: ["Price signal needs review", "HEP can see an economic change but cannot safely construct or validate the required Powerwall price signal."],
 } as const;
 const blockers: Record<string, string> = {
+    TESLA_AUTH_UNAVAILABLE: "Tesla read access is unavailable. This dashboard does not refresh the stored token.",
+    TESLA_READ_UNAVAILABLE: "The current Tesla tariff could not be read.",
+    KRAKEN_UNAVAILABLE: "The charging schedule is unavailable.",
+    STALE_KRAKEN_EVIDENCE: "The charging schedule is too old for a safe review.",
+    STALE_TESLA_CAPTURE: "The Tesla observation is too old for a safe review.",
     BUY_BELOW_SELL: "Tesla may raise an import price that is lower than the export price.",
     ROLLBACK_UNPROVEN: "Automatic restoration has not been proven.",
     BOUNDED_FORECAST: "This forecast covers a limited period, not an enduring tariff.",

@@ -153,15 +153,54 @@ observed precision. Review and source timestamps, expiry, ownership intervals,
 proposal fingerprint and blocker codes remain available in details. A dated review
 is explicitly a snapshot, not an automatically refreshed live status.
 
-**Live wiring remains pending:** the Home loader currently supplies no Tesla tariff
-observation/reconciliation result. It deliberately passes `null` and displays
-“Waiting for fresh information” with that limitation. No stored capture is guessed,
-no journal is read and no live API read is introduced by this presentation task.
-The four populated states are exercised through server-rendered component tests
-using supplied domain-shaped fixtures, not by calling live household integrations.
+## Live server snapshot wiring
 
-Next bounded task: an explicitly user-requested read-only review operation that
-obtains correctly site-bound snapshots and retained ownership context, invokes the
-existing reconciliation domain, and supplies the result to this section. It must
-preserve freshness/expiry checks and fail safely if ownership evidence is missing.
-Do not add a Confirm/Apply control or executor as part of that read-only wiring.
+The Home page calls `getHomeDashboardState` once per server render. It loads the
+existing site state (including the unchanged 60-second Kraken cache/fallback) and
+one Tesla `site_info` GET concurrently. Tesla's exact energy site ID is configured
+under the site's Tesla integration; account discovery/first-site guessing is not
+used. An optional returned identity must agree with the configured request target.
+Only the existing allowlisted observed-tariff capture enters reconciliation; the
+raw response and token do not enter component props or diagnostics.
+
+After both reads finish, the existing domain compares the remaining next 24 elapsed
+hours, explicitly bounded by the completion clock. London dates and DST remain the
+responsibility of the existing tariff model. Snapshot timestamps are not refreshed
+or relabelled by the wiring. Read failure/missing configuration/authentication,
+stale evidence and incomplete tariffs return an indeterminate review. Site-info
+errors no longer log raw upstream bodies. The existing Tesla client does not refresh
+tokens; authentication failure requires separate attention outside this dashboard.
+
+There is no new periodic polling, retry, browser refresh, write route, confirmation
+control or executor connection. Reloading the dashboard is a new read review and
+continues to use Kraken's existing cache; rendering the component makes no reads.
+The server result is passed straight to the existing read-only section. Ordinary
+page reloads may therefore read Tesla again, but never duplicate the read within
+one dashboard snapshot. No new persistent cache is introduced.
+
+Durable historical SMART ownership is still absent. No `managedImport` context is
+fabricated from the latest state or experiment journal. Previously unowned tariff
+differences remain reported/preserved; safe removal requires retained evidence in
+a later task. The shared domain failure factory retains every production blocker.
+
+Tests exercise real reconciliation with supplied snapshots and mocked read
+boundaries, including stale/failed reads, unmanaged prices and blocked execution.
+The next bounded step is to retain authenticated, provenance-bound operation
+ownership evidence before enabling safe historical SMART removal in reviews.
+Human approval and execution remain separate, unimplemented UI capabilities.
+
+
+### Tesla site-info render timeout
+
+`TESLA_SITE_INFO_TIMEOUT_MS` is explicitly **5,000 ms**: a conservative maximum
+wait for a secondary integration during an interactive Home render. The single
+budget covers token-file loading, response headers and complete JSON response-body
+consumption. On expiry the client aborts the request and rejects the pending read;
+a deadline race also bounds completion if a transport wrapper ignores cancellation.
+The timer is cleared after success or failure. No request is started after the
+budget has expired during token-file loading.
+
+Timeout follows the existing `TESLA_READ_UNAVAILABLE` → `indeterminate` path.
+Kraken/site data remains available; no second Tesla request, retry, token refresh
+or old Tesla observation is used. This network budget does not change any capture,
+evidence, approval or minimum-write TTL, reconciliation blocker or safety flag.

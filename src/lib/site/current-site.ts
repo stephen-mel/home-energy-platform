@@ -27,6 +27,7 @@ export const currentSite: Site = {
 
         tesla: {
             enabled: true,
+            energySiteId: "1689589307992591",
         },
     },
 

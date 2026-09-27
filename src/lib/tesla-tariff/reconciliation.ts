@@ -25,6 +25,14 @@ export type ReconciliationInput = {
 const productionBlockers = ["ROLLBACK_UNPROVEN", "BOUNDED_FORECAST", "RESTORATION_REQUIRED", "OBSERVED_TOU_ASSUMPTIONS_UNVERIFIED",
     "INVERSE_WRITE_MAPPING_UNPROVEN", "RESTORE_ACCEPTANCE_UNPROVEN", "RESTORATION_PRICE_TRANSFORMATION_RISK", "EXACT_PROPOSAL_APPROVAL_REQUIRED"];
 
+/** Shared failure shape for unavailable server-side read evidence. */
+export function unavailableReconciliation(code: string, requestedDomain: { start: string; end: string }) {
+    return { authority: "confirm" as const, inspectionOnly: true as const, writeReady: false as const,
+        rollbackProven: false as const, humanApproved: false as const, writePayload: null,
+        status: "indeterminate" as const, diagnostic: code, requestedDomain,
+        blockers: [...productionBlockers, code], proposal: null };
+}
+
 /** Confirm preparation only. Supplied snapshots/configuration, no I/O or approval.
  * `update-required` means an economic replacement is proposed, NOT permission to
  * submit it. Production blockers (including BUY_BELOW_SELL) are never waived.
@@ -32,8 +40,7 @@ const productionBlockers = ["ROLLBACK_UNPROVEN", "BOUNDED_FORECAST", "RESTORATIO
 export function reconcileTeslaTariff(input: ReconciliationInput) {
     const safety = { authority: "confirm" as const, inspectionOnly: true as const, writeReady: false as const,
         rollbackProven: false as const, humanApproved: false as const, writePayload: null };
-    const fail = (code: string) => ({ ...safety, status: "indeterminate" as const, diagnostic: code,
-        requestedDomain: input.comparisonDomain, blockers: [...productionBlockers, code], proposal: null });
+    const fail = (code: string) => unavailableReconciliation(code, input.comparisonDomain);
     try {
         const now = instant(input.now), start = instant(input.comparisonDomain.start), end = instant(input.comparisonDomain.end);
         if (![now, start, end].every(Number.isFinite) || end <= start || end <= now || end - Math.max(now, start) > 48 * 3600000)
