@@ -46,7 +46,8 @@ const observedProposal = load('src/lib/tesla-tariff/observed-proposal.ts', {
   './experiment-tariff': tariffTools, './rollback-evidence': rollback,
 });
 const observedEconomic = load('src/lib/tesla-tariff/observed-economic.ts', { './observed-tariff': observed });
-const managedSmart = load('src/lib/tesla-tariff/managed-smart.ts', { './experiment-tariff': tariffTools, '../tariff/comparison-domain': domains, './observed-economic': observedEconomic, './rollback-evidence': rollback });
+const ownership = load('src/lib/tesla-tariff/ownership-evidence.ts', { './observed-economic': observedEconomic, './rollback-evidence': rollback });
+const managedSmart = load('src/lib/tesla-tariff/managed-smart.ts', { './ownership-evidence': ownership, '../tariff/comparison-domain': domains, './observed-economic': observedEconomic, './rollback-evidence': rollback });
 const replacement = load('src/lib/tesla-tariff/observed-replacement.ts', {
   './managed-smart': managedSmart, '../tariff/comparison-domain': domains, './observed-economic': observedEconomic,
   './observed-simulation': simulation, './dry-run': dryRun, './experiment-tariff': tariffTools,

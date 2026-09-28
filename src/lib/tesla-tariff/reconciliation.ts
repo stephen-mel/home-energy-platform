@@ -91,7 +91,7 @@ export function reconcileTeslaTariff(input: ReconciliationInput) {
                 captureTtlSeconds: CAPTURE_TTL_MS / 1000, evidenceTtlSeconds: EVIDENCE_TTL_MS / 1000 },
             limitations: ["Exact comparison includes export; only managed SMART import divergence triggers replacement.",
                 "Comparison-only monetary views do not promote planned charging or establish billing eligibility.",
-                "Removing old SMART periods requires explicit represented-signal and underlying observed-baseline evidence; price resemblance alone establishes no ownership.",
+                "Removing old SMART periods requires durable bounded ownership and matching current Tesla economics; price resemblance alone establishes no ownership.",
                 "Proposals require new exact approval and fresh validation; this result grants no execution authority."] };
         const blockers = [...new Set([...productionBlockers, ...planner.compatibility.blockers.map(d => d.code), ...exactPlanner.compatibility.blockers.map(d => d.code)])];
         if (planner.comparison.state === "unchanged") return { ...common, status: "in-sync" as const, proposal: null, blockers };

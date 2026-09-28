@@ -2,13 +2,10 @@ import type { PriceSignal, PriceWindow } from "../tariff/types";
 import type { ObservedTariff } from "./observed-tariff";
 import { comparePriceSignalsInDomain } from "../tariff/comparison-domain";
 import { monetarySignal, observedEconomicSignal } from "./observed-economic";
-import { inspectObservedProposalTariff } from "./experiment-tariff";
+import { assertOwnership, type ManagedImportEvidence } from "./ownership-evidence";
+export type { ManagedImportEvidence } from "./ownership-evidence";
 import { representationKey } from "./rollback-evidence";
 
-// Explicit historical ownership context, not rollback proof. The caller must
-// retain the underlying Tesla before-state and the HEP signal actually represented;
-// a previous Kraken schedule alone does not establish that Tesla stored it.
-export type ManagedImportEvidence = { baseline: ObservedTariff; representedSignal: PriceSignal };
 export type ManagedSmartScope = { baseSignal: PriceSignal; previous?: ManagedImportEvidence };
 const equal = (a: PriceWindow, b: PriceWindow) => representationKey(a.price) === representationKey(b.price);
 const smart = (w: PriceWindow) => w.kind === "cheap-opportunity" && w.condition === "scheduled-ev-charging";
@@ -25,18 +22,11 @@ export function managedSmartTarget(hep: PriceSignal, observed: ObservedTariff,
     };
     const current = project(hep), base = project(scope.baseSignal);
     const seen = project(observedEconomicSignal(observed, domain).signal);
-    let old: PriceSignal | null = null, original: PriceSignal | null = null;
-    if (scope.previous) {
-        const before = scope.previous.baseline;
-        if (before.source.kind !== "tesla-site-info" || before.source.energySiteId !== observed.source.energySiteId
-            || before.source.timeZone !== observed.source.timeZone || !Number.isFinite(Date.parse(before.source.observedAt))
-            || Date.parse(before.source.observedAt) > Date.parse(observed.source.observedAt)
-            || before.diagnostics.includes("UNSUPPORTED_FIELDS_OMITTED") || !inspectObservedProposalTariff(before.tariff).exact) throw new Error("MANAGED_BASELINE_INVALID");
-        old = project(scope.previous.representedSignal);
-        original = project(observedEconomicSignal(before, domain).signal);
-    }
-    const points = [...new Set([current, base, seen, old, original].flatMap(s => s ? s.import.flatMap(w => [w.start, w.end]) : []))]
-        .sort((a,b) => Date.parse(a) - Date.parse(b));
+    if (scope.previous) assertOwnership(scope.previous, observed, hep.generatedAt);
+    const owned = scope.previous?.intervals ?? [];
+    const points = [...new Set([...[current, base, seen].flatMap(s => s.import.flatMap(w => [w.start, w.end])),
+        ...owned.flatMap(p => [p.start,p.end]).filter(t => Date.parse(t) > Date.parse(domain.start) && Date.parse(t) < Date.parse(domain.end))]
+        .map(t => new Date(Date.parse(t)).toISOString()))].sort((a,b) => Date.parse(a) - Date.parse(b));
     const at = (s: PriceSignal, time: string) => s.import.find(w => Date.parse(w.start) <= Date.parse(time) && Date.parse(w.end) > Date.parse(time))!;
     const target: PriceSignal = { ...seen, import: [], export: seen.export };
     const ownership: Array<{ start: string; end: string; basis: "current-smart" | "previously-managed-smart" | "unmanaged" }> = [];
@@ -45,12 +35,12 @@ export function managedSmartTarget(hep: PriceSignal, observed: ObservedTariff,
         let selected = observedWindow, basis: typeof ownership[number]["basis"] = "unmanaged";
         if (smart(desired) && !equal(desired, at(base,start))) {
             selected = desired; basis = "current-smart";
-        } else if (old && original && smart(at(old,start)) && !equal(at(old,start), at(original,start))) {
-            // Do not overwrite an intervening unrelated change. Already-restored
-            // baseline is harmless; any third price requires a new review.
-            if (!equal(observedWindow, at(old,start)) && !equal(observedWindow, at(original,start)))
-                throw new Error("MANAGED_IMPORT_OWNERSHIP_CONFLICT");
-            selected = at(original,start); basis = "previously-managed-smart";
+        } else {
+            const previous = owned.find(p => Date.parse(p.start) <= Date.parse(start) && Date.parse(p.end) >= Date.parse(end));
+            if (previous) {
+                selected = { ...observedWindow, price: previous.restore, priceStatus: "known" };
+                basis = "previously-managed-smart";
+            }
         }
         target.import.push({ ...selected, start, end, eligibilityPeriods: selected.eligibilityPeriods
             .filter(p => Date.parse(p.start) < Date.parse(end) && Date.parse(p.end) > Date.parse(start))

@@ -15,7 +15,7 @@ function load(file) {
   const exports = {}; modules.set(file, exports);
   vm.runInNewContext(ts.transpileModule(fs.readFileSync(file, 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
-  }).outputText, { exports, structuredClone, Date: InputDate, require(name) {
+  }).outputText, { exports, Error, structuredClone, Date: InputDate, require(name) {
     assert.ok(name.startsWith('.'), `No native, network, OAuth or filesystem dependency: ${name}`);
     return load(path.resolve(path.dirname(file), name + '.ts'));
   } });
@@ -25,7 +25,6 @@ const { reconcileTeslaTariff } = load('src/lib/tesla-tariff/reconciliation.ts');
 const { observedEconomicSignal, monetarySignal } = load('src/lib/tesla-tariff/observed-economic.ts');
 const { comparePriceSignalsInDomain } = load('src/lib/tariff/comparison-domain.ts');
 const { createTariffProposal, approveTariffProposal, assessProposalCurrentUse } = load('src/lib/tesla-tariff/proposal-approval.ts');
-const { getSitePriceSignal } = load('src/lib/site/get-site-price-signal.ts');
 const siteConfig = load('src/lib/site/current-site.ts').currentSite;
 const at = time => `2026-09-25T${time}:00+01:00`;
 const dispatch = (start, end, type = 'SMART') => ({ start: at(start), end: at(end), type, energyAddedKwh: '3' });
@@ -47,10 +46,12 @@ function input(dispatches=[], represented=[], now=at('12:00')) {
     observation:{source:{kind:'tesla-site-info',energySiteId:'12345',observedAt:now,timeZone:'Europe/London'},
       tariff:{...side(represented),sell_tariff:side([],true)},diagnostics:[],rollbackProven:false} };
   if (represented.length) {
-    const old = structuredClone(result.kraken);
-    old.vehicles[0].plannedDispatches = represented.map(([a,b]) => dispatch(`${String(Math.floor(a/60)).padStart(2,'0')}:${String(a%60).padStart(2,'0')}`, `${String(Math.floor(b/60)).padStart(2,'0')}:${String(b%60).padStart(2,'0')}`));
-    result.managedImport = { baseline: { ...structuredClone(result.observation), tariff: { ...side(), sell_tariff:side([],true) } },
-      representedSignal: getSitePriceSignal(result.site,old,now).signal };
+    result.managedImport = {version:1,energySiteId:'12345',timeZone:'Europe/London',createdAt:now,updatedAt:now,
+      validUntil:at('18:00'),basis:'confirmed-write-readback',baselineFingerprint:'a'.repeat(64),readbackFingerprint:'b'.repeat(64),
+      proposalFingerprint:'c'.repeat(64),smartEvidenceFingerprint:'d'.repeat(64),
+      intervals:represented.map(([a,b])=>({start:at(`${String(Math.floor(a/60)).padStart(2,'0')}:${String(a%60).padStart(2,'0')}`),
+        end:at(`${String(Math.floor(b/60)).padStart(2,'0')}:${String(b%60).padStart(2,'0')}`),
+        restoreBaselineFingerprint:'a'.repeat(64),applied:{amount:0.0299,currency:'GBP',unit:'kWh'},restore:{amount:0.2518,currency:'GBP',unit:'kWh'}}))};
   }
   return result;
 }
@@ -130,7 +131,7 @@ test('short validity and sub-minute proposals stay blocked; cancellation invalid
 });
 test('identical inputs give identical fingerprints and output; metadata changes alone do not create a rate difference',()=>{
   const i=input([dispatch('13:00','14:00')]);assert.equal(JSON.stringify(reconcileTeslaTariff(i)),JSON.stringify(reconcileTeslaTariff(i)));
-  const same=input([dispatch('13:00','14:00')],[[780,840]]);same.managedImport.baseline.source.observedAt='2026-09-25T10:59:58Z';same.observation.source.observedAt='2026-09-25T10:59:59Z';
+  const same=input([dispatch('13:00','14:00')],[[780,840]]);same.managedImport.createdAt=same.managedImport.updatedAt='2026-09-25T10:59:58Z';same.observation.source.observedAt='2026-09-25T10:59:59Z';
   assert.equal(reconcileTeslaTariff(same).status,'in-sync');
 });
 
@@ -221,9 +222,10 @@ test('17p Tesla export versus 17.5p HEP is unmanaged even with aligned SMART', (
 });
 test('moved SMART restores observed 25.177p base and preserves the complete observed 17p export representation', () => {
   const i=input([dispatch('14:00','15:00')],[[780,840]]);
-  for(const side of [i.observation.tariff,i.managedImport.baseline.tariff]) {
+  for(const side of [i.observation.tariff]) {
     for(const [key,value] of Object.entries(side.energy_charges.Annual.rates)) if(value===0.2518) side.energy_charges.Annual.rates[key]=0.25177;
   }
+  i.managedImport.intervals.forEach(p=>{p.restore.amount=0.25177;});
   for(const key of Object.keys(i.observation.tariff.sell_tariff.energy_charges.Annual.rates)) i.observation.tariff.sell_tariff.energy_charges.Annual.rates[key]=0.17;
   const r=reconcileTeslaTariff(i);assertReplacement(r);
   assert.deepEqual(structuredClone(r.proposal.bound.representation.sell_tariff),i.observation.tariff.sell_tariff);
@@ -241,7 +243,7 @@ test('unattributed cheap tariff is preserved; previous Kraken data alone cannot 
 test('intervening import changes and invalid historical site binding are indeterminate, not silently restored', () => {
   for(const mutate of [
     i=>{ for(const [key,value] of Object.entries(i.observation.tariff.energy_charges.Annual.rates)) if(value===0.0299) i.observation.tariff.energy_charges.Annual.rates[key]=0.08; },
-    i=>{i.managedImport.baseline.source.energySiteId='other';},
+    i=>{i.managedImport.energySiteId='other';},
   ]) {const i=input([],[[780,840]]);mutate(i);const r=reconcileTeslaTariff(i);assert.equal(r.status,'indeterminate');assert.equal(r.proposal,null);assert.equal(r.rollbackProven,false);}
 });
 
@@ -252,4 +254,36 @@ test('baseline import precision difference alone is reported without a managed u
   assert.equal(r.status,'in-sync');assert.equal(r.exactComparison.state,'changed');assert.equal(r.proposal,null);
   assert.ok(r.unmanaged.differences.length>0);
   assert.ok(r.unmanaged.differences.every(p=>p.channels.join()==='import'));
+});
+
+
+test('owned interval can be shortened, extended, removed or moved using its exact restoration value',()=>{
+  for(const ds of [[dispatch('15:00','17:00')],[dispatch('14:00','18:00')],[],[dispatch('15:00','18:00')]]) {
+    const i=input(ds,[[840,1020]]);i.managedImport.intervals[0].restore.amount=0.25177;
+    const r=reconcileTeslaTariff(i);assertReplacement(r);
+    for(const w of r.managed.target.import) {
+      if(Date.parse(w.start)>=Date.parse(at('14:00'))&&Date.parse(w.end)<=Date.parse(at('17:00')) && w.kind!=='cheap-opportunity') assert.equal(w.price.amount,0.25177);
+    }
+  }
+});
+test('manual change during still-required SMART blocks even retention/extension, not just removal',()=>{
+  for(const ds of [[],[dispatch('14:00','17:00')],[dispatch('14:00','18:00')]]) {
+    const i=input(ds,[[840,1020]]);
+    for(const [k,v]of Object.entries(i.observation.tariff.energy_charges.Annual.rates))if(v===0.0299)i.observation.tariff.energy_charges.Annual.rates[k]=0.08;
+    const r=reconcileTeslaTariff(i);assert.equal(r.status,'indeterminate');assert.equal(r.diagnostic,'MANAGED_IMPORT_OWNERSHIP_CONFLICT');assert.equal(r.proposal,null);
+  }
+});
+test('stale, malformed and incompatible retained ownership cannot authorize restoration',()=>{
+  for(const mutate of [e=>{e.version=2;},e=>{e.validUntil=at('11:59');e.createdAt=e.updatedAt=at('11:00');},e=>{e.intervals[0].restore.amount=null;},e=>{e.intervals.push(structuredClone(e.intervals[0]));}]){
+    const i=input([],[[840,1020]]);mutate(i.managedImport);
+    const r=reconcileTeslaTariff(i);assert.equal(r.status,'indeterminate');assert.equal(r.proposal,null);assert.equal(r.rollbackProven,false);
+  }
+});
+test('offset-distinct ownership boundaries survive repeated London hour; no wall-clock guessing',()=>{
+  const {validOwnership}=load('src/lib/tesla-tariff/ownership-evidence.ts');
+  const e=input([],[[840,1020]]).managedImport;
+  e.createdAt=e.updatedAt='2026-10-25T00:00:00+01:00';e.validUntil='2026-10-25T03:00:00Z';
+  e.intervals=[{...e.intervals[0],start:'2026-10-25T01:30:00+01:00',end:'2026-10-25T01:30:00+00:00'}];
+  assert.equal(validOwnership(e),true);assert.equal(Date.parse(e.intervals[0].end)-Date.parse(e.intervals[0].start),3600000);
+  e.intervals[0].start='2026-10-25T01:30:00';assert.equal(validOwnership(e),false);
 });

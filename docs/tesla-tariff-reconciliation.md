@@ -77,20 +77,19 @@ When a new daytime SMART interval needs 0.0299, only that increment is proposed;
 export and unrelated base prices remain as observed. No rounding is introduced.
 
 Removing/moving a previously represented SMART interval requires optional
-`managedImport` historical context: the underlying observed Tesla `baseline` and
-HEP `representedSignal` actually represented by the managed operation. This must
-come from retained, site-bound operation evidence, not inference from a cheap
-price or a prior Kraken schedule. The pure caller supplies it; this task adds no
-persistence, trust ledger or inferred successful write. It is not rollback proof.
+`managedImport` durable ownership evidence. It records exact bounded intervals,
+applied/restoration values and provenance fingerprints. It must come from the
+trusted server store, not inference from a cheap price or a prior Kraken schedule.
+See [SMART ownership](tesla-smart-ownership.md) for persistence and lifecycle.
+Ownership is not rollback proof and proposal generation does not create it.
 
-In removed intervals, the current price must still match either that previous
-managed price or its recorded baseline. A third price is an ownership conflict
-and returns `indeterminate`. Removal restores the recorded Tesla baseline, never
-HEP's unrelated base price. Without historical ownership context, unattributed
-cheap periods remain observable and unmanaged rather than guessed away. This is
-an intentional limit until a future caller supplies the appropriate operation
-record. Baseline identity, coverage and exact structure are validated; a historical
-capture is not subjected to the current live-capture TTL, nor used to satisfy it.
+Every remaining owned interval must match its recorded applied price exactly,
+even while Kraken still requests it. Any different price, including an already
+restored baseline, is an ownership conflict and returns `indeterminate`. Removal
+restores the recorded Tesla value, never HEP's unrelated base price. Without
+ownership, unattributed periods remain observable and unmanaged. Explicit validity,
+site/timezone, interval integrity and current observed economics are checked; old
+ownership timestamps never replace the separate fresh Tesla capture requirement.
 
 ## Replacement and safety binding
 
@@ -109,7 +108,7 @@ instants. Unrepresentable sub-minute intervals, conflicting repeated-hour prices
 unsupported captures/currencies and nonzero demand charges fail closed.
 
 The proposal binds exact representation, site/timezone, HEP economic/evidence key,
-SMART evidence key, managed scope (including historical baseline and represented signal), observed before-state (including capture provenance), common
+SMART evidence key, managed scope (including versioned bounded ownership evidence), observed before-state (including capture provenance), common
 domain, generation and expiry. Existing approval consistency reconstruction detects
 representation tampering; changed dispatch evidence produces a new binding even if
 an earlier proposal was approved. Existing `reviewObservedRestoration` supplies the
@@ -179,15 +178,15 @@ The server result is passed straight to the existing read-only section. Ordinary
 page reloads may therefore read Tesla again, but never duplicate the read within
 one dashboard snapshot. No new persistent cache is introduced.
 
-Durable historical SMART ownership is still absent. No `managedImport` context is
+The dashboard does not yet load the ownership store. No `managedImport` context is
 fabricated from the latest state or experiment journal. Previously unowned tariff
-differences remain reported/preserved; safe removal requires retained evidence in
-a later task. The shared domain failure factory retains every production blocker.
+differences remain reported/preserved; safe removal requires durable evidence
+supplied to the pure domain path. The shared domain failure factory retains every production blocker.
 
 Tests exercise real reconciliation with supplied snapshots and mocked read
 boundaries, including stale/failed reads, unmanaged prices and blocked execution.
-The next bounded step is to retain authenticated, provenance-bound operation
-ownership evidence before enabling safe historical SMART removal in reviews.
+A later bounded integration must connect authenticated confirmed write/readback
+evidence to the ownership store before enabling historical SMART removal in live reviews.
 Human approval and execution remain separate, unimplemented UI capabilities.
 
 
@@ -206,3 +205,10 @@ Kraken/site data remains available; a timeout is never retried and no old Tesla
 observation is used. Authentication recovery may retry a rejected GET once within
 the same total budget, as documented in the authenticated-read policy. This network budget does not change any capture,
 evidence, approval or minimum-write TTL, reconciliation blocker or safety flag.
+
+## Durable ownership evidence
+
+The retained `managedImport` input now uses versioned bounded ownership evidence,
+not an arbitrary previous signal/baseline pair. See [SMART ownership](tesla-smart-ownership.md)
+for the store, trust boundary, lifecycle and fail-closed handling. No dashboard
+store read or executor recording hook is connected in this feature.
