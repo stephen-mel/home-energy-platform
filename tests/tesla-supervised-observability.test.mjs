@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
 import ts from 'typescript';
+import { createHash } from 'node:crypto';
 
 const compile = file => ts.transpileModule(fs.readFileSync(file, 'utf8'), {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true },
@@ -14,6 +15,7 @@ function domain(file) {
   if (cache.has(file)) return cache.get(file);
   const exports = {}; cache.set(file, exports);
   vm.runInNewContext(compile(file), { exports, structuredClone, require(name) {
+    if (name === 'node:crypto') return { createHash };
     assert.ok(name.startsWith('.'), `Unexpected domain dependency: ${name}`);
     return domain(path.resolve(path.dirname(file), name + '.ts'));
   } });
@@ -56,6 +58,9 @@ function harness(fault) {
     } },
     './supervised-journal': { claimExperimentJournal() { calls.claims++; fail(); } },
     './supervised-experiment': core,
+    './linked-experiment-records': domain('src/lib/tesla-tariff/linked-experiment-records.ts'),
+    './prepared-mutation-context': domain('src/lib/tesla-tariff/prepared-mutation-context.ts'),
+    './ownership-store': { ownershipStore: () => ({ read: async () => ({ status: 'missing' }) }) },
   };
   class FixedDate extends Date { constructor(...args) { super(...(args.length ? args : ['2026-09-23T08:12:00.000Z'])); } }
   vm.runInNewContext(source, {

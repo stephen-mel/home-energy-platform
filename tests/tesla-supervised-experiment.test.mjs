@@ -22,6 +22,7 @@ function load(file, natives = {}) {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true },
   }).outputText, { exports, structuredClone, Date: InputDate, require(name) {
     if (name.startsWith('.')) return load(path.resolve(path.dirname(file), name + '.ts'));
+    if (name === 'node:crypto') return { createHash };
     assert.ok(name in natives, `Forbidden domain dependency: ${name}`); return natives[name];
   } });
   return exports;
@@ -36,10 +37,14 @@ const generatedAt = '2026-09-23T08:12:00.000Z';
 const prepared = () => api.prepareSupervisedExperiment(site, selection, structuredClone(fixture), generatedAt);
 function harness(overrides = {}) {
   let time = Date.parse(generatedAt), captures = 0, consumed = false;
-  const calls = { writes: [], confirmations: 0, claims: [], finishes: [], reads: 0 };
+  const calls = { mutationIds: 0, writes: [], confirmations: 0, claims: [], finishes: [], reads: 0 };
   let lastReview;
   const ports = {
+    journalRecords: load('src/lib/tesla-tariff/linked-experiment-records.ts'),
     now: () => new Date(time).toISOString(),
+    prepareContext: capture => load('src/lib/tesla-tariff/prepared-mutation-context.ts').prepareMutationContext({ site, selection, capture },
+      { readOwnership: async () => ({ status: 'missing' }), now: () => new Date(time).toISOString(),
+        newMutationId: () => { calls.mutationIds++; return 'fixture-mutation'; } }),
     capture: async () => { captures++; const c = structuredClone(fixture);
       if (captures > 1) { time += 1000; c.before.source.observedAt = ports.now(); c.kraken.lastSuccessfulUpdate = ports.now(); }
       return c; },
@@ -172,10 +177,11 @@ test('transport throw never retries; journal failures never permit resend', asyn
 test('real local journal atomically excludes concurrent/restarted attempts and contains no executable approval loader', async () => {
   const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'hep-experiment-test-'));
   try {
-    const claims = await Promise.allSettled([journalAPI.claimExperimentJournal(directory, '12345', { approval: 'fixture' }), journalAPI.claimExperimentJournal(directory, '12345', {})]);
+    const h = harness(), result = await h.run(), initial = h.calls.claims[0].record;
+    const claims = await Promise.allSettled([journalAPI.claimExperimentJournal(directory, '12345', initial), journalAPI.claimExperimentJournal(directory, '12345', initial)]);
     assert.equal(claims.filter(r => r.status === 'fulfilled').length, 1);
-    await claims.find(r => r.status === 'fulfilled').value.finish({ classification: 'fixture-only' });
-    await assert.rejects(journalAPI.claimExperimentJournal(directory, '12345', {}));
+    await claims.find(r => r.status === 'fulfilled').value.finish(result.record);
+    await assert.rejects(journalAPI.claimExperimentJournal(directory, '12345', initial));
     assert.equal((await fsp.stat(path.join(directory, 'site-12345.jsonl'))).mode & 0o777, 0o600);
     assert.equal((await fsp.readFile(path.join(directory, 'site-12345.jsonl'), 'utf8')).trim().split('\n').length, 2);
   } finally { await fsp.rm(directory, { recursive: true, force: true }); }

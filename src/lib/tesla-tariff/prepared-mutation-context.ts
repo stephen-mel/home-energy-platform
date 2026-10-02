@@ -20,7 +20,8 @@ export type MutationPreparationPorts = {
     newMutationId(): string;
 };
 
-/** Stage A only. No production caller, execution, journal, receipt or persistence.
+/** Preparation only. The local B1 journal path consumes this context; this
+ * builder performs no execution, journal mutation, receipt issuance or persistence.
  * Capture precedes initial preparation. Fresh revalidation continues to use the
  * existing prepareSupervisedExperiment, never this original-operation builder.
  * Fingerprints establish content identity, not authenticity or durability.

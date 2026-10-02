@@ -10,6 +10,9 @@ import { currentSite } from "../site/current-site";
 import { getKrakenDevices, getKrakenPlannedDispatches } from "../kraken/client";
 import type { KrakenState } from "../site/kraken-state";
 import { captureObservedTariff } from "./observed-tariff";
+import * as journalRecords from "./linked-experiment-records";
+import { prepareMutationContext } from "./prepared-mutation-context";
+import { ownershipStore } from "./ownership-store";
 import { claimExperimentJournal } from "./supervised-journal";
 import { runSupervisedExperiment, interpretWriteResponse, StaleApprovalOrEvidenceError } from "./supervised-experiment";
 
@@ -25,7 +28,9 @@ const SAFE_FAILURE_CODES = new Set([
     "DAY_COVERAGE_REQUIRED", "SUPERVISED_AUTHORITY_REQUIRED", "READ_ACCESS_REQUIRED", "WRITE_DISABLED",
     "TESLA_TOKEN_READ_FAILED", "TESLA_READ_FAILED", "TESLA_READ_DECODE_FAILED", "SITE_MISMATCH",
     "TESLA_CAPTURE_FAILED", "KRAKEN_DEVICE_READ_FAILED", "KRAKEN_PLANNED_DISPATCH_READ_FAILED",
-    "CAPTURE_PREPARATION_FAILED", "PREPARATION_FAILED",
+    "CAPTURE_PREPARATION_FAILED", "PREPARATION_FAILED", "JOURNAL_INITIAL_INVALID", "JOURNAL_CLASSIFIED_INVALID",
+    "PREPARATION_SITE_INVALID", "PREPARATION_TIME_INVALID", "PREPARATION_OWNERSHIP_INVALID", "PREPARATION_OWNERSHIP_UNAVAILABLE",
+    "PREPARATION_MUTATION_ID_INVALID", "MANAGED_OWNERSHIP_INVALID", "MANAGED_OWNERSHIP_STALE", "MANAGED_IMPORT_OWNERSHIP_CONFLICT",
 ]);
 export function safeExperimentFailureCode(error: unknown): string {
     if (typeof error !== "object" || error === null) return "READ_OR_EXECUTION_FAILED";
@@ -117,7 +122,9 @@ export async function runLocalExperiment(args: string[]) {
     let beforeConfirmation = true;
     const result = await runSupervisedExperiment({ site: currentSite, selection,
         mode: execute ? "execute-supervised" : "dry-run", authority: execute ? "supervised-experiment" : "observe" }, {
-        now, capture, readBack: readBefore,
+        now, capture, readBack: readBefore, journalRecords,
+        prepareContext: capture => prepareMutationContext({ site: currentSite, selection, capture },
+            { readOwnership: ownershipStore().read, now, newMutationId: randomUUID }),
         challenge: binding => `EXECUTE ${selection.energySiteId} ${digest(binding + randomUUID())}`,
         async confirm(review, challenge) {
             beforeConfirmation = false;

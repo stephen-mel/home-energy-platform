@@ -1,3 +1,4 @@
+import type { PreparedMutationContext } from "./prepared-mutation-context";
 import type { Site } from "../site/types";
 import type { KrakenState } from "../site/kraken-state";
 import { getSitePriceSignal } from "../site/get-site-price-signal";
@@ -109,6 +110,9 @@ export type Consent = { challenge: string; automaticRollbackUnproven: boolean; m
 export type ExperimentPorts = {
     now(): string;
     capture(): Promise<Capture>;
+    prepareContext(capture: Capture): Promise<PreparedMutationContext>;
+    journalRecords: Pick<typeof import("./linked-experiment-records"),
+        "validPreparedJournalContext" | "createLinkedInitialRecord" | "createLinkedClassifiedRecord">;
     confirm(review: PreparedExperiment, challenge: string): Promise<Consent>;
     // Exclusive durable site latch + complete before/payload/approval record.
     // Failure MUST throw before any POST. Latch is never automatically released.
@@ -123,7 +127,10 @@ export async function runSupervisedExperiment(input: {
 }, ports: ExperimentPorts) {
     input = structuredClone(input);
     if (input.mode === "execute-supervised" && input.authority !== "supervised-experiment") throw new Error("SUPERVISED_AUTHORITY_REQUIRED");
-    const review = prepareSupervisedExperiment(input.site, input.selection, structuredClone(await ports.capture()), ports.now());
+    const context = await ports.prepareContext(structuredClone(await ports.capture()));
+    if (!ports.journalRecords.validPreparedJournalContext(context) || representationKey(context.original.binding.selection) !== representationKey(input.selection))
+        throw new Error("JOURNAL_INITIAL_INVALID");
+    const review = structuredClone(context.original) as PreparedExperiment;
     if (input.mode !== "execute-supervised") return { status: "dry-run" as const, review, writeReady: false as const };
     if (input.authority !== "supervised-experiment" || review.hardBlockers.length) throw new Error("SUPERVISED_EXPERIMENT_GATE_BLOCKED");
     const challenge = ports.challenge(review.fingerprint);
@@ -159,9 +166,10 @@ export async function runSupervisedExperiment(input: {
     const exception = { kind: "supervised-manual-recovery" as const, consent, approvedAt, approval,
         exactExperimentFingerprint: review.fingerprint, productionBlockers: safety.blockers,
         automaticRollbackProven: false as const, manualRecovery: "Tesla app may be required; no automatic restoration" };
-    const journal = await ports.claim(input.selection.energySiteId, structuredClone({ phase: "approval-consumed-before-write", review, exception,
+    const initial = ports.journalRecords.createLinkedInitialRecord(context, { phase: "approval-consumed-before-write", review, exception,
         preWriteRecheck: { teslaSource: current.before.source, tariffKey: representationKey(current.before.tariff),
-            krakenObservedAt: current.kraken.lastSuccessfulUpdate, smartEvidenceKey: smartEvidenceKey(current.kraken) } }));
+            krakenObservedAt: current.kraken.lastSuccessfulUpdate, smartEvidenceKey: smartEvidenceKey(current.kraken) } });
+    const journal = await ports.claim(input.selection.energySiteId, initial);
     // A slow/failed persistence operation must not permit a late write.
     const attemptAt = ports.now();
     if (!fresh(approvedAt, attemptAt, APPROVAL_TTL_MS) || !fresh(current.kraken.lastSuccessfulUpdate, attemptAt, EVIDENCE_TTL_MS)
@@ -175,10 +183,10 @@ export async function runSupervisedExperiment(input: {
     const intended: ObservedTariff = { ...review.before, source: { ...review.before.source, kind: "simulation" }, tariff: review.proposal.bound.representation };
     const comparison = compareObservedTariffReadBack({ intended, readBack, after: attemptAt, dates: [review.date] });
     const classification = classifyExperimentResult(apiWrite, intended, readBack, comparison);
-    const record = { phase: "classified", attemptedAt: attemptAt, completedAt: ports.now(), exception,
+    const record = ports.journalRecords.createLinkedClassifiedRecord(initial, { phase: "classified", attemptedAt: attemptAt, completedAt: ports.now(), exception,
         apiWrite, apiTariffReadBack: { observation: readBack, comparison }, classification,
         laterTeslaAppObservation: null, laterPowerwallOpticasterObservation: null,
-        rollbackProven: false as const, productionWriteReady: false as const, automaticRestoreAttempted: false as const };
+        rollbackProven: false as const, productionWriteReady: false as const, automaticRestoreAttempted: false as const });
     await journal.finish(record); // Failure leaves consumed latch in place; never resend.
     return { status: "attempt-recorded" as const, review, record, writeReady: false as const };
 }
