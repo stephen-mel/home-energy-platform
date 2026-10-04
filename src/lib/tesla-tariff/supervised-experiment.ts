@@ -1,3 +1,4 @@
+import { validOwnershipTimestamp } from "./ownership-evidence";
 import type { JournalCompletionCapability } from "./supervised-journal";
 import type { PreparedMutationContext } from "./prepared-mutation-context";
 import type { Site } from "../site/types";
@@ -113,7 +114,7 @@ export type ExperimentPorts = {
     capture(): Promise<Capture>;
     prepareContext(capture: Capture): Promise<PreparedMutationContext>;
     journalRecords: Pick<typeof import("./linked-experiment-records"),
-        "validPreparedJournalContext" | "createLinkedInitialRecord" | "createLinkedClassifiedRecord">;
+        "validPreparedJournalContext" | "preflightOwnershipDomain" | "createLinkedInitialRecord" | "createLinkedClassifiedRecord">;
     confirm(review: PreparedExperiment, challenge: string): Promise<Consent>;
     // Exclusive durable site latch + complete before/payload/approval record.
     // Failure MUST throw before any POST. Latch is never automatically released.
@@ -164,6 +165,10 @@ export async function runSupervisedExperiment(input: {
         return safety;
     };
     const safety = validate();
+    const preflightAt = ports.now();
+    const containment = ports.journalRecords.preflightOwnershipDomain(context, preflightAt);
+    if (containment?.status !== "complete")
+        throw new Error(containment?.status === "rejected" ? containment.code : "INVALID_TRANSITION");
     const exception = { kind: "supervised-manual-recovery" as const, consent, approvedAt, approval,
         exactExperimentFingerprint: review.fingerprint, productionBlockers: safety.blockers,
         automaticRollbackProven: false as const, manualRecovery: "Tesla app may be required; no automatic restoration" };
@@ -173,6 +178,8 @@ export async function runSupervisedExperiment(input: {
     const journal = await ports.claim(input.selection.energySiteId, initial);
     // A slow/failed persistence operation must not permit a late write.
     const attemptAt = ports.now();
+    if (!validOwnershipTimestamp(attemptAt) || Date.parse(attemptAt) < Date.parse(preflightAt))
+        throw new Error("INVALID_TRANSITION");
     if (!fresh(approvedAt, attemptAt, APPROVAL_TTL_MS) || !fresh(current.kraken.lastSuccessfulUpdate, attemptAt, EVIDENCE_TTL_MS)
         || !fresh(review.before.source.observedAt, attemptAt, CAPTURE_TTL_MS) || Date.parse(attemptAt) + MIN_WRITE_REMAINING_MS >= Date.parse(review.proposal.bound.expiresAt))
         throw new Error("APPROVAL_EXPIRED_AFTER_CLAIM");

@@ -318,6 +318,7 @@ test('local coverage gap or ambiguous overlap adjacent to restoration boundary f
     const periods = Object.values(season.tou_periods).flatMap(t => t.periods).filter(p => p.toHour === 10 && p.toMinute === 0);
     assert.ok(periods.length > 0);
     for (const p of periods) { p.toHour = toMinute === 59 ? 9 : 10; p.toMinute = toMinute; }
+    assert.equal(containment({ previous: previous([owned('08:00', '10:00')]), domain: { start: at('00:00'), end: at('23:00') }, asOf: at('07:59') }).status, 'complete');
     const r = transition(before, broken, previous([owned('08:00', '10:00')]), at('08:00'), at('09:00'), 0.25177);
     assert.equal(r.status, 'rejected'); assert.equal(r.code, 'OWNERSHIP_DOMAIN_INCOMPLETE');
   }
@@ -346,4 +347,51 @@ test('nested returned finalisation transition is deeply immutable', () => {
     () => result.productionBlockers.splice(0)]) {
     assert.throws(mutate); assert.equal(key(result), snapshot);
   }
+});
+
+const { checkOwnershipDomain: containment } = load('src/lib/tesla-tariff/ownership-transition.ts');
+const domain = { start: at('08:00'), end: at('11:00') };
+for (const [name, spans, asOf, expected] of [
+  ['missing', null, '08:00', 'complete'], ['empty', [], '08:00', 'complete'],
+  ['inside', [['09:00','10:00']], '08:00', 'complete'],
+  ['relevant prefix outside', [['07:00','10:00']], '07:30', 'rejected'],
+  ['elapsed prefix outside', [['07:00','10:00']], '08:30', 'complete'],
+  ['suffix outside', [['09:00','12:00']], '08:00', 'rejected'],
+  ['both sides', [['07:00','12:00']], '07:30', 'rejected'],
+  ['exact equality', [['08:00','11:00']], '08:00', 'complete'],
+  ['ends at asOf', [['07:00','08:00']], '08:00', 'complete'],
+  ['starts at asOf', [['08:00','10:00']], '08:00', 'complete'],
+  ['future adjacent', [['11:00','12:00']], '08:00', 'rejected'],
+  ['previous adjacent relevant', [['07:00','08:00']], '07:30', 'rejected'],
+  ['one outside', [['08:00','09:00'],['11:00','12:00']], '08:00', 'rejected'],
+]) test(`canonical containment: ${name}`, () => {
+  const prior = spans === null ? null : previous(spans.map(([a,b]) => owned(a,b,0.25177,0.3)));
+  const snapshot = key(prior), result = containment({ previous: prior, domain, asOf: at(asOf) });
+  assert.equal(result.status, expected); assert.equal(key(prior), snapshot);
+  if (expected === 'rejected') assert.equal(result.code, 'OWNERSHIP_DOMAIN_INCOMPLETE');
+  const before = structuredClone(fixture.before); before.source.observedAt = at('07:00');
+  const transition = derive({ before, after: before, previous: prior, domain, submittedAt: at(asOf), authorised: [] });
+  assert.equal(transition.status, expected === 'complete' ? 'derived' : 'rejected', transition.code);
+  if (expected === 'rejected') assert.equal(transition.code, result.code);
+});
+test('containment preserves explicit DST fold/gap and midnight instants', () => {
+  for (const [start,end] of [
+    ['2026-10-25T01:30:00+01:00','2026-10-25T01:30:00+00:00'],
+    ['2026-03-29T00:30:00Z','2026-03-29T02:30:00+01:00'],
+    ['2026-09-23T23:30:00+01:00','2026-09-24T00:30:00+01:00'],
+  ]) {
+    const prior = previous([{ ...owned('08:00','10:00'), start, end }]);
+    const snapshot = key(prior);
+    assert.equal(containment({ previous: prior, domain: { start, end }, asOf: start }).status, 'complete');
+    assert.equal(containment({ previous: prior, domain: { start: new Date(start).toISOString(), end: new Date(end).toISOString() }, asOf: new Date(start).toISOString() }).status, 'complete');
+    assert.equal(key(prior), snapshot);
+  }
+});
+test('containment rejects invalid ownership, impossible timestamps and reversed domains', () => {
+  for (const input of [
+    { previous: undefined, domain, asOf: at('08:00') },
+    { previous: {}, domain, asOf: at('08:00') },
+    { previous: null, domain, asOf: '2026-02-30T00:00:00Z' },
+    { previous: null, domain: { start: domain.end, end: domain.start }, asOf: at('08:00') },
+  ]) assert.equal(containment(input).code, 'INVALID_TRANSITION');
 });

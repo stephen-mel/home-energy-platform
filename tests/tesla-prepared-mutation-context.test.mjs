@@ -18,7 +18,7 @@ function load(file) {
 }
 const { prepareMutationContext: build } = load('src/lib/tesla-tariff/prepared-mutation-context.ts');
 const { prepareSupervisedExperiment: prepare } = load('src/lib/tesla-tariff/supervised-experiment.ts');
-const { ownershipFingerprint: hash } = load('src/lib/tesla-tariff/ownership-transition.ts');
+const { ownershipFingerprint: hash, checkOwnershipDomain } = load('src/lib/tesla-tariff/ownership-transition.ts');
 const { representationKey: key } = load('src/lib/tesla-tariff/rollback-evidence.ts');
 const site = load('src/lib/site/current-site.ts').currentSite;
 const fixture = JSON.parse(fs.readFileSync('tests/fixtures/tesla-q7-sept23.json', 'utf8'));
@@ -283,4 +283,34 @@ test('a deliberately reused valid ID is accepted; uniqueness and replay enforcem
   const third = await build(changed, harness().ports);
   assert.equal(third.mutationId, first.mutationId); assert.notEqual(third.fingerprint, first.fingerprint);
   assert.equal(third.writeReady, false);
+});
+
+const { preflightOwnershipDomain: preflight } = load('src/lib/tesla-tariff/linked-experiment-records.ts');
+const { validPreparedJournalContext } = load('src/lib/tesla-tariff/linked-experiment-records.ts');
+test('preflight preserves missing, empty and owned contexts with no reread or ID allocation', async () => {
+  for (const read of [{ status: 'missing' }, ledger(), ledger([owned()])]) {
+    const h = harness(read), c = await build(input(), h.ports), before = key(c), calls = key(h.calls);
+    assert.ok(validPreparedJournalContext(c));
+    assert.equal(preflight(c, generatedAt).status, 'complete');
+    assert.equal(key(preflight(c, generatedAt)), key(checkOwnershipDomain({ previous: c.ownership.snapshot?.evidence ?? null, domain: c.comparisonDomain, asOf: generatedAt })));
+    assert.equal(key(c), before); assert.equal(key(h.calls), calls); frozen(c);
+  }
+});
+test('valid tomorrow context rejects specifically at containment; malformed context/time fail closed', async () => {
+  const read = ledger([{ ...owned(), start: '2026-09-24T08:00:00Z', end: '2026-09-24T10:00:00Z' }]);
+  read.snapshot.evidence.validUntil = '2026-09-25T00:00:00Z'; checksum(read);
+  const c = await build(input(), harness(read).ports);
+  assert.ok(validPreparedJournalContext(c));
+  assert.equal(preflight(c, generatedAt).code, 'OWNERSHIP_DOMAIN_INCOMPLETE');
+  assert.equal(preflight(c, '2026-02-30T00:00:00Z').code, 'INVALID_TRANSITION');
+  assert.equal(preflight(c, capturedAt).code, 'INVALID_TRANSITION');
+  const broken = structuredClone(c); broken.ownership.snapshot.generation = 'changed';
+  assert.equal(preflight(broken, generatedAt).code, 'JOURNAL_INITIAL_INVALID');
+});
+test('passing preflight does not establish readback sufficiency', async () => {
+  const c = await build(input(), harness().ports);
+  assert.equal(preflight(c, generatedAt).status, 'complete');
+  const receipt = simulatedReceipt(c); receipt.execution.readback.tariff = null;
+  receipt.journal.classifiedKey = hash({ mutationId: receipt.mutationId, execution: receipt.execution });
+  assert.equal(finalise(receipt).code, 'READBACK_NOT_EXACT');
 });

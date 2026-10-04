@@ -1,0 +1,13 @@
+# Pre-write ownership containment
+
+`checkOwnershipDomain({ previous, domain, asOf })` is the pure canonical rule shared by `deriveOwnershipTransition` (using real submission time) and `preflightOwnershipDomain(context, preflightAt)`. Each interval ending after asOf requires its entire [max(start, asOf), end) portion within the domain. Ending exactly at asOf is historical. Validation rejects invalid timestamps, domains and evidence. Neither helper clips or mutates evidence.
+
+The thin preflight lives alongside the existing context validator in linked-experiment-records.ts and is supplied through the existing journalRecords interface, keeping journal/crypto dependencies out of the executor’s runtime imports. It performs no journal operation.
+
+The preflight validates the original Stage A context and inspects its frozen ownership/domain. Missing and valid-empty ledgers both pass containment but retain distinct identities. There are no ports, ownership rereads, ID allocations, journal operations, observations, receipts or capabilities. Invalid context returns JOURNAL_INITIAL_INVALID; invalid time/input returns INVALID_TRANSITION; incomplete containment returns OWNERSHIP_DOMAIN_INCOMPLETE.
+
+The executor invokes preflight after existing approval/fresh validation and before initial record construction and exclusive claim. Ordinary domain rejection therefore consumes no latch and creates no execution record, POST, readback or B2 completion. Existing fresh reads have already occurred. The real attempt timestamp remains after claim. It must be strictly valid and at least preflightAt; a backward clock returns INVALID_TRANSITION before POST without releasing the consumed latch. Existing freshness/expiry checks remain in place. No new TTL is introduced.
+
+For fixed frozen inputs, passing containment remains passing as time advances. Preflight time is never represented as a hypothetical submission or stored as execution evidence. Failed containment rejects immediately, without waiting for intervals to elapse, rebasing ownership or broadening the proposal.
+
+Passing proves containment only. Actual before/readback coverage can still cause OWNERSHIP_DOMAIN_INCOMPLETE in the transition; insufficient confirmation readback can fail earlier with READBACK_NOT_EXACT. Tesla outcome, receipt eligibility, finalisation and persistence remain unproven. The captured ownership generation is unchanged; future generation-safe persistence must reject conflicts. B2 completion semantics, production blockers, rollback flags and manual recovery policy are unchanged. No receipt issuance, ownership persistence, recovery or retry is connected.

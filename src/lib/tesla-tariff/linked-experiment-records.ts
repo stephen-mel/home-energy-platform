@@ -6,7 +6,7 @@ import { createTariffProposal } from "./proposal-approval";
 import type { ObservedTariff } from "./observed-tariff";
 import { compareObservedTariffReadBack } from "./restoration-review";
 import { representationKey } from "./rollback-evidence";
-import { ownershipFingerprint } from "./ownership-transition";
+import { checkOwnershipDomain, ownershipFingerprint } from "./ownership-transition";
 import { validOwnership, validOwnershipTimestamp, assertOwnership, type ManagedImportEvidence } from "./ownership-evidence";
 
 export const EXPERIMENT_JOURNAL_SCHEMA = 1;
@@ -209,4 +209,17 @@ export function createLinkedClassifiedRecord(initial: LinkedInitialRecord, evide
     const record = { ...body, classifiedRecordId: ownershipFingerprint(body) };
     if (!validLinkedClassifiedRecord(record, initial)) throw Error("JOURNAL_CLASSIFIED_INVALID");
     return record;
+}
+
+/** Inspect the original context only. Passing is containment, not finalisation or
+ * authority. Actual readback coverage and generation conflicts remain unchecked. */
+export function preflightOwnershipDomain(context: PreparedMutationContext, preflightAt: string) {
+    if (!validPreparedJournalContext(context))
+        return { status: "rejected" as const, code: "JOURNAL_INITIAL_INVALID" as const };
+    if (!validOwnershipTimestamp(preflightAt) || Date.parse(preflightAt) < Date.parse(context.original.binding.generatedAt))
+        return { status: "rejected" as const, code: "INVALID_TRANSITION" as const };
+    return checkOwnershipDomain({
+        previous: context.ownership.status === "available" ? context.ownership.snapshot.evidence : null,
+        domain: context.comparisonDomain, asOf: preflightAt,
+    });
 }

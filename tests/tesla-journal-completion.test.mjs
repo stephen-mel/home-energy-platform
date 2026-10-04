@@ -232,23 +232,35 @@ function tomorrowLedger() {
   return { status: 'available', snapshot: { version: 1, generation, evidence, checksum: hash({ generation, evidence }) } };
 }
 
-test('outside-domain ownership can be linked to completion but still gains no finalisation eligibility', async () => {
+test('outside-domain ownership rejects before record creation, claim, POST, readback or completion', async () => {
   await usingHarness(async h => {
     h.ports.prepareContext = async capture => {
       h.calls.order.push('prepare');
       h.calls.context = await prepareMutationContext({ site, selection, capture }, { now: h.ports.now,
         readOwnership: async () => tomorrowLedger(), newMutationId: () => { h.calls.ids++; return 'test-mutation'; } });
+      assert.ok(records.validPreparedJournalContext(h.calls.context));
       return h.calls.context;
     };
-    const r = await h.run(), evidence = verify(h, r.journalCompletion);
-    assert.ok(evidence);
-    assert.ok(Date.parse(h.calls.context.ownership.snapshot.evidence.intervals[0].end)
-      > Date.parse(h.calls.context.comparisonDomain.end));
-    for (const k of ['finalisationEligible', 'ownershipTransition', 'confirmedReceipt', 'rollbackProven', 'writeReady'])
-      assert.equal(evidence[k], undefined);
-    assert.equal(r.writeReady, false); assert.equal(r.record.rollbackProven, false);
-    // Existing Stage A/finaliser regression rejects this exact coverage shape as
-    // OWNERSHIP_DOMAIN_INCOMPLETE. B2 neither applies nor bypasses that rule.
+    h.ports.journalRecords = { ...records, createLinkedInitialRecord() { assert.fail('No initial record'); } };
+    await assert.rejects(h.run(), /OWNERSHIP_DOMAIN_INCOMPLETE/);
+    assert.equal(h.calls.writes, 0); assert.equal(h.calls.claim, null); assert.equal(h.calls.result, null);
+    assert.deepEqual(h.calls.order, ['capture', 'prepare', 'confirm', 'capture']);
+    assert.deepEqual(operations, []); assert.equal(h.calls.ids, 1);
+  });
+});
+
+for (const delta of [-1, 1000]) test(`attempt clock delta ${delta} preserves the preflight time boundary`, async () => {
+  await usingHarness(async (h, directory) => {
+    const claim = h.ports.claim;
+    h.ports.claim = async (...args) => { const result = await claim(...args); h.advance(delta); return result; };
+    if (delta < 0) {
+      await assert.rejects(h.run(), /INVALID_TRANSITION/);
+      assert.equal(h.calls.writes, 0); assert.equal(h.calls.result, null);
+      assert.ok(h.calls.claim); assert.ok(!h.calls.order.includes('readback'));
+      await assert.rejects(claimExperimentJournal(directory, '12345', h.calls.claim), { code: 'EEXIST' });
+    } else {
+      const result = await h.run(); assert.equal(h.calls.writes, 1); assert.ok(verify(h, result.journalCompletion));
+    }
   });
 });
 
@@ -278,3 +290,17 @@ for (const phase of ['initial-construction', 'classified-construction', 'classif
     });
   });
 }
+
+
+test('malformed injected preflight cannot reach initial construction or execution', async () => {
+  await usingHarness(async h => {
+    h.ports.journalRecords = { ...records,
+      preflightOwnershipDomain() { return {}; },
+      createLinkedInitialRecord() { assert.fail('No initial record'); },
+    };
+    await assert.rejects(h.run(), /INVALID_TRANSITION/);
+    assert.equal(h.calls.writes, 0); assert.equal(h.calls.claim, null); assert.equal(h.calls.result, null);
+    assert.deepEqual(h.calls.order, ['capture', 'prepare', 'confirm', 'capture']);
+    assert.deepEqual(operations, []);
+  });
+});

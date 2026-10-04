@@ -3,7 +3,7 @@ import type { EnergyPrice } from "../tariff/types";
 import { comparePriceSignalsInDomain } from "../tariff/comparison-domain";
 import { observedEconomicSignal } from "./observed-economic";
 import type { ObservedTariff } from "./observed-tariff";
-import { assertOwnership, validOwnershipTimestamp, type ManagedImportEvidence, type OwnedImportInterval } from "./ownership-evidence";
+import { assertOwnership, validOwnership, validOwnershipTimestamp, type ManagedImportEvidence, type OwnedImportInterval } from "./ownership-evidence";
 import { representationKey } from "./rollback-evidence";
 
 export const ownershipFingerprint = (value: unknown) => createHash("sha256").update(representationKey(value)).digest("hex");
@@ -13,6 +13,24 @@ export type OwnershipTransitionInput = {
     domain: { start: string; end: string }; authorised: AuthorisedImportChange[];
     submittedAt: string;
 };
+
+/** Containment only: no confirmation, economic coverage or persistence authority. */
+export function checkOwnershipDomain(input: {
+    previous: Readonly<Omit<ManagedImportEvidence, "intervals">> & { readonly intervals: readonly OwnedImportInterval[] } | null;
+    domain: { start: string; end: string }; asOf: string;
+}) {
+    try {
+        const { previous, domain, asOf } = input;
+        if (![domain.start, domain.end, asOf].every(validOwnershipTimestamp)
+            || Date.parse(domain.end) <= Date.parse(domain.start) || (previous !== null && !validOwnership(previous)))
+            return { status: "rejected" as const, code: "INVALID_TRANSITION" as const };
+        const start = Date.parse(domain.start), end = Date.parse(domain.end), now = Date.parse(asOf);
+        if (previous?.intervals.some(p => Date.parse(p.end) > now &&
+            (Math.max(now, Date.parse(p.start)) < start || Date.parse(p.end) > end)))
+            return { status: "rejected" as const, code: "OWNERSHIP_DOMAIN_INCOMPLETE" as const };
+        return { status: "complete" as const };
+    } catch { return { status: "rejected" as const, code: "INVALID_TRANSITION" as const }; }
+}
 
 /** Pure interval kernel. Callers must independently establish confirmation and
  * authorisation; this is not an ownership receipt or a persistence entry point.
@@ -27,8 +45,8 @@ export function deriveOwnershipTransition(input: OwnershipTransitionInput) {
             throw Error("INVALID_TRANSITION");
         if (previous) assertOwnership(previous, before, submittedAt);
         const start = Date.parse(domain.start), end = Date.parse(domain.end), now = Date.parse(submittedAt);
-        if (previous?.intervals.some(p => Date.parse(p.end) > now &&
-            (Math.max(now, Date.parse(p.start)) < start || Date.parse(p.end) > end))) throw Error("OWNERSHIP_DOMAIN_INCOMPLETE");
+        const containment = checkOwnershipDomain({ previous, domain, asOf: submittedAt });
+        if (containment.status === "rejected") throw Error(containment.code);
         let last = start;
         for (const p of authorised) {
             const a = Date.parse(p.start), b = Date.parse(p.end);
