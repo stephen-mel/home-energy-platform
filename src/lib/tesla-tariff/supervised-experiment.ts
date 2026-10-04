@@ -1,3 +1,4 @@
+import type { JournalCompletionCapability } from "./supervised-journal";
 import type { PreparedMutationContext } from "./prepared-mutation-context";
 import type { Site } from "../site/types";
 import type { KrakenState } from "../site/kraken-state";
@@ -116,7 +117,7 @@ export type ExperimentPorts = {
     confirm(review: PreparedExperiment, challenge: string): Promise<Consent>;
     // Exclusive durable site latch + complete before/payload/approval record.
     // Failure MUST throw before any POST. Latch is never automatically released.
-    claim(site: string, record: unknown): Promise<{ finish(record: unknown): Promise<void> }>;
+    claim(site: string, record: unknown): Promise<{ finish(record: unknown): Promise<JournalCompletionCapability> }>;
     write(site: string, exactPayloadJson: string): Promise<WriteResult>;
     readBack(site: string): Promise<ObservedTariff>;
     challenge(binding: string): string;
@@ -187,8 +188,8 @@ export async function runSupervisedExperiment(input: {
         apiWrite, apiTariffReadBack: { observation: readBack, comparison }, classification,
         laterTeslaAppObservation: null, laterPowerwallOpticasterObservation: null,
         rollbackProven: false as const, productionWriteReady: false as const, automaticRestoreAttempted: false as const });
-    await journal.finish(record); // Failure leaves consumed latch in place; never resend.
-    return { status: "attempt-recorded" as const, review, record, writeReady: false as const };
+    const journalCompletion = await journal.finish(record); // Failure leaves consumed latch in place; never resend.
+    return { status: "attempt-recorded" as const, review, record, journalCompletion, writeReady: false as const };
 }
 
 export function classifyExperimentResult(write: WriteResult, intended: ObservedTariff, readBack: ObservedTariff | null,

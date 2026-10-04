@@ -136,14 +136,16 @@ test('legacy JSONL is diagnostic only and still occupies the same exclusive site
   } finally { await io.rm(dir, { recursive: true, force: true }); }
 });
 
-test('real journal validates both boundaries, preserves JSONL identities and returns no completion capability', async () => {
+test('real journal validates both boundaries, preserves JSONL identities and returns only a record-bound journal completion capability', async () => {
   const dir = await io.mkdtemp(path.join(os.tmpdir(), 'hep-linked-'));
   try {
     const invalid = structuredClone(initial); invalid.mutationId = null;
     await assert.rejects(claimExperimentJournal(dir, '12345', invalid), /JOURNAL_INITIAL_INVALID/);
     assert.deepEqual(await io.readdir(dir), []);
     const journal = await claimExperimentJournal(dir, '12345', initial);
-    assert.equal(await journal.finish(classified), undefined);
+    const completion = await journal.finish(classified);
+    const { journalCompletionForRecords } = load('src/lib/tesla-tariff/supervised-journal.ts');
+    assert.equal(journalCompletionForRecords(completion, initial, classified).classifiedRecordId, classified.classifiedRecordId);
     const lines = (await io.readFile(path.join(dir, 'site-12345.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
     assert.equal(key(lines[0]), key(initial)); assert.equal(key(lines[1]), key(classified));
     await assert.rejects(journal.finish(classified), /RESULT_ALREADY_RECORDED/);
