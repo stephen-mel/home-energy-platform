@@ -6,9 +6,9 @@ import { CAPTURE_TTL_MS, APPROVAL_TTL_MS, type WriteResult } from "./supervised-
 import { validOwnership, validOwnershipTimestamp, type ManagedImportEvidence } from "./ownership-evidence";
 import { deriveOwnershipTransition, ownershipFingerprint } from "./ownership-transition";
 
-/** Trusted local, frozen execution evidence ONLY. No production issuer exists yet.
- * Journal keys are attestations supplied by a future durable-journal reader, not
- * proof that arbitrary JSON came from Tesla. Never accept this from a browser.
+/** Frozen confirmation evidence, not standalone persistence authority.
+ * The trusted issuer derives these projection keys from B2-bound records; the
+ * keys alone do not prove Tesla origin. Never accept this from a browser.
  * Generation/evidence must be captured during preparation, not after execution.
  */
 export type ConfirmedSmartReceipt = {
@@ -29,12 +29,9 @@ function freeze<T>(value: T): T {
     return value;
 }
 
-/** No I/O, approval creation, journal mutation, execution or store commit.
- * Returned expectedGeneration is a compare-and-swap precondition, not permission
- * to fetch a newer generation. Receipt identity, not economic equality, will be
- * required by a future idempotent commit/recovery path.
- */
-export function finaliseConfirmedSmartOwnership(supplied: ConfirmedSmartReceipt) {
+/** Canonical pure confirmation checks shared by issuer and finaliser.
+ * Content validation is not runtime authority and performs no ownership derivation. */
+export function validateConfirmedSmartReceipt(supplied: ConfirmedSmartReceipt) {
     const reject = (code: string) => freeze({ status: "rejected" as const, code, writeReady: false as const, rollbackProven: false as const });
     try {
         const receipt = freeze(structuredClone(supplied)), { original, execution, journal } = receipt;
@@ -71,6 +68,20 @@ export function finaliseConfirmedSmartOwnership(supplied: ConfirmedSmartReceipt)
         const compared = compareObservedTariffReadBack({ intended, readBack: after, after: execution.submittedAt,
             dates: [proposal.observedPreparation!.localValidity!.date] });
         if (compared.outcome !== "exact-observed-match" || !compared.timelineScope.complete) return reject("READBACK_NOT_EXACT");
+        return freeze({ status: "validated" as const, receipt });
+    } catch { return reject("INVALID_CONFIRMATION"); }
+}
+
+/** Pure confirmation validation above establishes no ownership transition or
+ * runtime authority. Only this finaliser derives the bounded import transition. */
+export function finaliseConfirmedSmartOwnership(supplied: ConfirmedSmartReceipt) {
+    const reject = (code: string) => freeze({ status: "rejected" as const, code, writeReady: false as const, rollbackProven: false as const });
+    try {
+        const checked = validateConfirmedSmartReceipt(supplied);
+        if (checked.status === "rejected") return checked;
+        const receipt = checked.receipt, { original, execution } = receipt;
+        const { proposal, prior } = original, smart = proposal.input.observedSmart!;
+        const before = smart.observation, after = execution.readback;
         const price = proposal.input.signal.import.find(p => Date.parse(p.start) <= Date.parse(smart.dispatch.start)
             && Date.parse(p.end) > Date.parse(smart.dispatch.start))?.price;
         if (!price) return reject("SMART_PRICE_UNAVAILABLE");
