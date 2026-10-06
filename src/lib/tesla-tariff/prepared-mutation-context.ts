@@ -40,7 +40,8 @@ export async function prepareMutationContext(input: { site: Site; selection: Sel
         throw Error("PREPARATION_OWNERSHIP_INVALID");
     if (read.status === "available") {
         const s = read.snapshot;
-        if (!s || Object.keys(s).sort().join() !== "checksum,evidence,generation,version" || s.version !== 1
+        if (!s || Object.keys(s).sort().join() !== "checksum,evidence,generation,historyDigest,version" || s.version !== 2
+            || typeof s.historyDigest !== "string" || !/^[a-f0-9]{64}$/.test(s.historyDigest)
             || typeof s.generation !== "string" || !/^[a-f0-9-]{36}$/.test(s.generation)
             || !validOwnership(s.evidence) || s.evidence.energySiteId !== site
             || Date.parse(s.evidence.updatedAt) > Date.parse(capturedAt)

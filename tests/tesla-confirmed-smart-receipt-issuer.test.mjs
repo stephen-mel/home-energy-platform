@@ -186,7 +186,7 @@ test('valid-empty ownership keeps generation and empty evidence rather than beco
     updatedAt: '2026-09-23T07:00:00Z', validUntil: '2026-09-24T00:00:00Z', basis: 'confirmed-write-readback',
     baselineFingerprint: 'a'.repeat(64), readbackFingerprint: 'b'.repeat(64), proposalFingerprint: 'c'.repeat(64), smartEvidenceFingerprint: 'd'.repeat(64), intervals: [] };
   const generation = '11111111-1111-1111-1111-111111111111';
-  captured.status = 'available'; captured.snapshot = { version: 1, generation, evidence, checksum: hash({ generation, evidence }) };
+  captured.status = 'available'; captured.snapshot = { version: 2, generation, evidence, checksum: hash({ generation, evidence }), historyDigest: hash("captured history") };
   const smart = i.review.proposal.input.observedSmart;
   i.preparedContext.fingerprint = hash({ version: 1, mutationId: i.mutationId, original: i.review, ownership: captured,
     energySiteId: '12345', timeZone: 'Europe/London', selectedDispatch: smart.dispatch, comparisonDomain: smart.comparisonDomain,
@@ -262,7 +262,7 @@ test('non-empty retained ownership survives genuine issuance and selected SMART 
     baselineFingerprint: 'a'.repeat(64), readbackFingerprint: 'b'.repeat(64), proposalFingerprint: 'c'.repeat(64),
     smartEvidenceFingerprint: 'd'.repeat(64), intervals: [overlap, outside] };
   const generation = '22222222-2222-2222-2222-222222222222';
-  captured.status = 'available'; captured.snapshot = { version: 1, generation, evidence, checksum: hash({ generation, evidence }) };
+  captured.status = 'available'; captured.snapshot = { version: 2, generation, evidence, checksum: hash({ generation, evidence }), historyDigest: hash("captured history") };
   const smart = i.review.proposal.input.observedSmart;
   i.preparedContext.fingerprint = hash({ version: 1, mutationId: i.mutationId, original: i.review, ownership: captured,
     energySiteId: '12345', timeZone: 'Europe/London', selectedDispatch: smart.dispatch, comparisonDomain: smart.comparisonDomain,

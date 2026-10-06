@@ -172,7 +172,7 @@ function tomorrowLedger() {
     baselineFingerprint: 'a'.repeat(64), readbackFingerprint: 'b'.repeat(64), proposalFingerprint: 'c'.repeat(64), smartEvidenceFingerprint: 'd'.repeat(64),
     intervals: [{ start: '2026-09-24T08:00:00Z', end: '2026-09-24T10:00:00Z', restoreBaselineFingerprint: 'e'.repeat(64),
       applied: { amount: 0.25177, currency: 'GBP', unit: 'kWh' }, restore: { amount: 0.3, currency: 'GBP', unit: 'kWh' } }] };
-  return { status: 'available', snapshot: { version: 1, generation, evidence, checksum: hash({ generation, evidence }) } };
+  return { status: 'available', snapshot: { version: 2, generation, evidence, checksum: hash({ generation, evidence }), historyDigest: hash("captured history") } };
 }
 async function ownedInitial() {
   const capture = structuredClone(fixture); capture.before.source.observedAt = '2026-09-23T08:12:00.000Z'; capture.kraken.lastSuccessfulUpdate = capture.before.source.observedAt;
@@ -181,11 +181,13 @@ async function ownedInitial() {
   return records.createLinkedInitialRecord(c, evidence(initial));
 }
 
-test('altered ownership generation/evidence/checksum/context fingerprint cannot be substituted', async () => {
+test('altered ownership generation/evidence/checksum/history anchor/context fingerprint cannot be substituted', async () => {
   const a = await ownedInitial();
   for (const mutate of [r => { r.preparedContext.ownership.snapshot.generation = '22222222-2222-2222-2222-222222222222'; },
     r => { r.preparedContext.ownership.snapshot.evidence.intervals[0].restore.amount = 0.4; },
-    r => { r.preparedContext.ownership.snapshot.checksum = 'a'.repeat(64); }, r => { r.preparedContext.fingerprint = 'b'.repeat(64); }]) {
+    r => { r.preparedContext.ownership.snapshot.checksum = 'a'.repeat(64); },
+    r => { r.preparedContext.ownership.snapshot.historyDigest = 'f'.repeat(64); },
+    r => { delete r.preparedContext.ownership.snapshot.historyDigest; }, r => { r.preparedContext.fingerprint = 'b'.repeat(64); }]) {
     const r = structuredClone(a); mutate(r); rehashInitial(r);
     assert.equal(records.validLinkedInitialRecord(r, '12345'), false);
   }

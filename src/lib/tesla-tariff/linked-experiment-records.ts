@@ -101,7 +101,8 @@ export function validPreparedJournalContext(context: PreparedMutationContext): b
         if (o.status === "missing") return o.snapshot === null;
         if (o.status !== "available") return false;
         const s = o.snapshot;
-        if (!keys(s, ["version","generation","evidence","checksum"]) || s.version !== 1
+        if (!keys(s, ["version","generation","evidence","checksum","historyDigest"]) || s.version !== 2
+            || typeof s.historyDigest !== "string" || !/^[a-f0-9]{64}$/.test(s.historyDigest)
             || typeof s.generation !== "string" || !/^[a-f0-9-]{36}$/.test(s.generation)
             || !validOwnership(s.evidence) || Date.parse(s.evidence.updatedAt) > Date.parse(o.capturedAt)
             || s.checksum !== ownershipFingerprint({ generation: s.generation, evidence: s.evidence })) return false;

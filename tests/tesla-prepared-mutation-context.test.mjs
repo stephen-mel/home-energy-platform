@@ -31,7 +31,7 @@ function ledger(intervals = []) {
     basis: 'confirmed-write-readback', baselineFingerprint: 'a'.repeat(64), readbackFingerprint: 'b'.repeat(64),
     proposalFingerprint: 'c'.repeat(64), smartEvidenceFingerprint: 'd'.repeat(64), intervals };
   const generation = '11111111-1111-1111-1111-111111111111';
-  return { status: 'available', snapshot: { version: 1, generation, evidence, checksum: hash({ generation, evidence }) } };
+  return { status: 'available', snapshot: { version: 2, generation, evidence, checksum: hash({ generation, evidence }), historyDigest: hash("captured history") } };
 }
 const owned = () => ({ start: '2026-09-23T08:00:00Z', end: '2026-09-23T10:00:00Z',
   applied: { amount: 0.25177, currency: 'GBP', unit: 'kWh' }, restore: { amount: 0.3, currency: 'GBP', unit: 'kWh' }, restoreBaselineFingerprint: 'e'.repeat(64) });
@@ -84,10 +84,12 @@ test('missing differs from valid-empty and valid-owned snapshots remain exact', 
 
 test('corrupt, incompatible, unavailable and malformed reads fail closed before ID allocation', async () => {
   const corrupt = ledger(); corrupt.snapshot.checksum = 'bad';
-  const version = ledger(); version.snapshot.version = 2;
+  const version = ledger(); version.snapshot.version = 1;
+  const missingAnchor = ledger(); delete missingAnchor.snapshot.historyDigest;
+  const malformedAnchor = ledger(); malformedAnchor.snapshot.historyDigest = "bad";
   const wrongSite = ledger(); wrongSite.snapshot.evidence.energySiteId = '54321';
   const invalid = ledger(); invalid.snapshot.evidence.updatedAt = '2026-02-30T00:00:00Z';
-  for (const read of [{ status: 'invalid' }, { status: 'unavailable' }, null, corrupt, version, wrongSite, invalid,
+  for (const read of [{ status: 'invalid' }, { status: 'unavailable' }, null, corrupt, version, missingAnchor, malformedAnchor, wrongSite, invalid,
     { status: 'missing', snapshot: ledger().snapshot }]) {
     const h = harness(read); await assert.rejects(build(input(), h.ports), /PREPARATION_OWNERSHIP_(INVALID|UNAVAILABLE)/);
     assert.equal(h.calls.ids, 0);
@@ -128,14 +130,15 @@ test('inputs are detached before the asynchronous ownership read', async () => {
   assert.equal(c.selectedDispatch.assetId, 'q7-fixture'); assert.notEqual(c.original.before.tariff.name, 'mutated');
 });
 
-test('generation and complete evidence changes change context identity even with same mutation ID', async () => {
-  const a = ledger([owned()]), b = structuredClone(a), d = structuredClone(a);
+test('generation, evidence and history anchor change context identity even with same mutation ID', async () => {
+  const a = ledger([owned()]), b = structuredClone(a), d = structuredClone(a), h = structuredClone(a);
+  h.snapshot.historyDigest = hash("different committed history");
   b.snapshot.generation = '22222222-2222-2222-2222-222222222222';
   d.snapshot.evidence.intervals[0].restoreBaselineFingerprint = 'f'.repeat(64);
   for (const read of [b, d]) read.snapshot.checksum = hash({ generation: read.snapshot.generation, evidence: read.snapshot.evidence });
-  const contexts = await Promise.all([a,b,d].map(read => build(input(), harness(read).ports)));
-  assert.equal(new Set(contexts.map(c => c.fingerprint)).size, 3);
-  assert.equal(new Set(contexts.map(c => c.ownershipKey)).size, 3);
+  const contexts = await Promise.all([a,b,d,h].map(read => build(input(), harness(read).ports)));
+  assert.equal(new Set(contexts.map(c => c.fingerprint)).size, 4);
+  assert.equal(new Set(contexts.map(c => c.ownershipKey)).size, 4);
   assert.equal(new Set(contexts.map(c => c.payloadKey)).size, 1);
 });
 

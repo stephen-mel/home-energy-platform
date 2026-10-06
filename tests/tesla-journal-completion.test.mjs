@@ -229,7 +229,7 @@ function tomorrowLedger() {
     baselineFingerprint: 'a'.repeat(64), readbackFingerprint: 'b'.repeat(64), proposalFingerprint: 'c'.repeat(64), smartEvidenceFingerprint: 'd'.repeat(64),
     intervals: [{ start: '2026-09-24T08:00:00Z', end: '2026-09-24T10:00:00Z', restoreBaselineFingerprint: 'e'.repeat(64),
       applied: { amount: 0.25177, currency: 'GBP', unit: 'kWh' }, restore: { amount: 0.3, currency: 'GBP', unit: 'kWh' } }] };
-  return { status: 'available', snapshot: { version: 1, generation, evidence, checksum: hash({ generation, evidence }) } };
+  return { status: 'available', snapshot: { version: 2, generation, evidence, checksum: hash({ generation, evidence }), historyDigest: hash("captured history") } };
 }
 
 test('outside-domain ownership rejects before record creation, claim, POST, readback or completion', async () => {

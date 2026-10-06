@@ -34,39 +34,29 @@ Record fingerprints identify evidence; they are not signatures or an authenticat
 mechanism. The local store and its caller are trusted server components. It must
 never accept a browser-supplied claim that a write/readback succeeded.
 
-The future integration calls `recordConfirmed` with a consistent strict replacement
-proposal, its exact authenticated before-state, a submitted-representation-preserved
-outcome, exact authenticated readback, timestamps and expected store generation.
-It rejects simulated/changed readback, ambiguous write outcomes, mismatched prior
-ownership and expired submission approval intervals. Capture freshness uses the
-existing capture TTL. The currently unconnected API does not authenticate Tesla
-itself: a future supervised lifecycle must establish that provenance and retain all
-existing approval, SMART freshness and executor safety checks before calling it.
+The legacy `recordConfirmed` production write entry has been retired. Its
+replacement-lifecycle checks remain in the pure `deriveReplacementOwnership`
+function, which cannot persist anything. The selected-SMART finaliser remains a
+separate lifecycle; these derivations are not interchangeable.
 
 ## Local persistence
 
-`ownershipStore()` defaults to:
+SQLite is now the authoritative local supervised ownership format. See
+[SQLite ownership persistence](tesla-ownership-sqlite.md) for its private transaction
+boundary, runtime pin, preconditions, idempotency and failure semantics.
 
-`.cache/home-energy-platform/tesla-smart-ownership/site-<Tesla site ID>.json`
+`ownershipStore()` exposes only `read`. Its default database is:
 
-The existing `/.cache/home-energy-platform/` Git ignore rule covers the records and
-adjacent temporary files. Records contain only prices, bounded instants, provenance
-digests and version/generation metadata; no credentials, raw API payloads or tokens.
-Writes use exclusive owner-only temporary files, file sync, atomic rename and parent
-directory sync. Readers see either the complete previous or next record. Missing,
-malformed, incompatible, checksum-mismatched or unreadable data establishes no
-ownership. A corrupt file cannot be overwritten through the recording API.
+`.cache/home-energy-platform/tesla-smart-ownership/ownership.sqlite`
 
-A process-global queue per absolute site-file path coordinates separate server
-module instances. The expected-generation check occurs inside that queue. The
-queue follows the actual filesystem operation, including cleanup, so abandonment
-or timeout of a caller does not release a pending rename. Stale writers fail;
-a later valid confirmed receipt must name the latest generation. A failure before
-rename preserves the previous file. A directory-sync error after rename reports
-failure although the new file may exist; reload and review before any retry.
-There is no retry loop or distributed lock. Multi-process deployments need a
-replacement transactional store; filesystem rollback/tampering is outside this
-local trust model. There is no automatic repair/delete/latch-reset path.
+No production write entry is exposed yet. A future separately reviewed operation
+must verify genuine B2 completion and exact linked records, issue the receipt and
+finalise ownership before invoking the private commit. Arbitrary receipts and
+finaliser outputs provide no write authority. No executor connection is added.
+
+Legacy `site-<Tesla site ID>.json` files are never silently migrated or read as
+current ownership. Their presence fails closed with `OWNERSHIP_LEGACY_UNRESOLVED`,
+including when SQLite also has that site's state. A migration decision is deferred.
 
 ## Reconciliation
 
@@ -91,7 +81,7 @@ merges compare economic intervals, not dispatch IDs. Elapsed portions are exclud
 from the reconciliation domain; record age alone is not proof of a manual change,
 but explicit validity and a fresh matching Tesla observation are required.
 
-The recording API requires coverage of every still-relevant owned portion:
+The retained pure replacement derivation requires coverage of every still-relevant owned portion:
 `[max(interval.start, recordedAt), interval.end)` for intervals ending after
 `recordedAt`. Elapsed prefixes may fall outside the receipt domain; current/future
 prefixes and tails may not. Retained portions keep their original restoration
