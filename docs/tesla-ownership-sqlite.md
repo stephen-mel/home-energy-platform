@@ -1,14 +1,13 @@
 # Isolated local SQLite ownership persistence
 
 This is a **local supervised-experiment store**, not Vercel/cloud persistence.
-No executor, receipt orchestration, dashboard reader, recovery or restoration is
-connected. Production access is read-only. All production blockers remain;
+Standalone trusted receipt/finalisation/persistence orchestration exists, but no
+executor, dashboard consumer, recovery or restoration is connected. All production blockers remain;
 `rollbackProven` and `writeReady` are not promoted by storage.
 
-**Next-stage integration constraint:** Future trusted persistence orchestration
-must use the complete B2-bound Stage A ownership snapshot—including
+**Integration constraint:** Trusted persistence orchestration must use the complete B2-bound Stage A ownership snapshot—including
 `historyDigest`—as the persistence precondition. The pure finaliser's generation
-alone is insufficient. B2→persistence orchestration is not connected here.
+alone is insufficient. The standalone boundary enforces this; executor wiring remains deferred.
 
 ## Runtime and isolation
 
@@ -33,15 +32,15 @@ a network share, synced folder or separate per-process copies of the database.
 The existing cache Git ignore covers the database and SQLite journal files.
 New directories/files use owner-only permissions (0700/0600).
 
-`ownershipStore().read` is the only facade operation. `readOwnership` is the only
-SQLite module export. `commitOwnership` is module-private, with no environment
+`ownershipStore().read` is the only facade operation. The SQLite module exports
+`readOwnership` and the guarded three-input `persistConfirmedSmart` boundary. `commitOwnership` is module-private, with no environment
 switch or factory exposing it. Tests append an export in a VM-loaded copy of source;
 that seam exists only in `tests/helpers`. It is not runtime authority.
 
 Legacy `recordConfirmed` is removed. Its useful replacement derivation is pure and
-remains regression tested. It does not create write authority. The future trusted
-entry must accept genuine B2 capability + exact initial/classified records, issue
-and finalise internally, then call the private commit. No such entry is added here.
+remains regression tested. It does not create write authority. The standalone trusted
+entry accepts genuine B2 capability + exact initial/classified records, issues
+and finalises internally, then calls the private commit. It has no executor caller.
 
 ## Transaction and identity
 
@@ -135,7 +134,8 @@ prior/result identities: including the resulting history digest in its own resul
 identity would create a circular hash. Instead, available persistence preconditions
 compare the **entire snapshot**, including `historyDigest`. Preparation and linked
 context fingerprints also bind this field; their validators require the new snapshot
-shape. No journal orchestration, B2 evidence or execution is added to the adapter.
+shape. B2 verification occurs only in the standalone wrapper; the transaction primitive
+receives derived identities/evidence, never journal records or capabilities.
 
 An application's `priorHistoryDigest` records the exact captured prefix commitment
 (null only for genuinely missing state). Every prefix and the terminal snapshot
@@ -155,3 +155,40 @@ snapshot still detects the changed anchor; a fresh read of a fully rewritten val
 database cannot. Tests explicitly demonstrate that limit, rather than claiming local
 hashes provide a trusted external audit record. No secret, external trust root,
 recovery, migration or new authority is introduced.
+
+## Standalone trusted persistence boundary
+
+`persistConfirmedSmart(capability, initialRecord, classifiedRecord)` clones both
+records at entry and retains the original runtime capability identity. It calls
+`issueConfirmedSmartReceipt` and then `finaliseConfirmedSmartOwnership`. Only
+explicit `issued` and `derived` results can reach the private transaction. No
+caller-supplied receipt, evidence, snapshot, generation, checksum, history digest,
+mutation/issuance/receipt override or database path is accepted.
+
+The wrapper derives the entire persistence precondition from the B2-bound initial
+record's Stage A ownership context. Missing stays missing; available retains the
+exact v2 snapshot. It cross-checks site, mutation, completion record IDs, receipt
+and issuance keys, captured generation/time/evidence, original proposal/payload
+identity and finalised evidence before committing. It never rereads/rebases onto
+current ownership. The configured local destination matches the reader's default.
+
+Results retain separate `stage` and `confirmation` fields. Authority/issuance,
+finalisation and internal binding rejection perform no SQLite operation. The
+transaction's `persisted`, `already-persisted`, `conflict`, `store-failed` and
+`indeterminate` statuses are preserved. After issuance establishes confirmation,
+subsequent failures retain `confirmation: "confirmed"`: tariff confirmed; ownership
+recording failed/conflicted/indeterminate. They are not tariff rejection. All results
+have `writeReady: false` and `rollbackProven: false`; persistence results retain the
+finaliser's production blockers. Output is detached and deeply frozen.
+
+Same live authority and exact records may replay without advancing generation or
+history digest while the recorded result is still current. A different journal
+chain changes issuance identity even if its receipt projection matches. Historical
+replay after advancement conflicts. JSON records and copied capabilities grant no
+restart authority; the genuine B2 registry must be the same module instance.
+
+There are no network calls, executor calls, journal mutations, latch changes,
+current-clock decisions, retries, restoration or recovery in this wrapper. A later
+executor connection must retain its exact initial record; it is deliberately not
+implemented here. Tests mint genuine completion through existing B1/B2 functions,
+mock transport only, and use isolated temporary SQLite destinations.

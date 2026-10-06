@@ -21,7 +21,7 @@ test('runtime is exactly pinned; public modules expose no commit/recordConfirmed
     assert.equal(wrong.testCommit('/unused',input()).code,'OWNERSHIP_NODE_26_8_2_REQUIRED');
   }
   const source=fs.readFileSync('src/lib/tesla-tariff/ownership-sqlite.ts','utf8');
-  assert.deepEqual([...source.matchAll(/export function (\w+)/g)].map(m=>m[1]),['readOwnership']);
+  assert.deepEqual([...source.matchAll(/export function (\w+)/g)].map(m=>m[1]),['readOwnership','persistConfirmedSmart']);
   const facade=store.load('src/lib/tesla-tariff/ownership-store.ts').ownershipStore('/unused');
   assert.deepEqual(Object.keys(facade),['read']);
 });

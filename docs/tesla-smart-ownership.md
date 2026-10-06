@@ -49,10 +49,11 @@ boundary, runtime pin, preconditions, idempotency and failure semantics.
 
 `.cache/home-energy-platform/tesla-smart-ownership/ownership.sqlite`
 
-No production write entry is exposed yet. A future separately reviewed operation
-must verify genuine B2 completion and exact linked records, issue the receipt and
-finalise ownership before invoking the private commit. Arbitrary receipts and
-finaliser outputs provide no write authority. No executor connection is added.
+The standalone `persistConfirmedSmart` entry verifies genuine B2 completion and
+exact linked records, issues the receipt and finalises ownership before invoking
+the private commit. It uses the complete captured Stage A snapshot, including
+`historyDigest`, as its precondition. Arbitrary receipts and finaliser outputs
+provide no write authority. No executor connection is added.
 
 Legacy `site-<Tesla site ID>.json` files are never silently migrated or read as
 current ownership. Their presence fails closed with `OWNERSHIP_LEGACY_UNRESOLVED`,

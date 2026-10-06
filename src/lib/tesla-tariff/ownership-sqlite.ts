@@ -5,6 +5,9 @@ import type { DatabaseSync } from "node:sqlite";
 import { validOwnership, type ManagedImportEvidence } from "./ownership-evidence";
 import { representationKey } from "./rollback-evidence";
 import type { OwnershipRead, OwnershipSnapshot } from "./ownership-store";
+import type { LinkedInitialRecord, LinkedClassifiedRecord } from "./linked-experiment-records";
+import { issueConfirmedSmartReceipt } from "./confirmed-smart-receipt-issuer";
+import { finaliseConfirmedSmartOwnership } from "./ownership-finalisation";
 
 const hash = (v: unknown) => createHash("sha256").update(representationKey(v)).digest("hex");
 const digest = (v: unknown): v is string => typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
@@ -219,9 +222,8 @@ export function readOwnership(databasePath: string, site: string): OwnershipRead
     }
 }
 
-/** PRIVATE commit seam. No export, factory capability, environment switch or
- * production caller. Tests instrument module source in their own VM only.
- * Future B2 orchestration must validate/issue/finalise before invoking this. */
+/** PRIVATE transaction primitive. Only the trusted three-input orchestration
+ * below can call it in production; no raw evidence/precondition write API. */
 type CommitInput = { site: string; expected: Precondition; evidence: ManagedImportEvidence;
     mutationId: string; issuanceKey: string; receiptKey: string };
 type CommitResult = { status: "persisted" | "already-persisted"; snapshot: OwnershipSnapshot }
@@ -282,5 +284,72 @@ function commitOwnership(databasePath: string, input: CommitInput): CommitResult
             ? "conflict" : "store-failed", code: uncertain ? "OWNERSHIP_PERSISTENCE_INDETERMINATE" : reason };
     }
 }
-// Intentionally unreachable until separately reviewed B2 persistence orchestration.
-void commitOwnership;
+function freeze<T>(value: T): Readonly<T> {
+    if (value && typeof value === "object") { Object.values(value).forEach(freeze); Object.freeze(value); }
+    return value;
+}
+
+/** Standalone local boundary; deliberately not connected to any executor.
+ * B2 capability identity is retained; only detached, exactly bound B1 records
+ * supply evidence and the COMPLETE original ownership precondition. */
+export function persistConfirmedSmart(capability: unknown, initialRecord: LinkedInitialRecord,
+    classifiedRecord: LinkedClassifiedRecord) {
+    const reject = (stage: "issuance" | "finalisation" | "binding", code: string, confirmed: boolean) => freeze({
+        status: "rejected" as const, stage, code, confirmation: confirmed ? "confirmed" as const : "not-established" as const,
+        writeReady: false as const, rollbackProven: false as const,
+    });
+    let commit: CommitInput, productionBlockers: string[];
+    let stage: "issuance" | "finalisation" | "binding" = "issuance", confirmed = false;
+    try {
+        const initial = structuredClone(initialRecord), classified = structuredClone(classifiedRecord);
+        const issued = issueConfirmedSmartReceipt(capability, initial, classified);
+        if (issued.status !== "issued") return reject(stage, issued.code, false);
+        confirmed = true; stage = "finalisation";
+        const finalised = finaliseConfirmedSmartOwnership(issued.receipt);
+        if (finalised.status !== "derived") return reject(stage, finalised.code, true);
+        stage = "binding";
+        const captured = initial.preparedContext.ownership;
+        const expected: Precondition = captured.status === "missing" ? { status: "missing" }
+            : { status: "available", snapshot: structuredClone(captured.snapshot) as OwnershipSnapshot };
+        const site = issued.completion.energySiteId;
+        // Validate the complete snapshot shape/checksum without reading/rebasing
+        // current state. The transaction alone checks the captured history anchor.
+        identity(site, expected);
+        const generation = expected.status === "available" ? expected.snapshot.generation : null;
+        const previous = expected.status === "available" ? expected.snapshot.evidence : null;
+        const same = (a: unknown, b: unknown) => representationKey(a) === representationKey(b);
+        if (captured.energySiteId !== site || initial.review.proposal.bound.energySiteId !== site
+            || classified.energySiteId !== site || finalised.evidence.energySiteId !== site
+            || !validOwnership(finalised.evidence)
+            || finalised.evidence.timeZone !== initial.review.proposal.bound.timeZone
+            || issued.completion.mutationId !== initial.mutationId || classified.mutationId !== initial.mutationId
+            || issued.receipt.mutationId !== initial.mutationId || finalised.mutationId !== initial.mutationId
+            || issued.completion.initialRecordId !== initial.initialRecordId
+            || issued.completion.classifiedRecordId !== classified.classifiedRecordId
+            || issued.receiptKey !== hash(issued.receipt) || finalised.receiptKey !== issued.receiptKey
+            || issued.issuanceKey !== hash({ version: 1, completion: issued.completion, receiptKey: issued.receiptKey })
+            || finalised.expectedGeneration !== generation || issued.receipt.original.prior.generation !== generation
+            || issued.receipt.original.prior.capturedAt !== captured.capturedAt
+            || !same(issued.receipt.original.prior.evidence, previous)
+            || finalised.originalProposalFingerprint !== initial.review.proposal.fingerprint
+            || finalised.originalPayloadKey !== initial.review.payloadJson
+            || finalised.writeReady !== false || finalised.rollbackProven !== false)
+            return reject(stage, "OWNERSHIP_BINDING_INVALID", true);
+        commit = { site, expected, evidence: finalised.evidence, mutationId: initial.mutationId,
+            issuanceKey: issued.issuanceKey, receiptKey: issued.receiptKey };
+        productionBlockers = finalised.productionBlockers;
+    } catch { return reject(stage, "OWNERSHIP_ORCHESTRATION_INVALID", confirmed); }
+    // Trusted local destination, not a per-call caller override. No retry, clock,
+    // journal mutation, transport or latch operation exists in this boundary.
+    let file: string;
+    try { file = path.join(process.cwd(), ".cache/home-energy-platform/tesla-smart-ownership/ownership.sqlite"); }
+    catch {
+        // Confirmation already succeeded; no transaction has been attempted.
+        return freeze({ status: "store-failed" as const, code: "OWNERSHIP_DESTINATION_UNAVAILABLE",
+            stage: "persistence" as const, confirmation: "confirmed" as const,
+            productionBlockers, writeReady: false as const, rollbackProven: false as const });
+    }
+    const result = commitOwnership(file, commit);
+    return freeze({ ...result, stage: "persistence" as const, confirmation: "confirmed" as const,
+        productionBlockers, writeReady: false as const, rollbackProven: false as const });
+}

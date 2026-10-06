@@ -1,6 +1,7 @@
 // TEST ONLY: VM source instrumentation exposes the private commit function.
 // No test switch/export exists in the application module.
 import fs from 'node:fs';
+import io from 'node:fs/promises';
 import path from 'node:path';
 import vm from 'node:vm';
 import * as crypto from 'node:crypto';
@@ -25,11 +26,11 @@ export function loadStore(hooks = {}, version = process.versions.node) {
     if(file.endsWith('/ownership-sqlite.ts'))source+='\nexport { commitOwnership as testCommit };';
     const exports={}; cache.set(file,exports);
     vm.runInNewContext(ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,
-      {exports,Error,structuredClone,Date,process:{versions:{node:version},cwd:()=>process.cwd(),getBuiltinModule(name){
+      {exports,Error,structuredClone,Date,process:{versions:{node:version},cwd:()=>hooks.cwd ?? process.cwd(),getBuiltinModule(name){
         assert.equal(name,'node:sqlite');return {...sqlite,DatabaseSync:ControlledDatabase};}}, require(name){
         if(name.startsWith('.'))return load(path.resolve(path.dirname(file),name+'.ts'));
-        const allowed={'node:fs':fs,'node:path':path,'node:crypto':crypto};
-        assert.ok(name in allowed,`Forbidden dependency (transport/journal/executor): ${name}`);return allowed[name];
+        const allowed={'node:fs':fs,'node:fs/promises':io,'node:path':path,'node:crypto':crypto};
+        assert.ok(name in allowed,`Unexpected native dependency (no network transport): ${name}`);return allowed[name];
       }});return exports;
   }
   return {load,...load('src/lib/tesla-tariff/ownership-sqlite.ts')};
