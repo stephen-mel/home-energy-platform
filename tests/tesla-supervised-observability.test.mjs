@@ -61,6 +61,7 @@ function harness(fault) {
     './linked-experiment-records': domain('src/lib/tesla-tariff/linked-experiment-records.ts'),
     './prepared-mutation-context': domain('src/lib/tesla-tariff/prepared-mutation-context.ts'),
     './ownership-store': { ownershipStore: () => ({ read: async () => ({ status: 'missing' }) }) },
+    './ownership-sqlite': { persistConfirmedSmart: fail },
   };
   class FixedDate extends Date { constructor(...args) { super(...(args.length ? args : ['2026-09-23T08:12:00.000Z'])); } }
   vm.runInNewContext(source, {

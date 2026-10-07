@@ -13,6 +13,7 @@ import { captureObservedTariff } from "./observed-tariff";
 import * as journalRecords from "./linked-experiment-records";
 import { prepareMutationContext } from "./prepared-mutation-context";
 import { ownershipStore } from "./ownership-store";
+import { persistConfirmedSmart } from "./ownership-sqlite";
 import { claimExperimentJournal } from "./supervised-journal";
 import { runSupervisedExperiment, interpretWriteResponse, StaleApprovalOrEvidenceError } from "./supervised-experiment";
 
@@ -160,7 +161,28 @@ export async function runLocalExperiment(args: string[]) {
             payloadSHA256: digest(result.review.payloadJson), proposalSHA256: digest(result.review.proposal.fingerprint),
             exactPayload: JSON.parse(result.review.payloadJson), productionBlockers: result.review.restoration.blockers,
             experimentalBlockers: result.review.hardBlockers, writeReady: false }, null, 2));
-    } else console.log(JSON.stringify({ status: result.status, classification: result.record.classification,
+    } else {
+        // Only completed B2 results reach this point. This filter saves unnecessary
+        // issuance attempts; persistConfirmedSmart independently verifies authority.
+        // Keep persistence outside execution: no retry, rebase or latch operation.
+        let ownership: ReturnType<typeof persistConfirmedSmart> | null = null;
+        if (result.record.classification === "submitted-representation-preserved") {
+            try {
+                ownership = persistConfirmedSmart(result.journalCompletion, result.initialRecord, result.record);
+            } catch {
+                // An unexpected exception may occur after commit. Preserve the
+                // completed execution without inferring either persistence outcome.
+                ownership = { status: "indeterminate", stage: "persistence", confirmation: "confirmed",
+                    code: "OWNERSHIP_ORCHESTRATION_EXCEPTION", productionBlockers: result.review.restoration.blockers,
+                    writeReady: false, rollbackProven: false };
+            }
+        }
+        console.log(JSON.stringify({ status: result.status, classification: result.record.classification,
         apiWrite: result.record.apiWrite, journal: path.join(directory, `site-${selection.energySiteId}.jsonl`),
+        ownershipPersistence: ownership === null ? { status: "not-attempted", reason: "MUTATION_NOT_CONFIRMED" }
+            : { status: ownership.status, stage: ownership.stage, confirmation: ownership.confirmation,
+                ...("code" in ownership ? { code: ownership.code } : {}),
+                writeReady: ownership.writeReady, rollbackProven: ownership.rollbackProven },
         manualRecoveryMayBeRequired: true, rollbackProven: false, writeReady: false }, null, 2));
+    }
 }

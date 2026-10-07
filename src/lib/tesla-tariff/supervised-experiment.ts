@@ -196,7 +196,7 @@ export async function runSupervisedExperiment(input: {
         laterTeslaAppObservation: null, laterPowerwallOpticasterObservation: null,
         rollbackProven: false as const, productionWriteReady: false as const, automaticRestoreAttempted: false as const });
     const journalCompletion = await journal.finish(record); // Failure leaves consumed latch in place; never resend.
-    return { status: "attempt-recorded" as const, review, record, journalCompletion, writeReady: false as const };
+    return { status: "attempt-recorded" as const, review, initialRecord: initial, record, journalCompletion, writeReady: false as const };
 }
 
 export function classifyExperimentResult(write: WriteResult, intended: ObservedTariff, readBack: ObservedTariff | null,
