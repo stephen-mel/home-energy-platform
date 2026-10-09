@@ -5,6 +5,7 @@ import vm from 'node:vm';
 import ts from 'typescript';
 import * as jsxRuntime from 'react/jsx-runtime';
 import { createElement } from 'react';
+import * as react from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
 // No network or integration client dependencies are allowed in this graph.
@@ -26,7 +27,7 @@ const { getSitePriceSignal } = load('src/lib/site/get-site-price-signal.ts', {
   '../tariff/price-signal': curve, '../tariff/kraken-dispatches': adapter,
   '../tariff/effective-tariff': effectiveTariff,
 });
-const { default: HomeEnergyPlan } = load('src/components/HomeEnergyPlan.tsx', { 'react/jsx-runtime': jsxRuntime, './home-energy-plan-view': load('src/components/home-energy-plan-view.ts'), './use-dashboard-time': { useDashboardTime: value => value }, '../lib/presentation/local-time': load('src/lib/presentation/local-time.ts') });
+const { default: HomeEnergyPlan } = load('src/components/HomeEnergyPlan.tsx', { react, './selected-home-energy-plan': { selectedHomeEnergyPlan() { throw Error('Legacy default must not invoke preview'); } }, 'react/jsx-runtime': jsxRuntime, './home-energy-plan-view': load('src/components/home-energy-plan-view.ts'), './use-dashboard-time': { useDashboardTime: value => value }, '../lib/presentation/local-time': load('src/lib/presentation/local-time.ts') });
 const now = '2026-09-18T00:00:00.000Z';
 const at = hour => `2026-09-18T${String(hour).padStart(2, '0')}:00:00.000Z`;
 const price = amount => ({ amount, currency: 'GBP', unit: 'kWh' });
@@ -610,5 +611,5 @@ test('dashboard clock hydrates from server time then advances locally without an
   assert.equal(interval, 30000);
   tick(); stop(); assert.equal(cleanup, 123);
   const component = fs.readFileSync('src/components/HomeEnergyPlan.tsx', 'utf8');
-  assert.match(component, /homeEnergyPlanView\(signal, useDashboardTime\(signal.generatedAt\)\)/);
+  assert.match(component, /useDashboardTime\(plan.signal.generatedAt\)/);
 });
