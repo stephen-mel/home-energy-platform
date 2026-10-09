@@ -1,3 +1,6 @@
+import { parseDispatchResponse, requireCompleteDispatches, type DispatchResponse, type KrakenPlannedDispatch } from "./dispatch-response";
+export type { KrakenPlannedDispatch } from "./dispatch-response";
+
 const KRAKEN_GRAPHQL_URL =
   "https://api.eonnext-kraken.energy/v1/graphql/";
 
@@ -224,34 +227,31 @@ export async function getKrakenVehicleStatus(
 
   return device.status;
 }
-export type KrakenPlannedDispatch = {
-  start: string;
-  end: string;
-  type: string;
-  energyAddedKwh: string | null;
-};
+// Existing consumers receive an array only after a complete validated response.
+export async function getKrakenPlannedDispatches(deviceId: string): Promise<KrakenPlannedDispatch[]> {
+  return requireCompleteDispatches(await getKrakenPlannedDispatchResponse(deviceId));
+}
 
-export async function getKrakenPlannedDispatches(
-  deviceId: string
-): Promise<KrakenPlannedDispatch[]> {
-  const token = await getKrakenToken();
+export async function getKrakenPlannedDispatchResponse(deviceId: string): Promise<DispatchResponse & { deviceId: string }> {
+  try {
+    const token = await getKrakenToken();
 
-  const query = `
-    query {
-      flexPlannedDispatches(deviceId: ${JSON.stringify(deviceId)}) {
-        start
-        end
-        type
-        energyAddedKwh
+    const query = `
+      query {
+        flexPlannedDispatches(deviceId: ${JSON.stringify(deviceId)}) {
+          start
+          end
+          type
+          energyAddedKwh
+        }
       }
-    }
-  `;
+    `;
 
-  const data = await krakenGraphQL<{
-    flexPlannedDispatches: KrakenPlannedDispatch[];
-  }>(query, token);
-
-  return data.flexPlannedDispatches ?? [];
+    const data = await krakenGraphQL<unknown>(query, token);
+    return { ...parseDispatchResponse(data), deviceId };
+  } catch {
+    return { status: "failed", code: "DISPATCH_RETRIEVAL_FAILED", deviceId };
+  }
 }
 
 export type KrakenPreferenceSchedule = {

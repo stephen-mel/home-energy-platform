@@ -57,6 +57,8 @@ export type KrakenVehicleState = {
         }>;
     } | null;
 
+    // Complete-list compatibility projection. Failed/incomplete retrieval rejects
+    // the entire refresh; stale snapshots retain the original successful lists.
     plannedDispatches: KrakenPlannedDispatch[];
     status: KrakenVehicleStatus;
 };

@@ -1,4 +1,5 @@
 import "server-only";
+import { parseDispatchResponse, requireCompleteDispatches } from "../kraken/dispatch-response";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -55,9 +56,7 @@ const parseState = object<Omit<KrakenState, "stale">>({
             timeFrom: nullable(string), timeTo: nullable(string), timeStep: number,
             min: nullable(string), max: nullable(string), step: string,
         })) })),
-        plannedDispatches: array(object({
-            start: string, end: string, type: string, energyAddedKwh: nullable(string),
-        })),
+        plannedDispatches: input => requireCompleteDispatches(parseDispatchResponse({ flexPlannedDispatches: input })),
         status: object({
             currentState: nullable(string), isSuspended: nullable(boolean),
             stateOfCharge: nullable(object({ value: nullable(number) })),
@@ -71,7 +70,8 @@ export async function readLastKnownKrakenState(): Promise<KrakenState | null> {
         const raw = await readFile(cacheFile, "utf8");
         if (Buffer.byteLength(raw) > MAX_BYTES) return null;
         const envelope = JSON.parse(raw);
-        if (envelope?.version !== 1) return null;
+        // v1 could contain missing/null responses coerced to []; do not upgrade them.
+        if (envelope?.version !== 2) return null;
         return { ...parseState(envelope.state), stale: true };
     } catch {
         // Missing files, invalid data, permissions and disk failures are cache misses.
@@ -83,7 +83,7 @@ export async function writeLastKnownKrakenState(state: KrakenState): Promise<voi
     let temporary: string | undefined;
     try {
         if (state.stale) return;
-        const contents = JSON.stringify({ version: 1, state: parseState(state) });
+        const contents = JSON.stringify({ version: 2, state: parseState(state) });
         if (Buffer.byteLength(contents) > MAX_BYTES) return;
         await mkdir(dirname(cacheFile), { recursive: true, mode: 0o700 });
         temporary = `${cacheFile}.${randomUUID()}.tmp`;

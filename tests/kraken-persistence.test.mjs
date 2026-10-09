@@ -21,10 +21,14 @@ function load(file, dependencies, globals = {}) {
   });
   return exports;
 }
+const decimal = load('src/lib/tariff/economic-decimal.ts', {});
+const resolver = load('src/lib/tariff/resolve-economic-model.ts', { './economic-decimal': decimal });
+const dispatchResponse = load('src/lib/kraken/dispatch-response.ts', { '../tariff/resolve-economic-model': resolver });
 async function fixture(t, override = {}) {
   const root = await fs.mkdtemp(path.join(tmpdir(), 'kraken-cache-test-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const store = load('src/lib/site/kraken-state-store.ts', {
+    '../kraken/dispatch-response': dispatchResponse,
     'server-only': {}, 'node:fs/promises': { ...fs, ...override }, 'node:path': path, 'node:crypto': crypto,
   }, { process: { cwd: () => root } });
   return { store, root, file: path.join(root, '.cache/home-energy-platform/kraken-state.json') };
@@ -90,10 +94,10 @@ test('missing, corrupt, unsupported or invalid persisted data is a safe cache mi
   const badVehicle = state(); badVehicle.vehicles[0].status.isSuspended = 'false';
   const badSchedule = state(); badSchedule.vehicles[0].preferences.schedules[0].max = '80';
   const invalid = [
-    '{broken', 'null', '{}', JSON.stringify({ version: 2, state: state() }),
-    JSON.stringify({ version: 1, state: { ...state(), lastSuccessfulUpdate: 'yesterday' } }),
-    JSON.stringify({ version: 1, state: { ...state(), vehicles: [{}] } }),
-    JSON.stringify({ version: 1, state: badVehicle }), JSON.stringify({ version: 1, state: badSchedule }),
+    '{broken', 'null', '{}', JSON.stringify({ version: 3, state: state() }), JSON.stringify({ version: 1, state: state() }),
+    JSON.stringify({ version: 2, state: { ...state(), lastSuccessfulUpdate: 'yesterday' } }),
+    JSON.stringify({ version: 2, state: { ...state(), vehicles: [{}] } }),
+    JSON.stringify({ version: 2, state: badVehicle }), JSON.stringify({ version: 2, state: badSchedule }),
   ];
   for (const contents of invalid) {
     await fs.writeFile(file, contents);
@@ -145,4 +149,19 @@ test('disk write/rename/read failures do not hide live data or damage the previo
   });
   assert.equal(await failed.store.readLastKnownKrakenState(), null);
   await failed.store.writeLastKnownKrakenState(state());
+});
+
+ test('v2 cache rejects incomplete/malformed schedules and never upgrades v1 empty evidence', async t => {
+  const { store, file } = await fixture(t);const good=state();await store.writeLastKnownKrakenState(good);
+  const before=await fs.readFile(file,'utf8');assert.equal(JSON.parse(before).version,2);
+  for (const value of [null, undefined, [{...good.vehicles[0].plannedDispatches[0],start:'2026-02-30T01:00:00Z'}]]) {
+    const bad=state();bad.vehicles[0].plannedDispatches=value;await store.writeLastKnownKrakenState(bad);
+    assert.equal(await fs.readFile(file,'utf8'),before);
+    await fs.writeFile(file,JSON.stringify({version:2,state:bad}));assert.equal(await store.readLastKnownKrakenState(),null);
+    await fs.writeFile(file,before);
+  }
+  const empty=state();empty.vehicles[0].plannedDispatches=[];
+  await fs.writeFile(file,JSON.stringify({version:1,state:empty}));assert.equal(await store.readLastKnownKrakenState(),null);
+  await store.writeLastKnownKrakenState(empty);const recovered=await store.readLastKnownKrakenState();
+  assert.equal(recovered.stale,true);assert.equal(recovered.lastSuccessfulUpdate,empty.lastSuccessfulUpdate);assert.equal(recovered.vehicles[0].plannedDispatches.length,0);
 });
