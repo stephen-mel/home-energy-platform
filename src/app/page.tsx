@@ -1,6 +1,7 @@
 import EnergyOptimisation from "../components/EnergyOptimisation";
 import VehicleActivity from "../components/VehicleActivity";
-import { formatLocalTime, formatLocalDateTime } from "../lib/presentation/local-time";
+import KrakenPlannedSessions from "../components/KrakenPlannedSessions";
+import { formatLocalDateTime } from "../lib/presentation/local-time";
 import HomeEnergyPlan from "../components/HomeEnergyPlan";
 import { getSitePriceSignal } from "../lib/site/get-site-price-signal";
 import LiveHomeEnergy from "../components/LiveHomeEnergy";
@@ -72,6 +73,7 @@ export default async function Home() {
           <p className="mb-6 text-sm text-zinc-400">Vehicle data is currently unavailable.</p>
         )}
 
+        {vehicles.length === 0 && <KrakenPlannedSessions vehicle={null} snapshot={kraken} asOf={siteState.updatedAt} timeZone="Europe/London" />}
         <div className="grid gap-6 md:grid-cols-2">
           {vehicles.map((vehicle) => {
             const soc = Number(vehicle.status.stateOfCharge?.value ?? 0);
@@ -100,17 +102,6 @@ export default async function Home() {
               ? Number(scheduleSetting.step)
               : null;
 
-            const plannedDispatches = vehicle.plannedDispatches ?? [];
-
-            const plannedEnergy = plannedDispatches.reduce(
-              (total, dispatch) =>
-                total + Math.abs(Number(dispatch.energyAddedKwh ?? 0)),
-              0
-            );
-
-            const firstDispatch = plannedDispatches[0] ?? null;
-            const lastDispatch =
-              plannedDispatches[plannedDispatches.length - 1] ?? null;
             return (
               <section
                 key={vehicle.id}
@@ -222,49 +213,7 @@ export default async function Home() {
                     <VehicleActivity vehicle={vehicle} asOf={siteState.updatedAt} />
                   </div>
                 </div>
-                <div className="mt-6 border-t border-zinc-800 pt-6">
-                  <p className="text-xs uppercase tracking-wide text-zinc-500">
-                    Kraken Plan
-                  </p>
-
-                  {firstDispatch && lastDispatch ? (
-                    <div className="mt-3">
-                      <p className="text-lg font-medium">
-                        {plannedEnergy.toFixed(2)} kWh planned
-                      </p>
-
-                      <div className="mt-3 space-y-2">
-                        {plannedDispatches.map((dispatch, index) => {
-                          const start = formatLocalTime(dispatch.start, "Europe/London");
-                          const end = formatLocalTime(dispatch.end, "Europe/London");
-
-                          const energy = Math.abs(
-                            Number(dispatch.energyAddedKwh ?? 0)
-                          );
-
-                          return (
-                            <div
-                              key={`${dispatch.start}-${index}`}
-                              className="flex items-center justify-between text-sm"
-                            >
-                              <span className="text-zinc-400">
-                                {start} → {end}
-                              </span>
-
-                              <span className="font-medium">
-                                {energy.toFixed(2)} kWh
-                              </span>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  ) : (
-                    <p className="mt-3 text-sm text-zinc-400">
-                      No charging plan currently available
-                    </p>
-                  )}
-                </div>
+                <KrakenPlannedSessions vehicle={vehicle} snapshot={kraken} asOf={siteState.updatedAt} timeZone="Europe/London" />
               </section>
             );
           })}
