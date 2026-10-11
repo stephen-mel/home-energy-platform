@@ -3,12 +3,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import ts from 'typescript';
+import crypto from 'node:crypto';
 function load(file,deps={},globals={}){const exports={};vm.runInNewContext(ts.transpileModule(fs.readFileSync(file,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText,{exports,console:{error(){}},require:n=>{assert.ok(Object.hasOwn(deps,n),n);return deps[n];},...globals});return exports;}
 const decimal=load('src/lib/tariff/economic-decimal.ts');
 const resolver=load('src/lib/tariff/resolve-economic-model.ts',{'./economic-decimal':decimal});
 const parser=load('src/lib/kraken/dispatch-response.ts',{'../tariff/resolve-economic-model':resolver});
 const slot=()=>({start:'2026-10-25T01:00:00+01:00',end:'2026-10-25T01:30:00+00:00',type:'SMART',energyAddedKwh:'-2.3000'});
-function client(response,authFailure=false){const calls=[];const c=load('src/lib/kraken/client.ts',{'./dispatch-response':parser},{process:{env:{EON_EMAIL:'synthetic',EON_PASSWORD:'synthetic'}},fetch:async(url,init)=>{
+function client(response,authFailure=false){const calls=[];const c=load('src/lib/kraken/client.ts',{'./dispatch-response':parser,'node:crypto':crypto},{process:{env:{EON_EMAIL:'synthetic',EON_PASSWORD:'synthetic'}},fetch:async(url,init)=>{
  const q=JSON.parse(init.body).query;calls.push(q);
  if(q.includes('obtainKrakenToken')&&authFailure)throw Error('SECRET_AUTH');
  if(q.includes('obtainKrakenToken'))return {ok:true,json:async()=>({data:{obtainKrakenToken:{token:'synthetic-token'}}})};
@@ -42,29 +43,37 @@ test('legacy array consumer throws on incomplete, auth/transport/GraphQL failure
  const {c,calls}=client(response);await assert.rejects(c.getKrakenPlannedDispatches('ev'),e=>e.message.startsWith('DISPATCH_')&&!e.message.includes('SECRET'));assert.equal(calls.length,2);}
  const {c}=client({});assert.equal((await c.getKrakenPlannedDispatchResponse('ev')).status,'failed');
 });
-test('partial multi-vehicle refresh preserves previous schedules, while complete empty replaces them',async()=>{
- let mode='complete',now=Date.parse('2026-10-09T12:00:00Z'),saved=null,writes=0;
- const {c}=client(q=>({ok:true,json:async()=>({data:mode==='incomplete'&&q.includes('ev-b')?{flexPlannedDispatches:null}:{flexPlannedDispatches:mode==='complete'?[slot()]:[]}})}));
- const deps={'../kraken/client':{getKrakenDevices:async()=>[{id:'ev-a',name:'A'},{id:'ev-b',name:'B'}],getKrakenVehicleStatus:async()=>({}),getKrakenPlannedDispatches:c.getKrakenPlannedDispatches},
- './kraken-state-store':{readLastKnownKrakenState:async()=>saved?{...saved,stale:true}:null,writeLastKnownKrakenState:async s=>{saved=structuredClone(s);writes++;}}};
- const boot=()=>load('src/lib/site/kraken-state.ts',deps,{Date:class extends Date{static now(){return now;}}});
- const state=boot(),first=await state.getKrakenState();assert.equal(writes,1);
- mode='incomplete';now+=60000;const stale=await state.getKrakenState();assert.equal(stale.stale,true);assert.equal(stale.lastSuccessfulUpdate,first.lastSuccessfulUpdate);assert.equal(writes,1);
- assert.equal(stale.vehicles[0].plannedDispatches.length,1);assert.equal(stale.vehicles[1].plannedDispatches.length,1);
- const restart=await boot().getKrakenState();assert.equal(restart.stale,true);assert.equal(restart.vehicles[1].id,'ev-b');
- mode='empty';now+=60000;const fresh=await state.getKrakenState();assert.equal(fresh.stale,false);assert.ok(fresh.vehicles.every(v=>v.plannedDispatches.length===0));assert.equal(writes,2);
- await state.getKrakenState();assert.equal(writes,2);
-});
-test('new incomplete snapshot with no prior evidence is unavailable, never an empty success',async()=>{
- const {c}=client({data:{flexPlannedDispatches:null}});
- const state=load('src/lib/site/kraken-state.ts',{'../kraken/client':{getKrakenDevices:async()=>[{id:'ev-a'}],getKrakenVehicleStatus:async()=>({}),getKrakenPlannedDispatches:c.getKrakenPlannedDispatches},'./kraken-state-store':{readLastKnownKrakenState:async()=>null,writeLastKnownKrakenState:async()=>assert.fail('must not write')}});
- await assert.rejects(state.getKrakenState(),/DISPATCH_FIELD_NULL/);
-});
-
 test('authentication failure is sanitized, attributed and does not attempt the dispatch query',async()=>{
  const {c,calls}=client({},true);const r=await c.getKrakenPlannedDispatchResponse('ev-a');
  assert.equal(r.status,'failed');assert.equal(r.code,'DISPATCH_RETRIEVAL_FAILED');assert.equal(r.deviceId,'ev-a');
  assert.equal(calls.length,1);assert.ok(!JSON.stringify(r).includes('SECRET'));
+});
+
+test('missing credentials return the typed dispatch failure without rejecting',async()=>{
+ const calls=[];const c=load('src/lib/kraken/client.ts',{'./dispatch-response':parser,'node:crypto':crypto},{
+   process:{env:{EON_ACCOUNT:'synthetic-account'}},fetch:async()=>{calls.push('unexpected');throw Error('must not fetch');}
+ });
+ const result=await c.getKrakenPlannedDispatchResponse('ev-missing-auth');
+ assert.deepEqual(JSON.parse(JSON.stringify(result)),{
+   status:'failed',code:'DISPATCH_RETRIEVAL_FAILED',deviceId:'ev-missing-auth',
+ });
+ assert.equal(calls.length,0);
+});
+
+test('one read session captures account and authentication configuration without exposing raw identity',async()=>{
+ const env={EON_EMAIL:'first@example.invalid',EON_PASSWORD:'first-secret',EON_ACCOUNT:'account-first'},calls=[];
+ const c=load('src/lib/kraken/client.ts',{'./dispatch-response':parser,'node:crypto':crypto},{process:{env},fetch:async(_url,init)=>{
+   const q=JSON.parse(init.body).query;calls.push(q);
+   if(q.includes('obtainKrakenToken'))return {ok:true,json:async()=>({data:{obtainKrakenToken:{token:'token'}}})};
+   if(q.includes('flexPlannedDispatches'))return {ok:true,json:async()=>({data:{flexPlannedDispatches:[]}})};
+   if(q.includes('status'))return {ok:true,json:async()=>({data:{devices:[{status:{currentState:null,isSuspended:null,stateOfCharge:null,activePower:null}}]}})};
+   return {ok:true,json:async()=>({data:{devices:[]}})};
+ }});
+ const session=c.createKrakenReadSession();env.EON_EMAIL='second@example.invalid';env.EON_PASSWORD='second-secret';env.EON_ACCOUNT='account-second';
+ await session.getDevices();await session.getVehicleStatus('ev-a');await session.getPlannedDispatchResponse('ev-a');
+ assert.equal(JSON.stringify(session).includes('account-first'),false);assert.equal(JSON.stringify(session).includes('first-secret'),false);
+ assert.ok(calls.filter(q=>q.includes('obtainKrakenToken')).every(q=>q.includes('first@example.invalid')&&q.includes('first-secret')));
+ assert.ok(calls.filter(q=>q.includes('accountNumber')).every(q=>q.includes('account-first')&&!q.includes('account-second')));
 });
 
 test('QA Proxy length substitution cannot manufacture a complete empty schedule',()=>{

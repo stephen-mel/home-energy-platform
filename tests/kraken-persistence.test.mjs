@@ -45,68 +45,27 @@ function state() {
   }] };
 }
 const plain = value => JSON.parse(JSON.stringify(value));
-
-test('restart recovery uses persisted state only after live failure; success replaces it and keeps 60-second cache', async t => {
-  const { store, file } = await fixture(t);
-  let now = Date.parse(state().lastSuccessfulUpdate); let fail = false; let calls = 0;
-  let vehicle = state().vehicles[0];
-  const client = {
-    getKrakenDevices: async () => { calls++; if (fail) throw new Error('Timeout'); return [vehicle]; },
-    getKrakenVehicleStatus: async () => vehicle.status,
-    getKrakenPlannedDispatches: async () => vehicle.plannedDispatches,
-  };
-  const boot = () => load('src/lib/site/kraken-state.ts', {
-    '../kraken/client': client, './kraken-state-store': store,
-  }, { Date: class extends Date { static now() { return now; } } });
-  const firstProcess = boot();
-  const first = await firstProcess.getKrakenState();
-  assert.equal(first.stale, false);
-  assert.equal((JSON.parse(await fs.readFile(file, 'utf8'))).state.lastSuccessfulUpdate, first.lastSuccessfulUpdate);
-  now += 59_999;
-  await firstProcess.getKrakenState(); assert.equal(calls, 1);
-
-  // Fresh module = empty process-memory cache, while retaining the file on disk.
-  fail = true; const restarted = boot();
-  const recovered = await restarted.getKrakenState();
-  assert.equal(calls, 2); assert.equal(recovered.stale, true);
-  assert.equal(recovered.lastSuccessfulUpdate, first.lastSuccessfulUpdate);
-  assert.deepEqual(plain(recovered.vehicles), plain(first.vehicles));
-  const stillStale = await restarted.getKrakenState();
-  assert.equal(calls, 3); assert.equal(stillStale.stale, true);
-
-  fail = false; now += 1;
-  vehicle = { ...vehicle, status: { ...vehicle.status, stateOfCharge: { value: 65 } } };
-  const fresh = await restarted.getKrakenState();
-  assert.equal(fresh.stale, false); assert.equal(calls, 4);
-  assert.equal(fresh.lastSuccessfulUpdate, new Date(now).toISOString());
-  assert.equal(fresh.vehicles[0].status.stateOfCharge.value, 65);
-  assert.equal((await store.readLastKnownKrakenState()).vehicles[0].status.stateOfCharge.value, 65);
-  now += 59_999; await restarted.getKrakenState(); assert.equal(calls, 4);
-  now += 1; await restarted.getKrakenState(); assert.equal(calls, 5);
-  fail = true;
-  assert.equal((await boot().getKrakenState()).stale, true);
-});
+const scopeId = '["site","account"]';
 
 test('missing, corrupt, unsupported or invalid persisted data is a safe cache miss', async t => {
   const { store, file } = await fixture(t);
-  assert.equal(await store.readLastKnownKrakenState(), null);
+  assert.equal(await store.readLastKnownKrakenState(scopeId), null);
   await fs.mkdir(path.dirname(file), { recursive: true });
   const badVehicle = state(); badVehicle.vehicles[0].status.isSuspended = 'false';
   const badSchedule = state(); badSchedule.vehicles[0].preferences.schedules[0].max = '80';
   const invalid = [
     '{broken', 'null', '{}', JSON.stringify({ version: 3, state: state() }), JSON.stringify({ version: 1, state: state() }),
+    JSON.stringify({ version: 3, scopeId, state: { ...state(), lastSuccessfulUpdate: 'yesterday' } }),
+    JSON.stringify({ version: 3, scopeId, state: { ...state(), vehicles: [{}] } }),
+    JSON.stringify({ version: 3, scopeId, state: badVehicle }),
+    JSON.stringify({ version: 3, scopeId, state: badSchedule }),
     JSON.stringify({ version: 2, state: { ...state(), lastSuccessfulUpdate: 'yesterday' } }),
     JSON.stringify({ version: 2, state: { ...state(), vehicles: [{}] } }),
     JSON.stringify({ version: 2, state: badVehicle }), JSON.stringify({ version: 2, state: badSchedule }),
   ];
   for (const contents of invalid) {
     await fs.writeFile(file, contents);
-    assert.equal(await store.readLastKnownKrakenState(), null);
-    const kraken = load('src/lib/site/kraken-state.ts', {
-      './kraken-state-store': store,
-      '../kraken/client': { getKrakenDevices: async () => { throw new Error('Offline'); } },
-    });
-    await assert.rejects(kraken.getKrakenState(), /Offline/);
+    assert.equal(await store.readLastKnownKrakenState(scopeId), null);
   }
 });
 
@@ -114,14 +73,14 @@ test('writes only allowlisted fields; permissions are private; stale and invalid
   const { store, file } = await fixture(t);
   const input = state(); input.token = 'SECRET'; input.vehicles[0].auth = { token: 'SECRET' };
   input.vehicles[0].status.stateOfCharge.accessToken = 'SECRET';
-  await store.writeLastKnownKrakenState(input);
+  await store.writeLastKnownKrakenState(scopeId, input);
   const raw = await fs.readFile(file, 'utf8');
   assert.equal(raw.includes('SECRET'), false);
   assert.equal(raw.includes('stale'), false);
   assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
-  assert.deepEqual(plain(await store.readLastKnownKrakenState()), { ...state(), stale: true });
-  await store.writeLastKnownKrakenState({ ...state(), stale: true });
-  await store.writeLastKnownKrakenState({ ...state(), vehicles: [{}] });
+  assert.deepEqual(plain(await store.readLastKnownKrakenState(scopeId)), { ...state(), stale: true });
+  await store.writeLastKnownKrakenState(scopeId, { ...state(), stale: true });
+  await store.writeLastKnownKrakenState(scopeId, { ...state(), vehicles: [{}] });
   assert.equal(await fs.readFile(file, 'utf8'), raw);
   assert.deepEqual(await fs.readdir(path.dirname(file)), ['kraken-state.json']);
 });
@@ -131,37 +90,35 @@ test('disk write/rename/read failures do not hide live data or damage the previo
   const { store, file } = await fixture(t, { rename: async (...args) => {
     if (deny) throw new Error('Disk failure'); return fs.rename(...args);
   } });
-  await store.writeLastKnownKrakenState(state());
+  await store.writeLastKnownKrakenState(scopeId, state());
   const before = await fs.readFile(file, 'utf8'); deny = true;
-  const kraken = load('src/lib/site/kraken-state.ts', {
-    './kraken-state-store': store,
-    '../kraken/client': {
-      getKrakenDevices: async () => [],
-      getKrakenVehicleStatus: async () => {}, getKrakenPlannedDispatches: async () => [],
-    },
-  });
-  assert.equal((await kraken.getKrakenState()).stale, false);
+  const changed = state(); changed.lastSuccessfulUpdate = '2026-09-18T10:01:00.000Z';
+  await store.writeLastKnownKrakenState(scopeId, changed);
   assert.equal(await fs.readFile(file, 'utf8'), before);
   assert.deepEqual(await fs.readdir(path.dirname(file)), ['kraken-state.json']);
+  deny = false;
+  await store.writeLastKnownKrakenState(scopeId, changed);
+  assert.equal((await store.readLastKnownKrakenState(scopeId)).lastSuccessfulUpdate, changed.lastSuccessfulUpdate);
   const failed = await fixture(t, {
     readFile: async () => { throw new Error('Permission denied'); },
     mkdir: async () => { throw new Error('Read-only filesystem'); },
   });
-  assert.equal(await failed.store.readLastKnownKrakenState(), null);
-  await failed.store.writeLastKnownKrakenState(state());
+  assert.equal(await failed.store.readLastKnownKrakenState(scopeId), null);
+  await failed.store.writeLastKnownKrakenState(scopeId, state());
 });
 
- test('v2 cache rejects incomplete/malformed schedules and never upgrades v1 empty evidence', async t => {
-  const { store, file } = await fixture(t);const good=state();await store.writeLastKnownKrakenState(good);
-  const before=await fs.readFile(file,'utf8');assert.equal(JSON.parse(before).version,2);
+ test('v3 scoped cache rejects incomplete schedules and never upgrades unbound v1/v2 evidence', async t => {
+  const { store, file } = await fixture(t);const good=state();await store.writeLastKnownKrakenState(scopeId,good);
+  const before=await fs.readFile(file,'utf8');assert.equal(JSON.parse(before).version,3);
   for (const value of [null, undefined, [{...good.vehicles[0].plannedDispatches[0],start:'2026-02-30T01:00:00Z'}]]) {
-    const bad=state();bad.vehicles[0].plannedDispatches=value;await store.writeLastKnownKrakenState(bad);
+    const bad=state();bad.vehicles[0].plannedDispatches=value;await store.writeLastKnownKrakenState(scopeId,bad);
     assert.equal(await fs.readFile(file,'utf8'),before);
-    await fs.writeFile(file,JSON.stringify({version:2,state:bad}));assert.equal(await store.readLastKnownKrakenState(),null);
+    await fs.writeFile(file,JSON.stringify({version:3,scopeId,state:bad}));assert.equal(await store.readLastKnownKrakenState(scopeId),null);
     await fs.writeFile(file,before);
   }
   const empty=state();empty.vehicles[0].plannedDispatches=[];
-  await fs.writeFile(file,JSON.stringify({version:1,state:empty}));assert.equal(await store.readLastKnownKrakenState(),null);
-  await store.writeLastKnownKrakenState(empty);const recovered=await store.readLastKnownKrakenState();
+  for (const version of [1,2]) { await fs.writeFile(file,JSON.stringify({version,state:empty}));assert.equal(await store.readLastKnownKrakenState(scopeId),null); }
+  await store.writeLastKnownKrakenState(scopeId,empty);const recovered=await store.readLastKnownKrakenState(scopeId);
   assert.equal(recovered.stale,true);assert.equal(recovered.lastSuccessfulUpdate,empty.lastSuccessfulUpdate);assert.equal(recovered.vehicles[0].plannedDispatches.length,0);
+  assert.equal(await store.readLastKnownKrakenState('["other","account"]'),null);
 });

@@ -24,6 +24,7 @@ const boolean: Parser<boolean> = input => {
     return input;
 };
 const nullable = <T>(parse: Parser<T>): Parser<T | null> => input => input === null ? null : parse(input);
+const optional = <T>(parse: Parser<T>): Parser<T | undefined> => input => input === undefined ? undefined : parse(input);
 const array = <T>(parse: Parser<T>): Parser<T[]> => input => {
     if (!Array.isArray(input)) throw new Error("Invalid array");
     return input.map(parse);
@@ -43,8 +44,19 @@ const timestamp: Parser<string> = input => {
     }
     return value;
 };
+const recordingStatus: Parser<NonNullable<KrakenState["scheduleRecording"]>["status"]> = input => {
+    if (!["persisted", "already-recorded", "rejected", "busy", "invalid", "store-failed", "indeterminate"].includes(input as string)) {
+        throw new Error("Invalid recording status");
+    }
+    return input as NonNullable<KrakenState["scheduleRecording"]>["status"];
+};
+const recordingChange: Parser<NonNullable<KrakenState["scheduleRecording"]>["change"]> = input => {
+    if (!(input === null || input === "initial" || input === "unchanged" || input === "changed")) throw new Error("Invalid recording change");
+    return input;
+};
 const parseState = object<Omit<KrakenState, "stale">>({
     lastSuccessfulUpdate: timestamp,
+    scheduleRecording: optional(object({ status: recordingStatus, change: recordingChange, code: nullable(string) })),
     vehicles: array(object({
         id: string, name: string, deviceType: string, provider: string,
         vehicleBatterySize: nullable(string), chargePointPowerOutput: nullable(string),
@@ -65,13 +77,13 @@ const parseState = object<Omit<KrakenState, "stale">>({
     })),
 });
 
-export async function readLastKnownKrakenState(): Promise<KrakenState | null> {
+export async function readLastKnownKrakenState(scopeId: string): Promise<KrakenState | null> {
     try {
         const raw = await readFile(cacheFile, "utf8");
         if (Buffer.byteLength(raw) > MAX_BYTES) return null;
         const envelope = JSON.parse(raw);
-        // v1 could contain missing/null responses coerced to []; do not upgrade them.
-        if (envelope?.version !== 2) return null;
+        // Earlier files are not scope-bound and cannot safely cross an account change.
+        if (envelope?.version !== 3 || envelope.scopeId !== scopeId) return null;
         return { ...parseState(envelope.state), stale: true };
     } catch {
         // Missing files, invalid data, permissions and disk failures are cache misses.
@@ -79,11 +91,12 @@ export async function readLastKnownKrakenState(): Promise<KrakenState | null> {
     }
 }
 
-export async function writeLastKnownKrakenState(state: KrakenState): Promise<void> {
+export async function writeLastKnownKrakenState(scopeId: string, state: KrakenState): Promise<void> {
     let temporary: string | undefined;
     try {
         if (state.stale) return;
-        const contents = JSON.stringify({ version: 2, state: parseState(state) });
+        if (typeof scopeId !== "string" || !scopeId) return;
+        const contents = JSON.stringify({ version: 3, scopeId, state: parseState(state) });
         if (Buffer.byteLength(contents) > MAX_BYTES) return;
         await mkdir(dirname(cacheFile), { recursive: true, mode: 0o700 });
         temporary = `${cacheFile}.${randomUUID()}.tmp`;

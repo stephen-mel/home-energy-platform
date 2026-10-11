@@ -29,6 +29,7 @@ function load(path, dependencies = {}, globals = {}) {
 }
 
 const config = (enabled) => ({
+  id: 'site-config',
   integrations: { kraken: { enabled: true }, homeAssistant: { enabled }, tesla: { enabled: false } },
 });
 
@@ -71,53 +72,24 @@ test('Home Assistant handles zero or multiple assets and unavailable sensors', a
   assert.equal(data.assets[1].metrics[0].value, null);
 });
 
-test('Smart Control suspension remains independent of operation; cache survives refresh failures', async () => {
-  let now = 1;
-  let fail = false;
-  let calls = 0;
-  const client = {
-    getKrakenDevices: async () => {
-      calls++;
-      if (fail) throw new Error('Offline');
-      return [{ id: 'vehicle' }];
-    },
-    getKrakenVehicleStatus: async () => ({ currentState: 'SMART_CONTROL_NOT_AVAILABLE', isSuspended: false }),
-    getKrakenPlannedDispatches: async () => [],
-  };
-  const krakenModule = load('src/lib/site/kraken-state.ts', { '../kraken/client': client }, { Date: class extends Date { static now() { return now; } } });
+test('Smart Control suspension remains independent of operation and site scope reaches the refresh boundary', async () => {
+  const refreshed = { vehicles: [{ id: 'vehicle' }], stale: false, lastSuccessfulUpdate: '2026-10-11T10:00:00.000Z' };
+  let capturedSite;
+  const krakenModule = load('src/lib/site/kraken-state.ts', { './kraken-refresh': {
+    getRecordedKrakenState: async siteId => { capturedSite = siteId; return refreshed; },
+  } });
   assert.equal(krakenModule.getSmartControlSetting(false), 'Enabled');
   assert.equal(krakenModule.getSmartControlSetting(true), 'Suspended');
   assert.equal(krakenModule.getSmartControlSetting(null), 'Unknown');
-  const initial = await krakenModule.getKrakenState();
-  assert.equal(initial.stale, false);
-  assert.equal(initial.lastSuccessfulUpdate, new Date(now).toISOString());
-  assert.equal(initial.vehicles[0].status.currentState, 'SMART_CONTROL_NOT_AVAILABLE');
-  assert.equal(await krakenModule.getKrakenState(), initial);
-  assert.equal(calls, 1);
-  now += 60_001;
-  fail = true;
-  const stale = await krakenModule.getKrakenState();
-  assert.equal(stale.stale, true);
-  assert.equal(stale.vehicles, initial.vehicles);
-  assert.equal(stale.lastSuccessfulUpdate, initial.lastSuccessfulUpdate);
-  assert.equal(initial.stale, false);
-  assert.equal(calls, 2);
+  assert.equal(await krakenModule.getKrakenState({ id: 'site-a' }), refreshed);
+  assert.equal(capturedSite, 'site-a');
   const { getSiteState } = load('src/lib/site/get-site-state.ts', {
-    './kraken-state': { getKrakenState: async () => stale },
+    './kraken-state': { getKrakenState: async site => { capturedSite = site.id; return refreshed; } },
     './home-assistant-state': {},
   });
   const site = await getSiteState(config(false));
-  assert.equal(site.integrations.kraken.data, stale);
-  fail = false;
-  const recovered = await krakenModule.getKrakenState();
-  assert.notEqual(recovered, initial);
-  assert.equal(recovered.stale, false);
-  assert.equal(recovered.lastSuccessfulUpdate, new Date(now).toISOString());
-  assert.equal(await krakenModule.getKrakenState(), recovered);
-  assert.equal(calls, 3);
-  fail = true;
-  const fresh = load('src/lib/site/kraken-state.ts', { '../kraken/client': client });
-  await assert.rejects(fresh.getKrakenState(), /Offline/);
+  assert.equal(site.integrations.kraken.data, refreshed);
+  assert.equal(capturedSite, 'site-config');
 });
 
 

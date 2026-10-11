@@ -1,4 +1,5 @@
 import { parseDispatchResponse, requireCompleteDispatches, type DispatchResponse, type KrakenPlannedDispatch } from "./dispatch-response";
+import { createHash } from "node:crypto";
 export type { KrakenPlannedDispatch } from "./dispatch-response";
 
 const KRAKEN_GRAPHQL_URL =
@@ -48,12 +49,39 @@ async function krakenGraphQL<T>(
 }
 
 export async function getKrakenToken(): Promise<string> {
+  return obtainKrakenToken(captureKrakenAuthentication());
+}
+
+type KrakenAuthentication = { email: string; password: string };
+type KrakenReadConfiguration = KrakenAuthentication & { accountNumber: string; accountRef: string };
+
+function captureKrakenAuthentication(): KrakenAuthentication {
   const email = process.env.EON_EMAIL;
   const password = process.env.EON_PASSWORD;
 
   if (!email || !password) {
     throw new Error("E.ON credentials are not configured");
   }
+  return { email, password };
+}
+
+function captureKrakenAccount(): Pick<KrakenReadConfiguration, "accountNumber" | "accountRef"> {
+  const accountNumber = process.env.EON_ACCOUNT;
+  if (!accountNumber) throw new Error("E.ON account number is not configured");
+  return { accountNumber,
+    accountRef: createHash("sha256").update(`eon-account\0${accountNumber}`).digest("hex") };
+}
+
+/** Stable, opaque schedule scope identity which does not require credentials. */
+export function getKrakenAccountReference(): string {
+  return captureKrakenAccount().accountRef;
+}
+
+function captureKrakenReadConfiguration(): KrakenReadConfiguration {
+  return { ...captureKrakenAccount(), ...captureKrakenAuthentication() };
+}
+
+async function obtainKrakenToken({ email, password }: KrakenAuthentication): Promise<string> {
   const query = `
   mutation {
     obtainKrakenToken(
@@ -104,14 +132,9 @@ export type KrakenDevice = {
   } | null;
 };
 
-export async function getKrakenDevices(): Promise<KrakenDevice[]> {
-  const token = await getKrakenToken();
-
-  const accountNumber = process.env.EON_ACCOUNT;
-
-  if (!accountNumber) {
-    throw new Error("E.ON account number is not configured");
-  }
+async function getKrakenDevicesFor(configuration: KrakenReadConfiguration): Promise<KrakenDevice[]> {
+  const token = await obtainKrakenToken(configuration);
+  const { accountNumber } = configuration;
 
   const query = `
   query {
@@ -163,6 +186,10 @@ export async function getKrakenDevices(): Promise<KrakenDevice[]> {
   return data.devices;
 }
 
+export async function getKrakenDevices(): Promise<KrakenDevice[]> {
+  return getKrakenDevicesFor(captureKrakenReadConfiguration());
+}
+
 export type KrakenVehicleStatus = {
   currentState: string | null;
   isSuspended: boolean | null;
@@ -177,16 +204,11 @@ export type KrakenVehicleStatus = {
   } | null;
 };
 
-export async function getKrakenVehicleStatus(
-  deviceId: string
+async function getKrakenVehicleStatusFor(
+  deviceId: string, configuration: KrakenReadConfiguration
 ): Promise<KrakenVehicleStatus> {
-  const token = await getKrakenToken();
-
-  const accountNumber = process.env.EON_ACCOUNT;
-
-  if (!accountNumber) {
-    throw new Error("E.ON account number is not configured");
-  }
+  const token = await obtainKrakenToken(configuration);
+  const { accountNumber } = configuration;
 
   const query = `
   query {
@@ -227,6 +249,10 @@ export async function getKrakenVehicleStatus(
 
   return device.status;
 }
+
+export async function getKrakenVehicleStatus(deviceId: string): Promise<KrakenVehicleStatus> {
+  return getKrakenVehicleStatusFor(deviceId, captureKrakenReadConfiguration());
+}
 // Existing consumers receive an array only after a complete validated response.
 export async function getKrakenPlannedDispatches(deviceId: string): Promise<KrakenPlannedDispatch[]> {
   return requireCompleteDispatches(await getKrakenPlannedDispatchResponse(deviceId));
@@ -234,7 +260,17 @@ export async function getKrakenPlannedDispatches(deviceId: string): Promise<Krak
 
 export async function getKrakenPlannedDispatchResponse(deviceId: string): Promise<DispatchResponse & { deviceId: string }> {
   try {
-    const token = await getKrakenToken();
+    return await getKrakenPlannedDispatchResponseFor(deviceId, captureKrakenAuthentication());
+  } catch {
+    return { status: "failed", code: "DISPATCH_RETRIEVAL_FAILED", deviceId };
+  }
+}
+
+async function getKrakenPlannedDispatchResponseFor(
+  deviceId: string, authentication: KrakenAuthentication
+): Promise<DispatchResponse & { deviceId: string }> {
+  try {
+    const token = await obtainKrakenToken(authentication);
 
     const query = `
       query {
@@ -252,6 +288,19 @@ export async function getKrakenPlannedDispatchResponse(deviceId: string): Promis
   } catch {
     return { status: "failed", code: "DISPATCH_RETRIEVAL_FAILED", deviceId };
   }
+}
+
+/** One captured account/authentication context for a complete schedule refresh.
+ * Raw account identity and credentials remain closed over and are never returned. */
+export function createKrakenReadSession() {
+  const configuration = captureKrakenReadConfiguration();
+  return Object.freeze({
+    accountRef: configuration.accountRef,
+    getDevices: () => getKrakenDevicesFor(configuration),
+    getVehicleStatus: (deviceId: string) => getKrakenVehicleStatusFor(deviceId, configuration),
+    getPlannedDispatchResponse: (deviceId: string) =>
+      getKrakenPlannedDispatchResponseFor(deviceId, configuration),
+  });
 }
 
 export type KrakenPreferenceSchedule = {

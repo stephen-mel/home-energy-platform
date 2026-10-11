@@ -27,7 +27,7 @@ export async function getSiteState(
 ): Promise<SiteState> {
 
     const [kraken, homeAssistant] = await Promise.all([
-        loadIntegration(site.integrations.kraken.enabled, getKrakenState),
+        loadIntegration(site.integrations.kraken.enabled, () => getKrakenState(site)),
         loadIntegration(site.integrations.homeAssistant.enabled, () =>
             getHomeAssistantSiteState(site.integrations.homeAssistant)),
     ]);
