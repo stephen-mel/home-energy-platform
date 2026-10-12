@@ -44,6 +44,16 @@ function state() {
       stateOfCharge: { value: 42 }, activePower: { value: 0 } },
   }] };
 }
+function tariff() {
+  return { status:'available',accountRef:'account',observedAt:'2026-09-18T10:00:00.000Z',exportStatus:'unknown',
+    agreement:{validFrom:'2026-01-17T00:00:00.000Z',validTo:'2027-01-17T00:00:00.000Z',
+      productCode:'NEXT_DRIVE_SMART_V5_2',tariffCode:'E-TOU-NEXT_DRIVE_SMART_V5_2-G',meterPointRef:'meter-a'},
+    version:{id:'next_drive_smart_v5_2',name:'Next Drive Smart V5.2',provider:'eon-next-kraken',
+      effectiveFrom:'2026-09-18T00:00:00.000Z',effectiveTo:'2026-09-19T00:00:00.000Z',pricesIncludeVat:true,
+      normalImport:{amount:0.23978,currency:'GBP',unit:'kWh'},export:null,
+      scheduledChargingImport:{amount:0.0285,currency:'GBP',unit:'kWh'},standingCharge:null,
+      dailyImportWindows:[{start:'00:00',end:'06:00',kind:'guaranteed-off-peak',price:{amount:0.0285,currency:'GBP',unit:'kWh'}}]}};
+}
 const plain = value => JSON.parse(JSON.stringify(value));
 const scopeId = '["site","account"]';
 
@@ -83,6 +93,14 @@ test('writes only allowlisted fields; permissions are private; stale and invalid
   await store.writeLastKnownKrakenState(scopeId, { ...state(), vehicles: [{}] });
   assert.equal(await fs.readFile(file, 'utf8'), raw);
   assert.deepEqual(await fs.readdir(path.dirname(file)), ['kraken-state.json']);
+});
+
+test('canonical tariff evidence and vehicle data round-trip together', async t => {
+  const {store}=await fixture(t);const input={...state(),importTariff:tariff()};
+  await store.writeLastKnownKrakenState(scopeId,input);
+  const recovered=await store.readLastKnownKrakenState(scopeId);
+  assert.equal(recovered.stale,true);assert.deepEqual(plain(recovered.importTariff),tariff());
+  assert.deepEqual(plain(recovered.vehicles),state().vehicles);
 });
 
 test('disk write/rename/read failures do not hide live data or damage the previous file', async t => {

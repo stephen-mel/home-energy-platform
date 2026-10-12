@@ -1,7 +1,7 @@
 import { managedSmartTarget, type ManagedImportEvidence } from "./managed-smart";
 import type { Site } from "../site/types";
 import type { KrakenState } from "../site/kraken-state";
-import { getSitePriceSignal } from "../site/get-site-price-signal";
+import { getSitePriceSignal, siteWithKrakenImportTariff } from "../site/get-site-price-signal";
 import { instant } from "../tariff/price-signal";
 import { comparePriceSignalsInDomain } from "../tariff/comparison-domain";
 import type { ObservedTariff } from "./observed-tariff";
@@ -41,6 +41,8 @@ export function reconcileTeslaTariff(input: ReconciliationInput) {
     const safety = { authority: "confirm" as const, inspectionOnly: true as const, writeReady: false as const,
         rollbackProven: false as const, humanApproved: false as const, writePayload: null };
     const fail = (code: string) => unavailableReconciliation(code, input.comparisonDomain);
+    const blocked = (code: string) => ({ ...safety, status: "blocked" as const, diagnostic: code,
+        requestedDomain: input.comparisonDomain, blockers: [...productionBlockers, code], proposal: null });
     try {
         const now = instant(input.now), start = instant(input.comparisonDomain.start), end = instant(input.comparisonDomain.end);
         if (![now, start, end].every(Number.isFinite) || end <= start || end <= now || end - Math.max(now, start) > 48 * 3600000)
@@ -50,6 +52,8 @@ export function reconcileTeslaTariff(input: ReconciliationInput) {
             || input.site.tariff.timeZone !== input.observation.source.timeZone) return fail("OBSERVATION_TARGET_MISMATCH");
         const krakenAt = instant(input.kraken.lastSuccessfulUpdate), captureAt = instant(input.observation.source.observedAt);
         if (!Number.isFinite(krakenAt) || krakenAt > now || now - krakenAt > EVIDENCE_TTL_MS || input.kraken.stale !== false) return fail("STALE_KRAKEN_EVIDENCE");
+        if (input.kraken.importTariffDiagnostic?.status === "unavailable")
+            return blocked(input.kraken.importTariffDiagnostic.code);
         if (!Number.isFinite(captureAt) || captureAt > now || now - captureAt > CAPTURE_TTL_MS) return fail("STALE_TESLA_CAPTURE");
         if (!inspectObservedProposalTariff(input.observation.tariff).exact || input.observation.diagnostics.includes("UNSUPPORTED_FIELDS_OMITTED")) return fail("OBSERVATION_INEXACT");
         const domain = { start: new Date(Math.max(start, now)).toISOString(), end: new Date(end).toISOString() };
@@ -58,16 +62,23 @@ export function reconcileTeslaTariff(input: ReconciliationInput) {
         const dispatches = scheduled(input.kraken);
         if (dispatches.some(d => !Number.isFinite(instant(d.start)) || !Number.isFinite(instant(d.end)) || instant(d.end) <= instant(d.start)))
             return fail("INVALID_SMART_EVIDENCE");
-        const hep = getSitePriceSignal(input.site, input.kraken, input.now).signal;
-        const validated = comparePriceSignalsInDomain(hep, hep, domain);
+        const economicSite = siteWithKrakenImportTariff(input.site, input.kraken, input.now);
+        const usingVerifiedImport = economicSite !== input.site;
+        const hep = getSitePriceSignal(economicSite, input.kraken, input.now).signal;
+        const observed = observedEconomicSignal(input.observation, domain);
+        // Kraken proves import economics only. The observed Tesla export curve is
+        // preserved as unmanaged state and is not promoted to supplier truth.
+        const managedSignal = usingVerifiedImport ? { ...hep, export: observed.signal.export } : hep;
+        const validated = comparePriceSignalsInDomain(managedSignal, managedSignal, domain);
         if (validated.status === "indeterminate") return fail(validated.diagnostic.code);
         if ([...validated.projected.current.import, ...validated.projected.current.export].some(w => w.stale || w.sources.some(s => s.stale))) return fail("STALE_EVIDENCE");
-        const observed = observedEconomicSignal(input.observation, domain);
         const comparison = comparePriceSignalsInDomain(observed.signal, monetarySignal(validated.projected.current), domain);
         if (comparison.status === "indeterminate") return fail(comparison.diagnostic.code);
-        const managedScope = { baseSignal: getSitePriceSignal(input.site, null, input.now).signal, previous: input.managedImport };
+        const baseImport = getSitePriceSignal(economicSite, null, input.now).signal;
+        const managedScope = { baseSignal: usingVerifiedImport ? { ...baseImport, export: observed.signal.export } : baseImport,
+            previous: input.managedImport };
         let managed;
-        try { managed = managedSmartTarget(hep, input.observation, domain, managedScope); }
+        try { managed = managedSmartTarget(managedSignal, input.observation, domain, managedScope); }
         catch (error) { return fail(error instanceof Error ? error.message : "MANAGED_SCOPE_UNAVAILABLE"); }
         const exactPlanner = planTeslaTariffSync({ previousSignal: observed.signal, signal: monetarySignal(validated.projected.current),
             comparisonDomain: domain, timeZone: input.site.tariff.timeZone });
@@ -93,11 +104,12 @@ export function reconcileTeslaTariff(input: ReconciliationInput) {
                 "Comparison-only monetary views do not promote planned charging or establish billing eligibility.",
                 "Removing old SMART periods requires durable bounded ownership and matching current Tesla economics; price resemblance alone establishes no ownership.",
                 "Proposals require new exact approval and fresh validation; this result grants no execution authority."] };
-        const blockers = [...new Set([...productionBlockers, ...planner.compatibility.blockers.map(d => d.code), ...exactPlanner.compatibility.blockers.map(d => d.code)])];
+        const blockers = [...new Set([...productionBlockers, ...(usingVerifiedImport ? ["EXPORT_ECONOMICS_UNVERIFIED"] : []),
+            ...planner.compatibility.blockers.map(d => d.code), ...exactPlanner.compatibility.blockers.map(d => d.code)])];
         if (planner.comparison.state === "unchanged") return { ...common, status: "in-sync" as const, proposal: null, blockers };
         const proposal = createTariffProposal({ proposalId: "confirm-tariff-reconciliation", energySiteId: input.energySiteId,
             purpose: "tariff-sync", timeZone: input.site.tariff.timeZone, validFrom: input.now, expiresAt: new Date(expiry).toISOString(),
-            signal: hep, observedReplacement: { observation: input.observation, generatedAt: input.now,
+            signal: managedSignal, observedReplacement: { observation: input.observation, generatedAt: input.now,
                 comparisonDomain: domain, dispatchEvidenceKey: currentKey, managedScope } });
         const restoration = reviewObservedRestoration({ before: input.observation, temporaryProposal: proposal,
             asOf: input.now, maxCaptureAgeMs: CAPTURE_TTL_MS });

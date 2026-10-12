@@ -16,6 +16,7 @@ export type SiteIntegrationConfig = {
     kraken: {
         enabled: boolean;
         wholeHomeDispatchRate?: { enabled: boolean; importPrice: EnergyPrice | null };
+        importTariffIdentity?: { tariffCode: string; meterPointRef: string };
     };
 
     homeAssistant: {

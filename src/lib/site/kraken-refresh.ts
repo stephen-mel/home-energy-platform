@@ -7,6 +7,7 @@ import {
     type KrakenVehicleStatus as ClientVehicleStatus,
 } from "../kraken/client";
 import { requireCompleteDispatches } from "../kraken/dispatch-response";
+import { validateKrakenImportTariff } from "../kraken/import-tariff";
 import {
     scheduleObservationStore,
     scheduleScopeId,
@@ -162,12 +163,17 @@ export function createKrakenRefreshCoordinator(dependencies: Dependencies) {
         }
         return state;
     }
-    async function refresh(scope: ScheduleScope, scopeId: string): Promise<KrakenState> {
+    async function refresh(scope: ScheduleScope, scopeId: string,
+        tariffIdentity?: { tariffCode: string; meterPointRef: string }): Promise<KrakenState> {
         const startedAt = new Date(dependencies.now()).toISOString();
         try {
             const session = dependencies.createSession();
             if (requiredText(session.accountRef) !== scope.accountRef) throw Error("KRAKEN_ACCOUNT_CONTEXT_CHANGED");
-            const enumerated = devices(await session.getDevices());
+            const [deviceResponse, tariffRead] = await Promise.all([
+                session.getDevices(), session.getImportTariff().then(value => ({ ok: true as const, value }))
+                    .catch(() => ({ ok: false as const })),
+            ]);
+            const enumerated = devices(deviceResponse);
             const vehicles = await Promise.all(enumerated.map(async device => {
                 const [rawStatus, response] = await Promise.all([
                     session.getVehicleStatus(device.id), session.getPlannedDispatchResponse(device.id),
@@ -178,6 +184,10 @@ export function createKrakenRefreshCoordinator(dependencies: Dependencies) {
             }));
             const retrievedAtMs = dependencies.now();
             const retrievedAt = new Date(retrievedAtMs).toISOString();
+            const importTariff = tariffRead.ok ? validateKrakenImportTariff(tariffRead.value, {
+                accountRef: scope.accountRef, observedAt: retrievedAt, timeZone: "Europe/London",
+                tariffCode: tariffIdentity?.tariffCode, meterPointRef: tariffIdentity?.meterPointRef,
+            }) : { status: "unavailable" as const, code: "TARIFF_RETRIEVAL_FAILED" };
             const read: ScheduleRead = { scopeId, startedAt, retrievedAt, status: "complete",
                 provenance: "authenticated-query", vehicles: vehicles.map(vehicle => ({ id: vehicle.id,
                     name: vehicle.name, plannedDispatches: vehicle.plannedDispatches.map(dispatch => ({ ...dispatch })) })) };
@@ -186,7 +196,9 @@ export function createKrakenRefreshCoordinator(dependencies: Dependencies) {
                 throw Error("KRAKEN_OBSERVATION_REJECTED");
             }
             const state: KrakenState = { vehicles, lastSuccessfulUpdate: retrievedAt, stale: false,
-                scheduleRecording: recording(stored) };
+                scheduleRecording: recording(stored),
+                ...(importTariff.status === "available" ? { importTariff }
+                    : { importTariffDiagnostic: { status: "unavailable" as const, code: importTariff.code } }) };
             await dependencies.writeCompatibility(scopeId, state);
             // Freshness begins when authenticated retrieval completed, not when
             // best-effort compatibility publication eventually settles.
@@ -199,7 +211,7 @@ export function createKrakenRefreshCoordinator(dependencies: Dependencies) {
         }
     }
     return {
-        async get(siteId: string): Promise<KrakenState> {
+        async get(siteId: string, tariffIdentity?: { tariffCode: string; meterPointRef: string }): Promise<KrakenState> {
             const scope = { siteId: requiredText(siteId), accountRef: requiredText(dependencies.accountRef()) };
             const scopeId = scheduleScopeId(scope);
             const running = flights.get(scopeId);
@@ -208,7 +220,7 @@ export function createKrakenRefreshCoordinator(dependencies: Dependencies) {
             if (cached && !cached.state.stale && dependencies.now() - cached.storedAt < CACHE_MS) {
                 return classifyAtDelivery(cached.state);
             }
-            const promise = refresh(scope, scopeId);
+            const promise = refresh(scope, scopeId, tariffIdentity);
             flights.set(scopeId, promise);
             try { return classifyAtDelivery(await promise); }
             finally { if (flights.get(scopeId) === promise) flights.delete(scopeId); }
@@ -221,4 +233,5 @@ const processState = globalThis as typeof globalThis & {
 };
 const coordinator = processState.__hepKrakenRefreshCoordinator ??=
     createKrakenRefreshCoordinator(productionDependencies());
-export const getRecordedKrakenState = (siteId: string) => coordinator.get(siteId);
+export const getRecordedKrakenState = (siteId: string,
+    tariffIdentity?: { tariffCode: string; meterPointRef: string }) => coordinator.get(siteId, tariffIdentity);

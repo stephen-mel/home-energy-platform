@@ -26,6 +26,12 @@ function loadCoordinator() {
         if (result.status !== "complete") throw Error(result.code);
         return result.dispatches;
       } };
+      if (name === "../kraken/import-tariff") return { validateKrakenImportTariff(_raw, expected) {
+        return { status: "available", accountRef: expected.accountRef, observedAt: expected.observedAt,
+          agreement: { validFrom: "2026-01-17T00:00:00Z", validTo: "2027-01-17T00:00:00Z",
+            productCode: "NEXT_DRIVE_SMART_V5_2", tariffCode: "E-TOU-NEXT_DRIVE_SMART_V5_2-G", meterPointRef: "meter-a" },
+          version: {}, exportStatus: "unknown" };
+      } };
       if (name === "../kraken/schedule-store") return {
         scheduleObservationStore() { throw Error("not used"); },
         scheduleScopeId(scope) { return JSON.stringify([scope.siteId, scope.accountRef]); },
@@ -59,6 +65,7 @@ function harness(options = {}) {
       sessions++;
       if (options.credentialFailure?.()) throw Error("E.ON credentials are not configured");
       return { accountRef: options.accountRef ?? "account-a",
+        async getImportTariff() { if (options.tariffFailure) throw Error("tariff failed"); return {}; },
         async getDevices() { deviceCalls++; return options.devices ?? [device()]; },
         async getVehicleStatus() { statusCalls++; if (options.statusFailure) throw Error("status failed"); return vehicleStatus(); },
         async getPlannedDispatchResponse(id) { dispatchCalls++;
@@ -95,6 +102,15 @@ test("complete and explicit-empty refreshes create detached reads with exact val
   assert.equal(captured[0].read.provenance, "authenticated-query");
   assert.equal(captured[0].read.vehicles[0].plannedDispatches[0].start, slot().start);
   assert.deepEqual(h.counts(), { sessions: 1, deviceCalls: 1, statusCalls: 2, dispatchCalls: 2, records: 1, writes: 1 });
+});
+
+test("missing tariff evidence does not discard a complete vehicle refresh", async () => {
+  const h = harness({ tariffFailure: true });
+  const result = await h.coordinator.get("site-a");
+  assert.equal(result.stale, false);assert.equal(result.vehicles.length, 1);
+  assert.equal(result.importTariff, undefined);
+  assert.deepEqual(plain(result.importTariffDiagnostic), { status: "unavailable", code: "TARIFF_RETRIEVAL_FAILED" });
+  assert.equal(h.counts().records, 1);assert.equal(h.counts().writes, 1);
 });
 
 test("missing, null, malformed and partial dispatch reads never record or publish", async () => {
@@ -314,6 +330,7 @@ test("a genuine SQLite COMMIT followed by an exception remains indeterminate wit
   const coordinator = api.createKrakenRefreshCoordinator({
     now: () => Date.parse("2026-10-11T10:02:00Z"), accountRef: () => "account-a",
     createSession: () => ({ accountRef: "account-a", getDevices: async () => [device()],
+      getImportTariff: async () => ({}),
       getVehicleStatus: async () => vehicleStatus(), getPlannedDispatchResponse: async id => ({ status: "complete",
         explicitlyEmpty: false, dispatches: [slot(undefined, "2026-10-11T13:00:00+01:00")], deviceId: id }) }),
     record: (scope, read) => { recordCalls++; return uncertain.record(scope, read); }, readCompatibility: async () => null,
@@ -365,6 +382,7 @@ test("real SQLite integration records initial, replay, unchanged and revised sch
     now: () => now,
     accountRef: () => "account-a",
     createSession: () => ({ accountRef: "account-a", getDevices: async () => [device()],
+      getImportTariff: async () => ({}),
       getVehicleStatus: async () => vehicleStatus(), getPlannedDispatchResponse: async id =>
         ({ status: "complete", explicitlyEmpty: dispatches.length === 0, dispatches, deviceId: id }) }),
     record: (scope, read) => store.record(scope, read),

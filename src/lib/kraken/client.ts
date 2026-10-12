@@ -186,6 +186,35 @@ async function getKrakenDevicesFor(configuration: KrakenReadConfiguration): Prom
   return data.devices;
 }
 
+async function getKrakenImportTariffFor(configuration: KrakenReadConfiguration) {
+  const token = await obtainKrakenToken(configuration);
+  const data = await krakenGraphQL<{ account: { electricityAgreements: Array<Record<string, unknown>> } }>(`
+    query {
+      account(accountNumber: ${JSON.stringify(configuration.accountNumber)}) {
+        electricityAgreements(active: true) {
+          validFrom validTo ratesAgreedAt isRevoked
+          meterPoint { mpan direction }
+          tariff {
+            __typename
+            ... on HalfHourlyTariff {
+              productCode tariffCode displayName fullName isExport
+              standingCharge preVatStandingCharge
+              unitRates { validFrom validTo value preVatValue rateType }
+            }
+          }
+        }
+      }
+    }
+  `, token);
+  const electricityAgreements = data.account.electricityAgreements.map(agreement => {
+    const meterPoint = agreement.meterPoint as { mpan?: unknown; direction?: unknown } | undefined;
+    if (typeof meterPoint?.mpan !== "string" || typeof meterPoint.direction !== "string") return agreement;
+    return { ...agreement, meterPoint: { direction: meterPoint.direction,
+      meterPointRef: createHash("sha256").update(`eon-meter-point\0${meterPoint.mpan}`).digest("hex") } };
+  });
+  return { accountRef: configuration.accountRef, electricityAgreements };
+}
+
 export async function getKrakenDevices(): Promise<KrakenDevice[]> {
   return getKrakenDevicesFor(captureKrakenReadConfiguration());
 }
@@ -297,6 +326,7 @@ export function createKrakenReadSession() {
   return Object.freeze({
     accountRef: configuration.accountRef,
     getDevices: () => getKrakenDevicesFor(configuration),
+    getImportTariff: () => getKrakenImportTariffFor(configuration),
     getVehicleStatus: (deviceId: string) => getKrakenVehicleStatusFor(deviceId, configuration),
     getPlannedDispatchResponse: (deviceId: string) =>
       getKrakenPlannedDispatchResponseFor(deviceId, configuration),
