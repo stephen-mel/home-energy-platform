@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { KrakenState } from "./kraken-state";
 import type { KrakenImportTariffEvidence } from "../kraken/import-tariff";
+import type { KrakenExportTariffEvidence } from "../kraken/export-tariff";
 
 // Local single-site adapter. Replace these two operations with per-site storage
 // before sharing a deployment between accounts. Never use the public directory.
@@ -74,11 +75,22 @@ const importTariff: Parser<KrakenImportTariffEvidence> = object({
             kind: (input => { if (input !== "standard" && input !== "guaranteed-off-peak") throw new Error("Invalid kind"); return input; }) as Parser<"standard" | "guaranteed-off-peak">,
             price: nullable(energyPrice) })) }),
 });
+const exportTariff: Parser<KrakenExportTariffEvidence> = object({
+    status: (input => { if (input !== "available") throw new Error("Invalid tariff status"); return input; }) as Parser<"available">,
+    accountRef: string, observedAt: timestamp,
+    agreement: object({ validFrom: timestamp, validTo: timestamp, productCode: string, tariffCode: string }),
+    price: energyPrice,
+});
 const parseState = object<Omit<KrakenState, "stale">>({
     lastSuccessfulUpdate: timestamp,
     scheduleRecording: optional(object({ status: recordingStatus, change: recordingChange, code: nullable(string) })),
     importTariff: optional(importTariff),
     importTariffDiagnostic: optional(object({
+        status: (input => { if (input !== "unavailable") throw new Error("Invalid tariff status"); return input; }) as Parser<"unavailable">,
+        code: string,
+    })),
+    exportTariff: optional(exportTariff),
+    exportTariffDiagnostic: optional(object({
         status: (input => { if (input !== "unavailable") throw new Error("Invalid tariff status"); return input; }) as Parser<"unavailable">,
         code: string,
     })),

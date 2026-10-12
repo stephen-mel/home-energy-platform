@@ -12,6 +12,11 @@ export const currentSite: Site = {
                 tariffCode: "E-TOU-NEXT_DRIVE_SMART_V5_2-G",
                 meterPointRef: "45ee067bfe464f8f50729df68fbe962c6837d98db03443e7b7648de2bb70e0f9",
             },
+            exportTariffIdentity: {
+                accountRef: "1b64b91bc669c17f9f5b4d0bd31560fe521f5b51a07e24812a692badfd5106fe",
+                productCode: "NEXT_EXPORT_PREMIUM_V3",
+                tariffCode: "E-1R-NEXT_EXPORT_PREMIUM_V3-G",
+            },
         },
 
         homeAssistant: {

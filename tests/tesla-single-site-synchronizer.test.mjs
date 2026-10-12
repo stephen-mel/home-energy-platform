@@ -41,6 +41,9 @@ function side(smart = [], sell = false) {
 }
 function input({dispatches=[], represented=[], now=at('12:00')}={}) {
   const site=structuredClone(siteConfig);
+  // Historical/unit scenarios predate configured export evidence. Tests that
+  // exercise the current authenticated tariff opt in explicitly below.
+  delete site.integrations.kraken.exportTariffIdentity;
   const result={site,energySiteId:'12345',now,comparisonDomain:{start:at('00:00'),end:at('18:00')},
     kraken:{stale:false,lastSuccessfulUpdate:now,vehicles:[{id:'q7',name:'Q7',plannedDispatches:dispatches}]},
     observation:{source:{kind:'tesla-site-info',energySiteId:'12345',observedAt:now,timeZone:'Europe/London'},
@@ -138,6 +141,7 @@ test('verified current Kraken import economics replace expired static rates whil
   const now='2026-10-11T21:00:00.000Z',start='2026-10-11T21:00:00.000Z',end='2026-10-12T05:00:00.000Z';
   const i=input({now:at('12:00')});i.now=now;i.comparisonDomain={start,end};
   i.site.integrations.kraken.importTariffIdentity={tariffCode:'E-TOU-NEXT_DRIVE_SMART_V5_2-G',meterPointRef:'meter-a'};
+  i.site.integrations.kraken.exportTariffIdentity={accountRef:'opaque-export-account',productCode:'NEXT_EXPORT_PREMIUM_V3',tariffCode:'E-1R-NEXT_EXPORT_PREMIUM_V3-G'};
   i.kraken.lastSuccessfulUpdate=now;
   i.kraken.importTariff={status:'available',accountRef:'opaque-account',observedAt:now,exportStatus:'unknown',
     agreement:{validFrom:'2026-01-17T00:00:00Z',validTo:'2027-01-17T00:00:00Z',productCode:'NEXT_DRIVE_SMART_V5_2',tariffCode:'E-TOU-NEXT_DRIVE_SMART_V5_2-G',meterPointRef:'meter-a'},
@@ -145,6 +149,9 @@ test('verified current Kraken import economics replace expired static rates whil
       effectiveFrom:'2026-10-10T23:00:00Z',effectiveTo:'2026-10-12T23:00:00Z',pricesIncludeVat:true,
       normalImport:price(0.23978),export:null,scheduledChargingImport:price(0.0285),standingCharge:{amount:0.57143,currency:'GBP',unit:'day'},
       dailyImportWindows:[{start:'00:00',end:'06:00',kind:'guaranteed-off-peak',price:price(0.0285)}]}};
+  i.kraken.exportTariff={status:'available',accountRef:'opaque-export-account',observedAt:now,
+    agreement:{validFrom:'2026-10-01T23:00:00Z',validTo:'2027-10-01T23:00:00Z',productCode:'NEXT_EXPORT_PREMIUM_V3',tariffCode:'E-1R-NEXT_EXPORT_PREMIUM_V3-G'},
+    price:price(0.175)};
   i.kraken.vehicles[0].plannedDispatches=[{start:'2026-10-11T22:30:00Z',end:'2026-10-11T23:00:00Z',type:'SMART',energyAddedKwh:'1'}];
   i.observation.source.observedAt=now;
   for(const side of [i.observation.tariff]) for(const rates of Object.values(side.energy_charges))
@@ -153,8 +160,11 @@ test('verified current Kraken import economics replace expired static rates whil
   assertProposal(result,'apply');
   assert.ok(result.reconciliation.hep.import.some(window=>window.price?.amount===0.0285));
   assert.ok(result.reconciliation.hep.import.some(window=>window.price?.amount===0.23978));
-  assert.equal(result.reconciliation.hep.export.every(window=>window.price===null),true);
-  assert.ok(result.reconciliation.blockers.includes('EXPORT_ECONOMICS_UNVERIFIED'));
+  assert.ok(result.reconciliation.hep.export.some(window=>window.price?.amount===0.175));
+  assert.ok(result.reconciliation.hep.export.every(window=>window.price===null||window.price.amount===0.175));
+  assert.ok(result.reconciliation.exactComparison.changedPeriods.some(period=>period.channels.includes('export')));
+  assert.ok(result.reconciliation.unmanaged.differences.some(period=>period.channels.includes('export')));
+  assert.equal(result.reconciliation.blockers.includes('EXPORT_ECONOMICS_UNVERIFIED'),false);
   assert.ok(result.reconciliation.blockers.includes('BUY_BELOW_SELL'));
   assert.equal(representationKey(result.reconciliation.proposal.bound.representation.sell_tariff),representationKey(i.observation.tariff.sell_tariff));
   i.kraken.importTariff.agreement.validTo='2026-10-11T22:45:00.000Z';
@@ -162,4 +172,39 @@ test('verified current Kraken import economics replace expired static rates whil
   const expiresInsideProposal=planSingleSiteSynchronization(i);
   assert.equal(expiresInsideProposal.status,'indeterminate');
   assert.equal(expiresInsideProposal.reconciliation.proposal,null);
+});
+
+test('configured export evidence fails closed when missing, stale or contradictory',()=>{
+  const now='2026-10-11T21:00:00.000Z';
+  const base=input({dispatches:[{start:'2026-10-11T22:30:00Z',end:'2026-10-11T23:00:00Z',type:'SMART',energyAddedKwh:'1'}]});
+  base.now=now;base.comparisonDomain={start:now,end:'2026-10-12T05:00:00.000Z'};
+  base.kraken.lastSuccessfulUpdate=now;base.observation.source.observedAt=now;
+  base.site.integrations.kraken.exportTariffIdentity={accountRef:'opaque-export-account',productCode:'NEXT_EXPORT_PREMIUM_V3',tariffCode:'E-1R-NEXT_EXPORT_PREMIUM_V3-G'};
+  assert.equal(planSingleSiteSynchronization(base).reconciliation.diagnostic,'EXPORT_TARIFF_EVIDENCE_MISSING');
+  base.kraken.exportTariff={status:'available',accountRef:'opaque-export-account',observedAt:'2026-10-11T20:58:00.000Z',
+    agreement:{validFrom:'2026-10-01T23:00:00Z',validTo:'2027-10-01T23:00:00Z',productCode:'NEXT_EXPORT_PREMIUM_V3',tariffCode:'E-1R-NEXT_EXPORT_PREMIUM_V3-G'},price:price(0.175)};
+  assert.equal(planSingleSiteSynchronization(base).reconciliation.diagnostic,'EXPORT_TARIFF_EVIDENCE_INVALID');
+  base.kraken.exportTariff.observedAt=now;base.kraken.exportTariff.agreement.tariffCode='OTHER';
+  assert.equal(planSingleSiteSynchronization(base).reconciliation.diagnostic,'EXPORT_TARIFF_EVIDENCE_INVALID');
+});
+
+test('export agreement ending at 22:00 UTC cannot cover a proposal through 22:45 UTC',()=>{
+  const now='2026-10-11T21:00:00.000Z';
+  const i=input({dispatches:[{start:'2026-10-11T21:30:00Z',end:'2026-10-11T22:30:00Z',type:'SMART',energyAddedKwh:'1'}]});
+  i.now=now;i.comparisonDomain={start:now,end:'2026-10-11T22:45:00.000Z'};
+  i.kraken.lastSuccessfulUpdate=now;i.observation.source.observedAt=now;
+  i.site.integrations.kraken.exportTariffIdentity={accountRef:'opaque-export-account',productCode:'NEXT_EXPORT_PREMIUM_V3',tariffCode:'E-1R-NEXT_EXPORT_PREMIUM_V3-G'};
+  i.site.integrations.kraken.importTariffIdentity={tariffCode:'E-TOU-NEXT_DRIVE_SMART_V5_2-G',meterPointRef:'meter-a'};
+  i.kraken.importTariff={status:'available',accountRef:'opaque-import-account',observedAt:now,exportStatus:'unknown',
+    agreement:{validFrom:'2026-01-17T00:00:00Z',validTo:'2027-01-17T00:00:00Z',productCode:'NEXT_DRIVE_SMART_V5_2',tariffCode:'E-TOU-NEXT_DRIVE_SMART_V5_2-G',meterPointRef:'meter-a'},
+    version:{id:'next_drive_smart_v5_2',name:'Next Drive Smart V5.2',provider:'eon-next-kraken',effectiveFrom:now,effectiveTo:'2026-10-12T23:00:00Z',pricesIncludeVat:true,
+      normalImport:price(0.23978),export:null,scheduledChargingImport:price(0.0285),standingCharge:null,dailyImportWindows:[{start:'00:00',end:'06:00',kind:'guaranteed-off-peak',price:price(0.0285)}]}};
+  i.kraken.exportTariff={status:'available',accountRef:'opaque-export-account',observedAt:now,
+    agreement:{validFrom:'2026-10-01T23:00:00Z',validTo:'2026-10-11T22:00:00.000Z',productCode:'NEXT_EXPORT_PREMIUM_V3',tariffCode:'E-1R-NEXT_EXPORT_PREMIUM_V3-G'},price:price(0.175)};
+  const signal=getSitePriceSignal(i.site,i.kraken,now).signal;
+  const afterExpiry=signal.export.filter(window=>Date.parse(window.start)>=Date.parse('2026-10-11T22:00:00.000Z'));
+  assert.ok(afterExpiry.length);assert.ok(afterExpiry.every(window=>window.price===null));
+  const result=planSingleSiteSynchronization(i);
+  assert.equal(result.status,'blocked');assert.equal(result.reconciliation.proposal,null);
+  assert.equal(result.reconciliation.diagnostic,'EXPORT_TARIFF_COVERAGE_INCOMPLETE');
 });

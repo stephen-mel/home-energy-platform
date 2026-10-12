@@ -4,6 +4,7 @@ import type { KrakenState } from "./kraken-state";
 import type { PriceSignal } from "../tariff/types";
 import { buildPriceCurve } from "../tariff/price-signal";
 import { krakenDispatchPriceWindows } from "../tariff/kraken-dispatches";
+import type { KrakenExportTariffEvidence } from "../kraken/export-tariff";
 
 const KRAKEN_IMPORT_TARIFF_MAX_AGE_MS = 60_000;
 
@@ -15,6 +16,20 @@ export type SitePricePlan = {
         lastSuccessfulUpdate: string | null;
     };
 };
+
+export function verifiedKrakenExportTariff(site: Site, kraken: KrakenState | null, now: string): KrakenExportTariffEvidence | null {
+    const identity = site.integrations.kraken.exportTariffIdentity;
+    const age = Date.parse(now) - Date.parse(kraken?.exportTariff?.observedAt ?? "");
+    return kraken?.stale === false && kraken.exportTariff?.status === "available"
+        && identity !== undefined && kraken.exportTariff.accountRef.length > 0
+        && kraken.exportTariff.accountRef === identity.accountRef
+        && kraken.exportTariff.agreement.productCode === identity.productCode
+        && kraken.exportTariff.agreement.tariffCode === identity.tariffCode
+        && Number.isFinite(age) && age >= 0 && age <= KRAKEN_IMPORT_TARIFF_MAX_AGE_MS
+        && Date.parse(now) >= Date.parse(kraken.exportTariff.agreement.validFrom)
+        && Date.parse(now) < Date.parse(kraken.exportTariff.agreement.validTo)
+        ? kraken.exportTariff : null;
+}
 
 export function siteWithKrakenImportTariff(site: Site, kraken: KrakenState | null, now: string): Site {
     const age = Date.parse(now) - Date.parse(kraken?.importTariff?.observedAt ?? "");
@@ -28,7 +43,13 @@ export function siteWithKrakenImportTariff(site: Site, kraken: KrakenState | nul
         && Date.parse(now) < Date.parse(kraken.importTariff.agreement.validTo)
         ? kraken.importTariff : null;
     if (!verified || !site.tariff) return site;
-    return { ...site, tariff: { ...site.tariff, normalImport: null, export: null, versions: [verified.version] } };
+    const verifiedExport = verifiedKrakenExportTariff(site, kraken, now);
+    const exportWindows = verifiedExport ? [{ start: verifiedExport.agreement.validFrom, end: verifiedExport.agreement.validTo,
+        price: verifiedExport.price, kind: "standard" as const, condition: "none" as const,
+        sources: [{ provider: "eon-next-kraken", description: verifiedExport.agreement.productCode,
+            tariffVersion: verifiedExport.agreement.tariffCode, observedAt: verifiedExport.observedAt, stale: false }] }] : [];
+    return { ...site, tariff: { ...site.tariff, normalImport: null, export: null, exportWindows,
+        versions: [{ ...verified.version, export: null }] } };
 }
 
 // Uses the already loaded site snapshot. No fetching, refresh or control actions.
@@ -49,7 +70,8 @@ export function getSitePriceSignal(site: Site, kraken: KrakenState | null, now: 
         signal: {
             scope: "whole-home", generatedAt: now, horizon,
             import: buildPriceCurve(horizon, effective ? null : tariff?.normalImport ?? null, [...(effective?.import ?? tariff?.importWindows ?? []), ...opportunities]),
-            export: buildPriceCurve(horizon, effective ? null : tariff?.export ?? null, effective?.export ?? tariff?.exportWindows ?? []),
+            export: buildPriceCurve(horizon, effective ? null : tariff?.export ?? null,
+                tariff?.exportWindows ?? effective?.export ?? []),
         },
     };
 }

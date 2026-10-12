@@ -54,6 +54,12 @@ function tariff() {
       scheduledChargingImport:{amount:0.0285,currency:'GBP',unit:'kWh'},standingCharge:null,
       dailyImportWindows:[{start:'00:00',end:'06:00',kind:'guaranteed-off-peak',price:{amount:0.0285,currency:'GBP',unit:'kWh'}}]}};
 }
+function exportTariff() {
+  return {status:'available',accountRef:'export-account',observedAt:'2026-09-18T10:00:00.000Z',
+    agreement:{validFrom:'2026-10-01T23:00:00.000Z',validTo:'2027-10-01T23:00:00.000Z',
+      productCode:'NEXT_EXPORT_PREMIUM_V3',tariffCode:'E-1R-NEXT_EXPORT_PREMIUM_V3-G'},
+    price:{amount:0.175,currency:'GBP',unit:'kWh'}};
+}
 const plain = value => JSON.parse(JSON.stringify(value));
 const scopeId = '["site","account"]';
 
@@ -96,10 +102,11 @@ test('writes only allowlisted fields; permissions are private; stale and invalid
 });
 
 test('canonical tariff evidence and vehicle data round-trip together', async t => {
-  const {store}=await fixture(t);const input={...state(),importTariff:tariff()};
+  const {store}=await fixture(t);const input={...state(),importTariff:tariff(),exportTariff:exportTariff()};
   await store.writeLastKnownKrakenState(scopeId,input);
   const recovered=await store.readLastKnownKrakenState(scopeId);
   assert.equal(recovered.stale,true);assert.deepEqual(plain(recovered.importTariff),tariff());
+  assert.deepEqual(plain(recovered.exportTariff),exportTariff());
   assert.deepEqual(plain(recovered.vehicles),state().vehicles);
 });
 

@@ -45,6 +45,8 @@ function input(dispatches=[], represented=[], now=at('12:00')) {
     kraken:{stale:false,lastSuccessfulUpdate:now,vehicles:[{id:'q7',name:'Q7',plannedDispatches:dispatches}]},
     observation:{source:{kind:'tesla-site-info',energySiteId:'12345',observedAt:now,timeZone:'Europe/London'},
       tariff:{...side(represented),sell_tariff:side([],true)},diagnostics:[],rollbackProven:false} };
+  // Synthetic September reconciliation explicitly uses its historical tariff.
+  delete result.site.integrations.kraken.exportTariffIdentity;
   if (represented.length) {
     result.managedImport = {version:1,energySiteId:'12345',timeZone:'Europe/London',createdAt:now,updatedAt:now,
       validUntil:at('18:00'),basis:'confirmed-write-readback',baselineFingerprint:'a'.repeat(64),readbackFingerprint:'b'.repeat(64),

@@ -21,7 +21,10 @@ function load(file,deps,globals={}) {
   }});return exports;
 }
 const domain=load('src/lib/tesla-tariff/reconciliation.ts');
-const site=load('src/lib/site/current-site.ts').currentSite;
+const site=structuredClone(load('src/lib/site/current-site.ts').currentSite);
+// These September presentation fixtures intentionally exercise the historical
+// configured tariff rather than the October authenticated export integration.
+delete site.integrations.kraken.exportTariffIdentity;
 const {captureObservedTariff}=load('src/lib/tesla-tariff/observed-tariff.ts');
 function side(sell=false){return {name:'Test tariff',utility:'Test',currency:'GBP',
   seasons:{Annual:{fromMonth:1,fromDay:1,toMonth:12,toDay:31,tou_periods:{night:{periods:[{fromDayOfWeek:0,toDayOfWeek:6,fromHour:0,toHour:6,fromMinute:0,toMinute:0}]},day:{periods:[{fromDayOfWeek:0,toDayOfWeek:6,fromHour:6,toHour:0,fromMinute:0,toMinute:0}]}}}},

@@ -3,11 +3,13 @@ import { isAbsolute, join } from "node:path";
 import {
     createKrakenReadSession,
     getKrakenAccountReference,
+    getKrakenExportAccountReference,
     type KrakenDevice,
     type KrakenVehicleStatus as ClientVehicleStatus,
 } from "../kraken/client";
 import { requireCompleteDispatches } from "../kraken/dispatch-response";
 import { validateKrakenImportTariff } from "../kraken/import-tariff";
+import { validateKrakenExportTariff } from "../kraken/export-tariff";
 import {
     scheduleObservationStore,
     scheduleScopeId,
@@ -36,12 +38,13 @@ type ReadSession = ReturnType<typeof createKrakenReadSession>;
 type Dependencies = {
     now: () => number;
     accountRef: () => string;
+    exportAccountRef?: () => string | null;
     createSession: () => ReadSession;
     record: (scope: ScheduleScope, read: ScheduleRead) => ScheduleStoreWrite;
     readCompatibility: (scopeId: string) => Promise<KrakenState | null>;
     writeCompatibility: (scopeId: string, state: KrakenState) => Promise<void>;
 };
-type Entry = { state: KrakenState; storedAt: number };
+type Entry = { state: KrakenState; storedAt: number; exportContextKey: string };
 
 function data(value: unknown, key: string): unknown {
     if (!value || typeof value !== "object" || Array.isArray(value)) throw Error("KRAKEN_DEVICE_RESPONSE_INVALID");
@@ -142,7 +145,8 @@ export function krakenObservationDatabasePath(
     return configured;
 }
 function productionDependencies(): Dependencies {
-    return { now: Date.now, accountRef: getKrakenAccountReference, createSession: createKrakenReadSession,
+    return { now: Date.now, accountRef: getKrakenAccountReference, exportAccountRef: getKrakenExportAccountReference,
+        createSession: createKrakenReadSession,
         record: (scope, read) => {
             try { return scheduleObservationStore(krakenObservationDatabasePath()).record(scope, read); }
             catch { return { status: "store-failed" }; }
@@ -163,15 +167,37 @@ export function createKrakenRefreshCoordinator(dependencies: Dependencies) {
         }
         return state;
     }
+    const exportContextKey = (identity: { accountRef: string; productCode: string; tariffCode: string } | undefined,
+        accountRef: string | null) => JSON.stringify([accountRef, identity?.accountRef ?? null,
+            identity?.productCode ?? null, identity?.tariffCode ?? null]);
+    function exportEvidenceMatches(state: KrakenState,
+        identity: { accountRef: string; productCode: string; tariffCode: string } | undefined, accountRef: string | null) {
+        return !identity || accountRef !== null && identity.accountRef === accountRef
+            && state.exportTariff?.accountRef === accountRef;
+    }
+    function staleRecovery(state: KrakenState,
+        identity: { accountRef: string; productCode: string; tariffCode: string } | undefined, accountRef: string | null): KrakenState {
+        if (exportEvidenceMatches(state, identity, accountRef)) return { ...state, stale: true };
+        const { exportTariff: ignored, ...withoutExport } = state;
+        void ignored;
+        return { ...withoutExport, stale: true,
+            exportTariffDiagnostic: { status: "unavailable", code: "EXPORT_ACCOUNT_CONTEXT_CHANGED" } };
+    }
     async function refresh(scope: ScheduleScope, scopeId: string,
-        tariffIdentity?: { tariffCode: string; meterPointRef: string }): Promise<KrakenState> {
+        tariffIdentity?: { tariffCode: string; meterPointRef: string },
+        exportTariffIdentity?: { accountRef: string; productCode: string; tariffCode: string },
+        expectedExportAccountRef: string | null = null): Promise<KrakenState> {
         const startedAt = new Date(dependencies.now()).toISOString();
         try {
             const session = dependencies.createSession();
             if (requiredText(session.accountRef) !== scope.accountRef) throw Error("KRAKEN_ACCOUNT_CONTEXT_CHANGED");
-            const [deviceResponse, tariffRead] = await Promise.all([
+            if (exportTariffIdentity && session.exportAccountRef !== expectedExportAccountRef)
+                throw Error("KRAKEN_EXPORT_ACCOUNT_CONTEXT_CHANGED");
+            const [deviceResponse, tariffRead, exportTariffRead] = await Promise.all([
                 session.getDevices(), session.getImportTariff().then(value => ({ ok: true as const, value }))
                     .catch(() => ({ ok: false as const })),
+                exportTariffIdentity ? session.getExportTariff().then(value => ({ ok: true as const, value }))
+                    .catch(() => ({ ok: false as const })) : Promise.resolve({ ok: false as const }),
             ]);
             const enumerated = devices(deviceResponse);
             const vehicles = await Promise.all(enumerated.map(async device => {
@@ -188,6 +214,13 @@ export function createKrakenRefreshCoordinator(dependencies: Dependencies) {
                 accountRef: scope.accountRef, observedAt: retrievedAt, timeZone: "Europe/London",
                 tariffCode: tariffIdentity?.tariffCode, meterPointRef: tariffIdentity?.meterPointRef,
             }) : { status: "unavailable" as const, code: "TARIFF_RETRIEVAL_FAILED" };
+            const exportTariff = exportTariffIdentity?.accountRef !== expectedExportAccountRef
+                ? { status: "unavailable" as const, code: "EXPORT_ACCOUNT_IDENTITY_MISMATCH" }
+                : exportTariffRead.ok && expectedExportAccountRef ? validateKrakenExportTariff(exportTariffRead.value, {
+                accountRef: expectedExportAccountRef, importAccountRef: scope.accountRef, observedAt: retrievedAt,
+                productCode: exportTariffIdentity?.productCode, tariffCode: exportTariffIdentity?.tariffCode,
+            }) : { status: "unavailable" as const, code: exportTariffRead.ok
+                ? "EXPORT_ACCOUNT_IDENTITY_UNAVAILABLE" : "EXPORT_TARIFF_RETRIEVAL_FAILED" };
             const read: ScheduleRead = { scopeId, startedAt, retrievedAt, status: "complete",
                 provenance: "authenticated-query", vehicles: vehicles.map(vehicle => ({ id: vehicle.id,
                     name: vehicle.name, plannedDispatches: vehicle.plannedDispatches.map(dispatch => ({ ...dispatch })) })) };
@@ -198,32 +231,40 @@ export function createKrakenRefreshCoordinator(dependencies: Dependencies) {
             const state: KrakenState = { vehicles, lastSuccessfulUpdate: retrievedAt, stale: false,
                 scheduleRecording: recording(stored),
                 ...(importTariff.status === "available" ? { importTariff }
-                    : { importTariffDiagnostic: { status: "unavailable" as const, code: importTariff.code } }) };
+                    : { importTariffDiagnostic: { status: "unavailable" as const, code: importTariff.code } }),
+                ...(exportTariff.status === "available" ? { exportTariff }
+                    : { exportTariffDiagnostic: { status: "unavailable" as const, code: exportTariff.code } }) };
             await dependencies.writeCompatibility(scopeId, state);
             // Freshness begins when authenticated retrieval completed, not when
             // best-effort compatibility publication eventually settles.
-            memory.set(scopeId, { state, storedAt: retrievedAtMs });
+            memory.set(scopeId, { state, storedAt: retrievedAtMs,
+                exportContextKey: exportContextKey(exportTariffIdentity, expectedExportAccountRef) });
             return state;
         } catch (error) {
             const cached = memory.get(scopeId)?.state ?? await dependencies.readCompatibility(scopeId);
-            if (cached) return { ...cached, stale: true };
+            if (cached) return staleRecovery(cached, exportTariffIdentity, expectedExportAccountRef);
             throw error;
         }
     }
     return {
-        async get(siteId: string, tariffIdentity?: { tariffCode: string; meterPointRef: string }): Promise<KrakenState> {
+        async get(siteId: string, tariffIdentity?: { tariffCode: string; meterPointRef: string },
+            exportTariffIdentity?: { accountRef: string; productCode: string; tariffCode: string }): Promise<KrakenState> {
             const scope = { siteId: requiredText(siteId), accountRef: requiredText(dependencies.accountRef()) };
             const scopeId = scheduleScopeId(scope);
-            const running = flights.get(scopeId);
+            const expectedExportAccountRef = dependencies.exportAccountRef?.() ?? null;
+            const currentExportContextKey = exportContextKey(exportTariffIdentity, expectedExportAccountRef);
+            const flightId = JSON.stringify([scopeId, currentExportContextKey]);
+            const running = flights.get(flightId);
             if (running) return classifyAtDelivery(await running);
             const cached = memory.get(scopeId);
-            if (cached && !cached.state.stale && dependencies.now() - cached.storedAt < CACHE_MS) {
+            if (cached && !cached.state.stale && dependencies.now() - cached.storedAt < CACHE_MS
+                && cached.exportContextKey === currentExportContextKey) {
                 return classifyAtDelivery(cached.state);
             }
-            const promise = refresh(scope, scopeId, tariffIdentity);
-            flights.set(scopeId, promise);
+            const promise = refresh(scope, scopeId, tariffIdentity, exportTariffIdentity, expectedExportAccountRef);
+            flights.set(flightId, promise);
             try { return classifyAtDelivery(await promise); }
-            finally { if (flights.get(scopeId) === promise) flights.delete(scopeId); }
+            finally { if (flights.get(flightId) === promise) flights.delete(flightId); }
         },
     };
 }
@@ -234,4 +275,6 @@ const processState = globalThis as typeof globalThis & {
 const coordinator = processState.__hepKrakenRefreshCoordinator ??=
     createKrakenRefreshCoordinator(productionDependencies());
 export const getRecordedKrakenState = (siteId: string,
-    tariffIdentity?: { tariffCode: string; meterPointRef: string }) => coordinator.get(siteId, tariffIdentity);
+    tariffIdentity?: { tariffCode: string; meterPointRef: string },
+    exportTariffIdentity?: { accountRef: string; productCode: string; tariffCode: string }) =>
+    coordinator.get(siteId, tariffIdentity, exportTariffIdentity);

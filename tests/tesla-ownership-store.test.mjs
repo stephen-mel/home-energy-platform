@@ -9,6 +9,11 @@ const at=t=>`2026-09-25T${t}:00+01:00`;
 // Legacy replacement lifecycle is exercised through a PURE derivation function.
 // This test-only adapter uses the private SQLite seam; no production authority.
 function loader() { return loadStore().load; }
+function historicalSite(load) {
+  const site=structuredClone(load('src/lib/site/current-site.ts').currentSite);
+  delete site.integrations.kraken.exportTariffIdentity;
+  return site;
+}
 function replacementStore(dir, load) {
   const store=loadStore(),file=path.join(dir,'ownership.sqlite');
   return { read: async site=>store.readOwnership(file,site), async recordDerived(receipt) {
@@ -27,7 +32,7 @@ function side(sell=false){return {version:1,name:'Synthetic tariff',utility:'Tes
   seasons:{Annual:{fromMonth:1,fromDay:1,toMonth:12,toDay:31,tou_periods:{night:{periods:[{fromDayOfWeek:0,toDayOfWeek:6,fromHour:0,fromMinute:0,toHour:6,toMinute:0}]},day:{periods:[{fromDayOfWeek:0,toDayOfWeek:6,fromHour:6,fromMinute:0,toHour:0,toMinute:0}]}}}},
   energy_charges:{Annual:{rates:{night:sell?0.17:0.02993,day:sell?0.17:0.25177}}}};}
 function receipt(load){
-  const site=structuredClone(load('src/lib/site/current-site.ts').currentSite);
+  const site=historicalSite(load);
   const before={source:{kind:'tesla-site-info',energySiteId:'12345',observedAt:now,timeZone:'Europe/London'},tariff:{...side(),sell_tariff:side(true)},diagnostics:[],rollbackProven:false};
   const result=load('src/lib/tesla-tariff/reconciliation.ts').reconcileTeslaTariff({site,energySiteId:'12345',now,comparisonDomain:{start:now,end:at('18:00')},observation:before,
     kraken:{stale:false,lastSuccessfulUpdate:now,vehicles:[{id:'q7',name:'Q7',plannedDispatches:[{start:at('14:00'),end:at('17:00'),type:'SMART'}]}]}});
@@ -41,7 +46,7 @@ async function sandbox(fn){const dir=await io.mkdtemp(path.join(os.tmpdir(),'hep
 function followup(load, saved, observation, time, dispatches, domain={start:time,end:at('18:00')}) {
   const before={...structuredClone(observation),source:{...observation.source,observedAt:time}};
   const result=load('src/lib/tesla-tariff/reconciliation.ts').reconcileTeslaTariff({
-    site:structuredClone(load('src/lib/site/current-site.ts').currentSite),energySiteId:'12345',now:time,
+    site:historicalSite(load),energySiteId:'12345',now:time,
     comparisonDomain:domain,observation:before,managedImport:saved.evidence,
     kraken:{stale:false,lastSuccessfulUpdate:time,vehicles:[{id:'reoptimised-ev',name:'EV',plannedDispatches:dispatches}]},
   });
@@ -76,7 +81,7 @@ test('later confirmed extension preserves original restoration lineage and commi
   const load=loader(),store=replacementStore(dir,load),first=receipt(load);
   const saved=await store.recordDerived(first);
   const proposal=load('src/lib/tesla-tariff/reconciliation.ts').reconcileTeslaTariff({
-    site:structuredClone(load('src/lib/site/current-site.ts').currentSite),energySiteId:'12345',now,
+    site:historicalSite(load),energySiteId:'12345',now,
     comparisonDomain:{start:now,end:at('18:00')},observation:first.readback,managedImport:saved.evidence,
     kraken:{stale:false,lastSuccessfulUpdate:now,vehicles:[{id:'q7',name:'Q7',plannedDispatches:[{start:at('14:00'),end:at('18:00'),type:'SMART'}]}]},
   }).proposal;

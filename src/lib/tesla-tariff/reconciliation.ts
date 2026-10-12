@@ -1,7 +1,7 @@
 import { managedSmartTarget, type ManagedImportEvidence } from "./managed-smart";
 import type { Site } from "../site/types";
 import type { KrakenState } from "../site/kraken-state";
-import { getSitePriceSignal, siteWithKrakenImportTariff } from "../site/get-site-price-signal";
+import { getSitePriceSignal, siteWithKrakenImportTariff, verifiedKrakenExportTariff } from "../site/get-site-price-signal";
 import { instant } from "../tariff/price-signal";
 import { comparePriceSignalsInDomain } from "../tariff/comparison-domain";
 import type { ObservedTariff } from "./observed-tariff";
@@ -54,9 +54,19 @@ export function reconcileTeslaTariff(input: ReconciliationInput) {
         if (!Number.isFinite(krakenAt) || krakenAt > now || now - krakenAt > EVIDENCE_TTL_MS || input.kraken.stale !== false) return fail("STALE_KRAKEN_EVIDENCE");
         if (input.kraken.importTariffDiagnostic?.status === "unavailable")
             return blocked(input.kraken.importTariffDiagnostic.code);
+        if (input.site.integrations.kraken.exportTariffIdentity && input.kraken.exportTariffDiagnostic?.status === "unavailable")
+            return blocked(input.kraken.exportTariffDiagnostic.code);
+        if (input.site.integrations.kraken.exportTariffIdentity && !input.kraken.exportTariff)
+            return blocked("EXPORT_TARIFF_EVIDENCE_MISSING");
+        if (input.site.integrations.kraken.exportTariffIdentity && !verifiedKrakenExportTariff(input.site, input.kraken, input.now))
+            return blocked("EXPORT_TARIFF_EVIDENCE_INVALID");
         if (!Number.isFinite(captureAt) || captureAt > now || now - captureAt > CAPTURE_TTL_MS) return fail("STALE_TESLA_CAPTURE");
         if (!inspectObservedProposalTariff(input.observation.tariff).exact || input.observation.diagnostics.includes("UNSUPPORTED_FIELDS_OMITTED")) return fail("OBSERVATION_INEXACT");
         const domain = { start: new Date(Math.max(start, now)).toISOString(), end: new Date(end).toISOString() };
+        if (input.site.integrations.kraken.exportTariffIdentity && input.kraken.exportTariff
+            && (Date.parse(input.kraken.exportTariff.agreement.validFrom) > Date.parse(domain.start)
+                || Date.parse(input.kraken.exportTariff.agreement.validTo) < Date.parse(domain.end)))
+            return blocked("EXPORT_TARIFF_COVERAGE_INCOMPLETE");
         const scheduled = (state: KrakenState) => state.vehicles.flatMap(v => v.plannedDispatches.filter(d => d.type === "SMART")
             .map(d => ({ assetId: v.id, assetName: v.name, ...d })));
         const dispatches = scheduled(input.kraken);
@@ -67,9 +77,12 @@ export function reconcileTeslaTariff(input: ReconciliationInput) {
         const hep = getSitePriceSignal(economicSite, input.kraken, input.now).signal;
         const observed = observedEconomicSignal(input.observation, domain);
         // Kraken proves import economics only. The observed Tesla export curve is
-        // preserved as unmanaged state and is not promoted to supplier truth.
+        // preserved as unmanaged state in the replacement. Independently verified
+        // export economics remain visible in the exact/unmanaged comparison.
         const managedSignal = usingVerifiedImport ? { ...hep, export: observed.signal.export } : hep;
-        const validated = comparePriceSignalsInDomain(managedSignal, managedSignal, domain);
+        const exportEvidence = verifiedKrakenExportTariff(input.site, input.kraken, input.now);
+        const comparisonSignal = exportEvidence ? hep : managedSignal;
+        const validated = comparePriceSignalsInDomain(comparisonSignal, comparisonSignal, domain);
         if (validated.status === "indeterminate") return fail(validated.diagnostic.code);
         if ([...validated.projected.current.import, ...validated.projected.current.export].some(w => w.stale || w.sources.some(s => s.stale))) return fail("STALE_EVIDENCE");
         const comparison = comparePriceSignalsInDomain(observed.signal, monetarySignal(validated.projected.current), domain);
@@ -104,7 +117,8 @@ export function reconcileTeslaTariff(input: ReconciliationInput) {
                 "Comparison-only monetary views do not promote planned charging or establish billing eligibility.",
                 "Removing old SMART periods requires durable bounded ownership and matching current Tesla economics; price resemblance alone establishes no ownership.",
                 "Proposals require new exact approval and fresh validation; this result grants no execution authority."] };
-        const blockers = [...new Set([...productionBlockers, ...(usingVerifiedImport ? ["EXPORT_ECONOMICS_UNVERIFIED"] : []),
+        const exportVerified = exportEvidence !== null;
+        const blockers = [...new Set([...productionBlockers, ...(usingVerifiedImport && !exportVerified ? ["EXPORT_ECONOMICS_UNVERIFIED"] : []),
             ...planner.compatibility.blockers.map(d => d.code), ...exactPlanner.compatibility.blockers.map(d => d.code)])];
         if (planner.comparison.state === "unchanged") return { ...common, status: "in-sync" as const, proposal: null, blockers };
         const proposal = createTariffProposal({ proposalId: "confirm-tariff-reconciliation", energySiteId: input.energySiteId,

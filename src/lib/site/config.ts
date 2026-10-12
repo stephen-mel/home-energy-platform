@@ -17,6 +17,7 @@ export type SiteIntegrationConfig = {
         enabled: boolean;
         wholeHomeDispatchRate?: { enabled: boolean; importPrice: EnergyPrice | null };
         importTariffIdentity?: { tariffCode: string; meterPointRef: string };
+        exportTariffIdentity?: { accountRef: string; productCode: string; tariffCode: string };
     };
 
     homeAssistant: {

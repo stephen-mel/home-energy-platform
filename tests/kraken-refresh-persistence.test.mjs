@@ -32,6 +32,14 @@ function loadCoordinator() {
             productCode: "NEXT_DRIVE_SMART_V5_2", tariffCode: "E-TOU-NEXT_DRIVE_SMART_V5_2-G", meterPointRef: "meter-a" },
           version: {}, exportStatus: "unknown" };
       } };
+      if (name === "../kraken/export-tariff") return { validateKrakenExportTariff(_raw, expected) {
+        if (expected.accountRef === expected.importAccountRef)
+          return { status: "unavailable", code: "EXPORT_ACCOUNT_NOT_DISTINCT" };
+        return { status: "available", accountRef: expected.accountRef, observedAt: expected.observedAt,
+          agreement: { validFrom: "2026-10-01T23:00:00Z", validTo: "2027-10-01T23:00:00Z",
+            productCode: "NEXT_EXPORT_PREMIUM_V3", tariffCode: "E-1R-NEXT_EXPORT_PREMIUM_V3-G" },
+          price: { amount: 0.175, currency: "GBP", unit: "kWh" } };
+      } };
       if (name === "../kraken/schedule-store") return {
         scheduleObservationStore() { throw Error("not used"); },
         scheduleScopeId(scope) { return JSON.stringify([scope.siteId, scope.accountRef]); },
@@ -61,11 +69,17 @@ function harness(options = {}) {
   const coordinator = api.createKrakenRefreshCoordinator({
     now: () => now,
     accountRef: () => options.accountRef ?? "account-a",
+    exportAccountRef: () => typeof options.expectedExportAccountRef === 'function'
+      ? options.expectedExportAccountRef() : options.expectedExportAccountRef ?? "export-account-a",
     createSession: () => {
       sessions++;
       if (options.credentialFailure?.()) throw Error("E.ON credentials are not configured");
+      const exportAccountRef = typeof options.sessionExportAccountRef === 'function'
+        ? options.sessionExportAccountRef() : options.sessionExportAccountRef ?? "export-account-a";
       return { accountRef: options.accountRef ?? "account-a",
+        exportAccountRef,
         async getImportTariff() { if (options.tariffFailure) throw Error("tariff failed"); return {}; },
+        async getExportTariff() { if (options.exportTariffFailure) throw Error("export tariff failed"); return {}; },
         async getDevices() { deviceCalls++; return options.devices ?? [device()]; },
         async getVehicleStatus() { statusCalls++; if (options.statusFailure) throw Error("status failed"); return vehicleStatus(); },
         async getPlannedDispatchResponse(id) { dispatchCalls++;
@@ -111,6 +125,64 @@ test("missing tariff evidence does not discard a complete vehicle refresh", asyn
   assert.equal(result.importTariff, undefined);
   assert.deepEqual(plain(result.importTariffDiagnostic), { status: "unavailable", code: "TARIFF_RETRIEVAL_FAILED" });
   assert.equal(h.counts().records, 1);assert.equal(h.counts().writes, 1);
+});
+
+test("configured export tariff is independently validated without affecting complete dispatch recording", async () => {
+  const h = harness();
+  const result = await h.coordinator.get("site-a",
+    { tariffCode: "E-TOU-NEXT_DRIVE_SMART_V5_2-G", meterPointRef: "meter-a" },
+    { accountRef: "export-account-a", productCode: "NEXT_EXPORT_PREMIUM_V3", tariffCode: "E-1R-NEXT_EXPORT_PREMIUM_V3-G" });
+  assert.equal(result.exportTariff.status, "available");
+  assert.equal(result.exportTariff.price.amount, 0.175);
+  assert.equal(result.vehicles[0].plannedDispatches.length, 1);
+  assert.equal(result.scheduleRecording.status, "persisted");
+});
+
+test("changing configured export account invalidates the 60-second cache and refreshes exact account evidence", async () => {
+  let exportAccount = "export-account-a";
+  const h = harness({ expectedExportAccountRef: () => exportAccount, sessionExportAccountRef: () => exportAccount });
+  const identity = accountRef => ({ accountRef, productCode: "NEXT_EXPORT_PREMIUM_V3", tariffCode: "E-1R-NEXT_EXPORT_PREMIUM_V3-G" });
+  const first = await h.coordinator.get("site-a", undefined, identity(exportAccount));
+  assert.equal(first.exportTariff.accountRef, "export-account-a");
+  exportAccount = "export-account-b";
+  const second = await h.coordinator.get("site-a", undefined, identity(exportAccount));
+  assert.equal(second.exportTariff.accountRef, "export-account-b");
+  assert.equal(h.counts().sessions, 2);
+  assert.equal(h.counts().deviceCalls, 2);
+});
+
+test("failed export retrieval is cached for its captured account context but an account change refreshes", async () => {
+  let exportAccount = "export-account-a";
+  const h = harness({ exportTariffFailure: true, expectedExportAccountRef: () => exportAccount,
+    sessionExportAccountRef: () => exportAccount });
+  const identity = accountRef => ({ accountRef, productCode: "NEXT_EXPORT_PREMIUM_V3",
+    tariffCode: "E-1R-NEXT_EXPORT_PREMIUM_V3-G" });
+  const first = await h.coordinator.get("site-a", undefined, identity(exportAccount));
+  assert.equal(first.exportTariff, undefined);
+  assert.equal(first.exportTariffDiagnostic.code, "EXPORT_TARIFF_RETRIEVAL_FAILED");
+  const repeated = await h.coordinator.get("site-a", undefined, identity(exportAccount));
+  assert.equal(repeated, first);
+  assert.equal(h.counts().sessions, 1);
+  exportAccount = "export-account-b";
+  const changed = await h.coordinator.get("site-a", undefined, identity(exportAccount));
+  assert.equal(changed.exportTariffDiagnostic.code, "EXPORT_TARIFF_RETRIEVAL_FAILED");
+  assert.equal(h.counts().sessions, 2);
+});
+
+test("recovery never launders export evidence from a previous account", async () => {
+  const old = { vehicles: [], lastSuccessfulUpdate: "2026-10-11T10:00:00.000Z", stale: true,
+    scheduleRecording: { status: "persisted", change: "initial", code: null },
+    exportTariff: { status: "available", accountRef: "export-account-a",
+    observedAt: "2026-10-11T10:00:00.000Z", agreement: { validFrom: "2026-10-01T23:00:00.000Z",
+      validTo: "2027-10-01T23:00:00.000Z", productCode: "NEXT_EXPORT_PREMIUM_V3",
+      tariffCode: "E-1R-NEXT_EXPORT_PREMIUM_V3-G" }, price: { amount: 0.175, currency: "GBP", unit: "kWh" } } };
+  const h = harness({ compatible: old, expectedExportAccountRef: "export-account-b",
+    sessionExportAccountRef: "export-account-b", credentialFailure: () => true });
+  const recovered = await h.coordinator.get("site-a", undefined, { accountRef: "export-account-b",
+    productCode: "NEXT_EXPORT_PREMIUM_V3", tariffCode: "E-1R-NEXT_EXPORT_PREMIUM_V3-G" });
+  assert.equal(recovered.stale, true);
+  assert.equal(recovered.exportTariff, undefined);
+  assert.equal(recovered.exportTariffDiagnostic.code, "EXPORT_ACCOUNT_CONTEXT_CHANGED");
 });
 
 test("missing, null, malformed and partial dispatch reads never record or publish", async () => {

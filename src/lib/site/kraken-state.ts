@@ -1,5 +1,6 @@
 import { getRecordedKrakenState } from "./kraken-refresh";
 import type { KrakenImportTariffEvidence } from "../kraken/import-tariff";
+import type { KrakenExportTariffEvidence } from "../kraken/export-tariff";
 
 export type KrakenVehicleStatus = {
     currentState: string | null;
@@ -61,6 +62,8 @@ export type KrakenState = {
     scheduleRecording?: KrakenScheduleRecording;
     importTariff?: KrakenImportTariffEvidence;
     importTariffDiagnostic?: { status: "unavailable"; code: string };
+    exportTariff?: KrakenExportTariffEvidence;
+    exportTariffDiagnostic?: { status: "unavailable"; code: string };
 };
 
 export type KrakenScheduleRecording = {
@@ -78,6 +81,8 @@ export function getSmartControlSetting(isSuspended: boolean | null): string {
 
 export async function getKrakenState(site: { id: string; integrations?: { kraken: {
     importTariffIdentity?: { tariffCode: string; meterPointRef: string };
+    exportTariffIdentity?: { accountRef: string; productCode: string; tariffCode: string };
 } } }): Promise<KrakenState> {
-    return getRecordedKrakenState(site.id, site.integrations?.kraken.importTariffIdentity);
+    return getRecordedKrakenState(site.id, site.integrations?.kraken.importTariffIdentity,
+        site.integrations?.kraken.exportTariffIdentity);
 }

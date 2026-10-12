@@ -54,6 +54,7 @@ export async function getKrakenToken(): Promise<string> {
 
 type KrakenAuthentication = { email: string; password: string };
 type KrakenReadConfiguration = KrakenAuthentication & { accountNumber: string; accountRef: string };
+type KrakenExportReadConfiguration = KrakenAuthentication & { accountNumber: string; accountRef: string };
 
 function captureKrakenAuthentication(): KrakenAuthentication {
   const email = process.env.EON_EMAIL;
@@ -77,8 +78,23 @@ export function getKrakenAccountReference(): string {
   return captureKrakenAccount().accountRef;
 }
 
+/** Opaque configured export-account identity; no credentials or raw account ID escape. */
+export function getKrakenExportAccountReference(): string | null {
+  const accountNumber = process.env.EON_EXPORT_ACCOUNT;
+  return accountNumber
+    ? createHash("sha256").update(`eon-account\0${accountNumber}`).digest("hex")
+    : null;
+}
+
 function captureKrakenReadConfiguration(): KrakenReadConfiguration {
   return { ...captureKrakenAccount(), ...captureKrakenAuthentication() };
+}
+
+function captureKrakenExportConfiguration(authentication: KrakenAuthentication): KrakenExportReadConfiguration | null {
+  const accountNumber = process.env.EON_EXPORT_ACCOUNT;
+  if (!accountNumber) return null;
+  return { ...authentication, accountNumber,
+    accountRef: createHash("sha256").update(`eon-account\0${accountNumber}`).digest("hex") };
 }
 
 async function obtainKrakenToken({ email, password }: KrakenAuthentication): Promise<string> {
@@ -215,6 +231,28 @@ async function getKrakenImportTariffFor(configuration: KrakenReadConfiguration) 
   return { accountRef: configuration.accountRef, electricityAgreements };
 }
 
+async function getKrakenExportTariffFor(configuration: KrakenExportReadConfiguration) {
+  const token = await obtainKrakenToken(configuration);
+  const data = await krakenGraphQL<{ account: { electricityAgreements: Array<Record<string, unknown>> } }>(`
+    query {
+      account(accountNumber: ${JSON.stringify(configuration.accountNumber)}) {
+        electricityAgreements(active: true) {
+          validFrom validTo isRevoked
+          meterPoint { direction }
+          tariff {
+            __typename
+            ... on StandardTariff {
+              productCode tariffCode displayName fullName isExport unitRate preVatUnitRate
+            }
+          }
+        }
+      }
+    }
+  `, token);
+  return { accountRef: configuration.accountRef, rateUnit: "p/kWh",
+    electricityAgreements: data.account.electricityAgreements };
+}
+
 export async function getKrakenDevices(): Promise<KrakenDevice[]> {
   return getKrakenDevicesFor(captureKrakenReadConfiguration());
 }
@@ -323,10 +361,15 @@ async function getKrakenPlannedDispatchResponseFor(
  * Raw account identity and credentials remain closed over and are never returned. */
 export function createKrakenReadSession() {
   const configuration = captureKrakenReadConfiguration();
+  const exportConfiguration = captureKrakenExportConfiguration(configuration);
   return Object.freeze({
     accountRef: configuration.accountRef,
+    exportAccountRef: exportConfiguration?.accountRef ?? null,
     getDevices: () => getKrakenDevicesFor(configuration),
     getImportTariff: () => getKrakenImportTariffFor(configuration),
+    getExportTariff: () => exportConfiguration
+      ? getKrakenExportTariffFor(exportConfiguration)
+      : Promise.reject(Error("E.ON export account is not configured")),
     getVehicleStatus: (deviceId: string) => getKrakenVehicleStatusFor(deviceId, configuration),
     getPlannedDispatchResponse: (deviceId: string) =>
       getKrakenPlannedDispatchResponseFor(deviceId, configuration),
