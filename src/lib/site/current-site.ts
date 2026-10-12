@@ -8,6 +8,10 @@ export const currentSite: Site = {
         kraken: {
             enabled: true,
             wholeHomeDispatchRate: { enabled: true, importPrice: null },
+            importTariffIdentity: {
+                tariffCode: "E-TOU-NEXT_DRIVE_SMART_V5_2-G",
+                meterPointRef: "45ee067bfe464f8f50729df68fbe962c6837d98db03443e7b7648de2bb70e0f9",
+            },
         },
 
         homeAssistant: {
