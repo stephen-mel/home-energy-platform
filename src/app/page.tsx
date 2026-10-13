@@ -7,6 +7,8 @@ import { getSitePriceSignal } from "../lib/site/get-site-price-signal";
 import LiveHomeEnergy from "../components/LiveHomeEnergy";
 import { getCurrentSite } from "../lib/site/repository";
 import { getHomeDashboardState } from "../lib/site/get-home-dashboard-state";
+import FinancialOverview from "../components/FinancialOverview";
+import { calculateElectricityFinancialOverview } from "../lib/financial/electricity-overview";
 
 import ReadyByControl from "../components/ReadyByControl";
 import TargetSocControl from "../components/TargetSocControl";
@@ -40,6 +42,12 @@ export default async function Home() {
   const krakenError = siteState.integrations.kraken.error;
   const homeAssistant = siteState.integrations.homeAssistant;
   const pricePlan = getSitePriceSignal(site, kraken, siteState.updatedAt);
+  const financialPeriod = { start: siteState.updatedAt,
+    end: new Date(Date.parse(siteState.updatedAt) + 24 * 60 * 60 * 1000).toISOString() };
+  // HEP currently has instantaneous HA power only, not interval meter energy.
+  // Keep financial totals unavailable until measured/explicitly estimated energy is supplied.
+  const financialOverview = calculateElectricityFinancialOverview({ period: financialPeriod,
+    signal: pricePlan.signal, readings: [] });
 
   return (
     <main className="min-h-screen bg-zinc-950 px-6 py-10 text-white">
@@ -57,6 +65,7 @@ export default async function Home() {
           <HomeEnergyPlan plan={pricePlan} />
         </LiveHomeEnergy>
         <EnergyOptimisation result={siteState.reconciliation} timeZone={site.tariff?.timeZone ?? "Europe/London"} />
+        <FinancialOverview overview={financialOverview} timeZone={pricePlan.timeZone} />
         <h2 className="mb-3 text-2xl font-semibold">Electric Vehicles</h2>
         <p className="mb-6 text-sm text-zinc-400">
           {kraken?.stale ? "Last known vehicle data from Kraken Flex" : "Vehicle data from Kraken Flex"}
