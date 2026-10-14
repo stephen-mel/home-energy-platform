@@ -33,11 +33,12 @@ const raw=()=>({response:{energy_site_id:Number(site.integrations.tesla.energySi
 const observation=()=>captureObservedTariff(raw(),site.integrations.tesla.energySiteId,now);
 const kraken=()=>({stale:false,lastSuccessfulUpdate:now,vehicles:[{id:'q7',name:'Q7',plannedDispatches:[]}]});
 const state=k=>({site,updatedAt:now,integrations:{kraken:{enabled:true,data:k,error:null},homeAssistant:{enabled:false,data:null,error:null},tesla:{enabled:true,data:null,error:null}}});
-function loader(k=kraken(),read=async()=>observation()) {
-  const calls={kraken:0,tesla:0};
+function loader(k=kraken(),read=async()=>observation(),ownership={status:'missing'}) {
+  const calls={kraken:0,tesla:0,ownership:0};
   const loaded=load('src/lib/site/get-home-dashboard-state.ts',{
     './get-site-state':{getSiteState:async()=>{calls.kraken++;return state(k);}},
     './tesla-observation':{getSiteTeslaObservation:async()=>{calls.tesla++;return read();}},
+    '../tesla-tariff/ownership-store':{ownershipStore:()=>({read:async()=>{calls.ownership++;return ownership;}})},
     '../tesla-tariff/reconciliation':domain,
   });return {run:()=>loaded.getHomeDashboardState(site),calls};
 }
@@ -52,7 +53,7 @@ test('one fresh snapshot reaches component; base/export differences remain unman
   assert.ok(result.reconciliation.unmanaged.differences.some(p=>p.channels.includes('export')));
   const markup=renderToStaticMarkup(React.createElement(Card,{result:result.reconciliation,timeZone:'Europe/London'}));
   assert.match(markup,/No managed SMART update identified/);assert.match(markup,/17p\/kWh/);
-  assert.deepEqual(x.calls,{kraken:1,tesla:1});
+  assert.deepEqual(x.calls,{kraken:1,tesla:1,ownership:1});
 });
 test('fresh daytime SMART produces non-executable proposal preserving observed export and no manufactured ownership',async()=>{
   const k=kraken();k.vehicles[0].plannedDispatches=[{start:'2026-09-26T12:30:00+01:00',end:'2026-09-26T14:00:00+01:00',type:'SMART',energyAddedKwh:null}];
@@ -79,6 +80,35 @@ test('missing, persisted stale and expired Kraken retain safe semantics without 
 test('incomplete or stale Tesla observations remain indeterminate',async()=>{
   for(const change of [o=>{o.tariff=null;},o=>{o.source.observedAt='2026-09-26T10:57:00Z';}]){
     const o=observation();change(o);assert.equal((await loader(kraken(),async()=>o).run()).reconciliation.status,'indeterminate');
+  }
+});
+test('durable ownership reaches real reconciliation and permits an exact restoration review',async()=>{
+  const scheduled=kraken();scheduled.vehicles[0].plannedDispatches=[{start:'2026-09-26T13:00:00+01:00',end:'2026-09-26T14:00:00+01:00',type:'SMART',energyAddedKwh:'1'}];
+  const first=domain.reconcileTeslaTariff({site,energySiteId:site.integrations.tesla.energySiteId,kraken:scheduled,
+    observation:observation(),now,comparisonDomain:{start:now,end:'2026-09-27T12:00:00+01:00'}});
+  assert.equal(first.status,'update-required');
+  const applied={...observation(),tariff:structuredClone(first.proposal.bound.representation)};
+  const evidence={version:1,energySiteId:site.integrations.tesla.energySiteId,timeZone:'Europe/London',createdAt:now,updatedAt:now,
+    validUntil:'2026-09-27T12:00:00+01:00',basis:'confirmed-write-readback',baselineFingerprint:'a'.repeat(64),
+    readbackFingerprint:'b'.repeat(64),proposalFingerprint:'c'.repeat(64),smartEvidenceFingerprint:'d'.repeat(64),
+    intervals:[{start:'2026-09-26T13:00:00+01:00',end:'2026-09-26T14:00:00+01:00',
+      restoreBaselineFingerprint:'a'.repeat(64),applied:{amount:0.0299,currency:'GBP',unit:'kWh'},restore:{amount:0.25177,currency:'GBP',unit:'kWh'}}]};
+  const x=loader(kraken(),async()=>applied,{status:'available',snapshot:{version:2,generation:'00000000-0000-4000-8000-000000000000',
+    evidence,checksum:'a'.repeat(64),historyDigest:'b'.repeat(64)}});
+  const result=(await x.run()).reconciliation;
+  assert.equal(result.status,'update-required');assert.equal(result.writeReady,false);assert.equal(result.rollbackProven,false);
+  assert.equal(result.proposal.input.observedReplacement.managedScope.previous.energySiteId,site.integrations.tesla.energySiteId);
+  const restored=result.managed.target.import.filter(w=>Date.parse(w.start)<Date.parse(evidence.intervals[0].end)
+    && Date.parse(w.end)>Date.parse(evidence.intervals[0].start));
+  assert.ok(restored.length);assert.ok(restored.every(w=>w.price.amount===0.25177));
+  assert.deepEqual(x.calls,{kraken:1,tesla:1,ownership:1});
+});
+test('invalid or unavailable ownership fails closed without hiding the live site snapshot',async()=>{
+  for(const ownership of [{status:'invalid',code:'OWNERSHIP_STORE_INVALID'},{status:'unavailable'}]) {
+    const result=await loader(kraken(),async()=>observation(),ownership).run();
+    assert.equal(result.reconciliation.status,'indeterminate');assert.equal(result.reconciliation.proposal,null);
+    assert.match(result.reconciliation.diagnostic,/OWNERSHIP_STORE_/);
+    assert.ok(result.integrations.kraken.data);assert.ok(result.integrations.tesla.data);
   }
 });
 test('Tesla boundary uses one configured site GET; no discovery, raw response, wrong-site acceptance or token refresh',async()=>{
@@ -132,7 +162,7 @@ for (const stall of ['headers','body']) test(`Tesla ${stall} stall aborts at the
   assert.equal(result.reconciliation.status,'indeterminate');assert.equal(result.reconciliation.diagnostic,'TESLA_READ_UNAVAILABLE');
   assert.equal(result.integrations.tesla.data,null);assert.equal(result.reconciliation.proposal,null);
   assert.equal(result.reconciliation.writeReady,false);assert.equal(result.reconciliation.rollbackProven,false);
-  assert.deepEqual(x.calls,{kraken:1,tesla:1});assert.equal(attempts,1);
+  assert.deepEqual(x.calls,{kraken:1,tesla:1,ownership:1});assert.equal(attempts,1);
   assert.doesNotMatch(JSON.stringify(result),/secret-test-token|secret-refresh/);
 });
 
@@ -180,7 +210,7 @@ test('503 with an open unread body aborts transport before timer cleanup and pre
   assert.equal(result.integrations.tesla.data,null);assert.equal(result.integrations.tesla.error,'TESLA_READ_UNAVAILABLE');
   assert.equal(result.reconciliation.status,'indeterminate');assert.equal(result.reconciliation.proposal,null);
   assert.equal(result.reconciliation.writeReady,false);assert.equal(result.reconciliation.rollbackProven,false);
-  assert.equal(attempts,1);assert.deepEqual(x.calls,{kraken:1,tesla:1});
+  assert.equal(attempts,1);assert.deepEqual(x.calls,{kraken:1,tesla:1,ownership:1});
   assert.doesNotMatch(JSON.stringify(result),/secret-test-token|secret-refresh/);
 });
 
