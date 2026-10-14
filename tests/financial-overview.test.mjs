@@ -111,4 +111,9 @@ test("dashboard card reports unavailable totals, coverage and verified rates hon
   assert.match(html, /Import data coverage:.*0%/); assert.match(html, /Export data coverage:.*0%/);
   assert.match(html, /23\.978p\/kWh/); assert.match(html, /2\.85p\/kWh/); assert.match(html, /17\.5p\/kWh/);
   assert.match(html, /Complete interval import and export energy readings are unavailable/);
+  result.limitations.splice(0, result.limitations.length, "REPEATED_SAFE_DIAGNOSTIC", "REPEATED_SAFE_DIAGNOSTIC");
+  const errors = [], original = console.error; console.error = (...values) => errors.push(values.join(" "));
+  try { renderToStaticMarkup(component.default({ overview: result, timeZone: "Europe/London" })); }
+  finally { console.error = original; }
+  assert.equal(errors.some(value => value.includes("same key")), false);
 });

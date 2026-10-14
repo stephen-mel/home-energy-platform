@@ -9,6 +9,10 @@ import { DatabaseSync } from "node:sqlite";
 import { loadStore } from "./helpers/kraken-schedule-store.mjs";
 
 function loadCoordinator() {
+  const historicalExports = {};
+  vm.runInNewContext(ts.transpileModule(fs.readFileSync("src/lib/kraken/historical-import-rates.ts", "utf8"), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  }).outputText, { exports: historicalExports, Date, Object, Array, Number, Error, Set, structuredClone });
   const source = ts.transpileModule(fs.readFileSync("src/lib/site/kraken-refresh.ts", "utf8"), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText;
@@ -28,9 +32,10 @@ function loadCoordinator() {
       } };
       if (name === "../kraken/import-tariff") return { validateKrakenImportTariff(_raw, expected) {
         return { status: "available", accountRef: expected.accountRef, observedAt: expected.observedAt,
-          agreement: { validFrom: "2026-01-17T00:00:00Z", validTo: "2027-01-17T00:00:00Z",
+          agreement: { validFrom: "2026-01-17T00:00:00.000Z", validTo: "2027-01-17T00:00:00.000Z",
             productCode: "NEXT_DRIVE_SMART_V5_2", tariffCode: "E-TOU-NEXT_DRIVE_SMART_V5_2-G", meterPointRef: "meter-a" },
-          version: {}, exportStatus: "unknown" };
+          version: { normalImport: { amount: 0.23978, currency: "GBP", unit: "kWh" },
+            scheduledChargingImport: { amount: 0.0285, currency: "GBP", unit: "kWh" } }, exportStatus: "unknown" };
       } };
       if (name === "../kraken/export-tariff") return { validateKrakenExportTariff(_raw, expected) {
         if (expected.accountRef === expected.importAccountRef)
@@ -40,6 +45,7 @@ function loadCoordinator() {
             productCode: "NEXT_EXPORT_PREMIUM_V3", tariffCode: "E-1R-NEXT_EXPORT_PREMIUM_V3-G" },
           price: { amount: 0.175, currency: "GBP", unit: "kWh" } };
       } };
+      if (name === "../kraken/historical-import-rates") return historicalExports;
       if (name === "../kraken/schedule-store") return {
         scheduleObservationStore() { throw Error("not used"); },
         scheduleScopeId(scope) { return JSON.stringify([scope.siteId, scope.accountRef]); },
@@ -59,7 +65,7 @@ const slot = (start = "2026-10-11T12:00:00+01:00", end = "2026-10-11T12:30:00+01
 const device = (id = "ev-a", name = "EV A") => ({ id, name, deviceType: "EV", provider: "kraken",
   vehicleBatterySize: "77.0", chargePointPowerOutput: "7.2", preferences: null, preferenceSetting: null });
 const vehicleStatus = () => ({ currentState: "SMART_CHARGING", isSuspended: false,
-  stateOfCharge: { value: 42 }, activePower: { value: 7.1 }, stateOfChargeLimit: null });
+  stateOfCharge: { value: "42.00" }, activePower: { value: "7.1" }, stateOfChargeLimit: null });
 function harness(options = {}) {
   let now = options.now ?? Date.parse("2026-10-11T10:00:00Z");
   let sessions = 0, deviceCalls = 0, statusCalls = 0, dispatchCalls = 0, records = 0, writes = 0;
@@ -80,8 +86,12 @@ function harness(options = {}) {
         exportAccountRef,
         async getImportTariff() { if (options.tariffFailure) throw Error("tariff failed"); return {}; },
         async getExportTariff() { if (options.exportTariffFailure) throw Error("export tariff failed"); return {}; },
+        async getHistoricalImportRates(period) { if (options.historicalFailure) throw Error("historical failed");
+          options.onHistorical?.(period); return options.historicalResponse ?? { accountRef: options.accountRef ?? "account-a",
+            meterPointRef: "meter-a", complete: true, edges: [{ cursor: "history-1",
+              node: { value: "23.97800", validFrom: period.start, validTo: period.end } }] }; },
         async getDevices() { deviceCalls++; return options.devices ?? [device()]; },
-        async getVehicleStatus() { statusCalls++; if (options.statusFailure) throw Error("status failed"); return vehicleStatus(); },
+        async getVehicleStatus() { statusCalls++; if (options.statusFailure) throw Error("status failed"); return options.vehicleStatus ?? vehicleStatus(); },
         async getPlannedDispatchResponse(id) { dispatchCalls++;
           const response = await (options.dispatchResponse?.(id) ?? { status: "complete", explicitlyEmpty: !sessionsByDevice[id]?.length,
             dispatches: sessionsByDevice[id] ?? [] });
@@ -117,6 +127,82 @@ test("complete and explicit-empty refreshes create detached reads with exact val
   assert.equal(captured[0].read.vehicles[0].plannedDispatches[0].start, slot().start);
   assert.deepEqual(h.counts(), { sessions: 1, deviceCalls: 1, statusCalls: 2, dispatchCalls: 2, records: 1, writes: 1 });
 });
+
+test("one refresh session carries exact bounded historical evidence without another session", async () => {
+  const period={start:"2026-10-10T10:00:00.000Z",end:"2026-10-11T10:00:00.000Z"};let captured;
+  const h=harness({onHistorical:value=>{captured=value;}});
+  const result=await h.coordinator.get("site-a",{tariffCode:"tariff",meterPointRef:"meter-a"},undefined,period);
+  assert.deepEqual(plain(captured),period);assert.equal(result.historicalImportRates.status,"available");
+  assert.deepEqual(h.counts(),{sessions:1,deviceCalls:1,statusCalls:1,dispatchCalls:1,records:1,writes:1});
+});
+
+test("client-shaped 48-interval Relay history passes the real validator; malformed coverage stays unavailable",async()=>{
+ const period={start:"2026-10-10T10:00:00.000Z",end:"2026-10-11T10:00:00.000Z"},start=Date.parse(period.start);
+ const edges=Array.from({length:48},(_,index)=>({cursor:`edge-${index}`,node:{value:index<26?"23.97800":"2.85000",
+  validFrom:new Date(start+index*1800000).toISOString(),validTo:new Date(start+(index+1)*1800000).toISOString()}}));
+ const h=harness({historicalResponse:{accountRef:"account-a",meterPointRef:"meter-a",complete:true,edges}});
+ const result=await h.coordinator.get("site-a",{tariffCode:"tariff",meterPointRef:"meter-a"},undefined,period);
+ assert.equal(result.historicalImportRates.status,"available");assert.equal(result.historicalImportRates.windows.length,48);
+ for(const mutate of [
+  value=>{delete value.edges[0].node;},
+  value=>{value.edges[1].node.validFrom=new Date(start+45*60000).toISOString();},
+  value=>{value.edges[1].node.validFrom=new Date(start+15*60000).toISOString();},
+ ]) { const broken=structuredClone({accountRef:"account-a",meterPointRef:"meter-a",complete:true,edges});mutate(broken);
+   const check=harness({historicalResponse:broken});const state=await check.coordinator.get("site-a",{tariffCode:"tariff",meterPointRef:"meter-a"},undefined,period);
+   assert.equal(state.historicalImportRates,undefined);assert.equal(state.historicalImportRatesDiagnostic.status,"unavailable"); }
+});
+
+test("real coordinator and validator accept equivalent client timestamps without milliseconds and offsets",async()=>{
+ const period={start:"2026-10-10T10:00:00.000Z",end:"2026-10-11T10:00:00.000Z"},start=Date.parse(period.start);
+ const format=(instant,index)=>index%2===0?new Date(instant).toISOString().replace('.000Z','Z'):
+  new Date(instant+3600000).toISOString().replace('.000Z','+01:00');
+ const edges=Array.from({length:48},(_,index)=>({cursor:`offset-${index}`,node:{value:index<26?"23.97800":"2.85000",
+  validFrom:format(start+index*1800000,index),validTo:format(start+(index+1)*1800000,index)}}));
+ const h=harness({historicalResponse:{accountRef:"account-a",meterPointRef:"meter-a",complete:true,edges}});
+ const result=await h.coordinator.get("site-a",{tariffCode:"tariff",meterPointRef:"meter-a"},undefined,period);
+ assert.equal(result.historicalImportRates.status,"available");assert.equal(result.historicalImportRates.windows.length,48);
+ assert.equal(result.historicalImportRates.windows[0].start,period.start);
+ assert.equal(result.historicalImportRates.windows.at(-1).end,period.end);
+});
+
+test("observed Kraken decimal-string status metrics become finite internal numbers", async () => {
+  const h = harness({ vehicleStatus: { currentState: "SMART_CONTROL_IN_PROGRESS", isSuspended: false,
+    stateOfCharge: { value: "78.00" }, activePower: { value: "0.0" }, stateOfChargeLimit: null } });
+  const result = await h.coordinator.get("site-a");
+  assert.equal(result.vehicles[0].status.stateOfCharge.value, 78);
+  assert.equal(result.vehicles[0].status.activePower.value, 0);
+});
+
+test("complete previously observed production device shape validates without coercing schedule fields", async () => {
+  const observed = { ...device(), preferences: { schedules: Array.from({ length: 7 }, (_, index) => ({
+    dayOfWeek: ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"][index],
+    time: "07:00:00", min: null, max: 100, upperLimit: 100,
+  })) }, preferenceSetting: { scheduleSettings: [{ timeFrom: "00:00:00", timeTo: "23:30:00", timeStep: 30,
+    min: "10.00", max: "100.00", step: "1.00" }] } };
+  const h = harness({ devices: [observed], vehicleStatus: { currentState: "SMART_CONTROL_IN_PROGRESS", isSuspended: false,
+    stateOfCharge: { value: "78.00" }, activePower: { value: "0.0" }, stateOfChargeLimit: null } });
+  const result = await h.coordinator.get("site-a");
+  assert.equal(result.vehicles[0].preferences.schedules[0].max, 100);
+  assert.equal(result.vehicles[0].preferenceSetting.scheduleSettings[0].min, "10.00");
+  assert.equal(result.vehicles[0].status.stateOfCharge.value, 78);
+});
+
+test("parser failures identify a safe field path without including raw values", async () => {
+  const h = harness({ vehicleStatus: { currentState: null, isSuspended: null,
+    stateOfCharge: { value: "SECRET-NOT-A-DECIMAL" }, activePower: { value: "0.0" }, stateOfChargeLimit: null } });
+  await assert.rejects(h.coordinator.get("site-a"), error => {
+    assert.equal(error.message, "KRAKEN_DEVICE_RESPONSE_INVALID:status.stateOfCharge.value");
+    assert.doesNotMatch(error.message, /SECRET/); return true;
+  });
+});
+
+for (const value of [" 78.00", "NaN", "Infinity", "1e2", true, {}, Infinity, NaN])
+  test(`malformed Kraken status metric fails closed: ${String(value)}`, async () => {
+    const h = harness({ vehicleStatus: { currentState: null, isSuspended: null,
+      stateOfCharge: { value }, activePower: { value: "0.0" }, stateOfChargeLimit: null } });
+    await assert.rejects(h.coordinator.get("site-a"), /KRAKEN_DEVICE_RESPONSE_INVALID/);
+    assert.equal(h.counts().records, 0); assert.equal(h.counts().writes, 0);
+  });
 
 test("missing tariff evidence does not discard a complete vehicle refresh", async () => {
   const h = harness({ tariffFailure: true });

@@ -8,9 +8,13 @@ const readFailures = new Set(["TESLA_DISABLED", "TESLA_SITE_NOT_CONFIGURED", "TE
 /** One request snapshot. Reuses Kraken's existing cache through getSiteState;
  * neither reconciliation nor presentation fetches it again. No background work.
  */
-export async function getHomeDashboardState(site: Site) {
+export async function getHomeDashboardState(site: Site, historicalPeriod?: { start: string; end: string }) {
+    const financialEnd = Math.floor(Date.now() / (30 * 60 * 1000)) * 30 * 60 * 1000;
+    const requestedHistoricalPeriod = historicalPeriod ?? {
+        start: new Date(financialEnd - 24 * 60 * 60 * 1000).toISOString(), end: new Date(financialEnd).toISOString(),
+    };
     const [state, tesla] = await Promise.all([
-        getSiteState(site),
+        getSiteState(site, requestedHistoricalPeriod),
         getSiteTeslaObservation(site).then(data => ({ data, error: null }), error => ({ data: null,
             error: error instanceof Error && readFailures.has(error.message) ? error.message : "TESLA_READ_UNAVAILABLE" })),
     ]);
@@ -24,6 +28,6 @@ export async function getHomeDashboardState(site: Site) {
         : reconcileTeslaTariff({ site, energySiteId: site.integrations.tesla.energySiteId!,
             kraken, observation: tesla.data!, now, comparisonDomain: domain });
     // No synthetic managedImport or previousKraken: retained ownership is absent.
-    return { ...state, reconciliation, integrations: { ...state.integrations,
+    return { ...state, financialPeriod: requestedHistoricalPeriod, reconciliation, integrations: { ...state.integrations,
         tesla: { enabled: site.integrations.tesla.enabled, ...tesla } } };
 }

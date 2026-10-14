@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import type { KrakenState } from "./kraken-state";
 import type { KrakenImportTariffEvidence } from "../kraken/import-tariff";
 import type { KrakenExportTariffEvidence } from "../kraken/export-tariff";
+import type { KrakenHistoricalImportRates } from "../kraken/historical-import-rates";
 
 // Local single-site adapter. Replace these two operations with per-site storage
 // before sharing a deployment between accounts. Never use the public directory.
@@ -81,6 +82,19 @@ const exportTariff: Parser<KrakenExportTariffEvidence> = object({
     agreement: object({ validFrom: timestamp, validTo: timestamp, productCode: string, tariffCode: string }),
     price: energyPrice,
 });
+const historicalImportRates: Parser<KrakenHistoricalImportRates> = object({
+    status: (input => { if (input !== "available") throw new Error("Invalid historical status"); return input; }) as Parser<"available">,
+    accountRef: string, meterPointRef: string, observedAt: timestamp,
+    period: object({ start: timestamp, end: timestamp }),
+    vatBasis: (input => { if (input !== "corroborated-not-independent") throw new Error("Invalid VAT basis"); return input; }) as Parser<"corroborated-not-independent">,
+    windows: array(object({ start: timestamp, end: timestamp, price: nullable(energyPrice),
+        kind: (input => { if (input !== "standard") throw new Error("Invalid kind"); return input; }) as Parser<"standard">,
+        condition: (input => { if (input !== "none") throw new Error("Invalid condition"); return input; }) as Parser<"none">,
+        sources: array(object({ provider: string, description: string, tariffVersion: optional(string),
+            observedAt: nullable(timestamp), stale: boolean, cause: optional(object({ kind: (input => {
+                if (input !== "ev-dispatch") throw new Error("Invalid cause"); return input;
+            }) as Parser<"ev-dispatch">, assetId: string, assetName: optional(string), start: timestamp, end: timestamp, dispatchType: string })) })) })),
+});
 const parseState = object<Omit<KrakenState, "stale">>({
     lastSuccessfulUpdate: timestamp,
     scheduleRecording: optional(object({ status: recordingStatus, change: recordingChange, code: nullable(string) })),
@@ -91,6 +105,11 @@ const parseState = object<Omit<KrakenState, "stale">>({
     })),
     exportTariff: optional(exportTariff),
     exportTariffDiagnostic: optional(object({
+        status: (input => { if (input !== "unavailable") throw new Error("Invalid tariff status"); return input; }) as Parser<"unavailable">,
+        code: string,
+    })),
+    historicalImportRates: optional(historicalImportRates),
+    historicalImportRatesDiagnostic: optional(object({
         status: (input => { if (input !== "unavailable") throw new Error("Invalid tariff status"); return input; }) as Parser<"unavailable">,
         code: string,
     })),

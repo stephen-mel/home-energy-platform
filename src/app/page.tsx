@@ -3,12 +3,13 @@ import VehicleActivity from "../components/VehicleActivity";
 import KrakenPlannedSessions from "../components/KrakenPlannedSessions";
 import { formatLocalDateTime } from "../lib/presentation/local-time";
 import HomeEnergyPlan from "../components/HomeEnergyPlan";
-import { getSitePriceSignal } from "../lib/site/get-site-price-signal";
+import { getSitePriceSignal, getSitePriceSignalForPeriod } from "../lib/site/get-site-price-signal";
 import LiveHomeEnergy from "../components/LiveHomeEnergy";
 import { getCurrentSite } from "../lib/site/repository";
 import { getHomeDashboardState } from "../lib/site/get-home-dashboard-state";
 import FinancialOverview from "../components/FinancialOverview";
 import { calculateElectricityFinancialOverview } from "../lib/financial/electricity-overview";
+import { getMeasuredGridEnergy } from "../lib/financial/home-assistant-energy";
 
 import ReadyByControl from "../components/ReadyByControl";
 import TargetSocControl from "../components/TargetSocControl";
@@ -36,18 +37,24 @@ function formatSmartControl(state: string | null) {
 export default async function Home() {
   const site = await getCurrentSite();
   const siteState = await getHomeDashboardState(site);
+  const financialPeriod = siteState.financialPeriod;
 
   const kraken = siteState.integrations.kraken.data;
   const vehicles = kraken?.vehicles ?? [];
   const krakenError = siteState.integrations.kraken.error;
   const homeAssistant = siteState.integrations.homeAssistant;
   const pricePlan = getSitePriceSignal(site, kraken, siteState.updatedAt);
-  const financialPeriod = { start: siteState.updatedAt,
-    end: new Date(Date.parse(siteState.updatedAt) + 24 * 60 * 60 * 1000).toISOString() };
-  // HEP currently has instantaneous HA power only, not interval meter energy.
-  // Keep financial totals unavailable until measured/explicitly estimated energy is supplied.
+  const financialPlan = getSitePriceSignalForPeriod(site, kraken, siteState.updatedAt, financialPeriod, true);
+  const energyConfig = site.integrations.homeAssistant.financialEnergy;
+  const measured = energyConfig ? await getMeasuredGridEnergy({ importEntityId: energyConfig.gridImportEntityId,
+    exportEntityId: energyConfig.gridExportEntityId, period: financialPeriod })
+    : { readings: [], diagnostics: ["Measured grid energy sensors are not configured."] };
   const financialOverview = calculateElectricityFinancialOverview({ period: financialPeriod,
-    signal: pricePlan.signal, readings: [] });
+    signal: financialPlan.signal, readings: measured.readings, dataLimitations: [
+      ...measured.diagnostics,
+      ...(kraken?.historicalImportRates?.vatBasis === "corroborated-not-independent"
+        ? ["Historical applicable rates match the current VAT-inclusive tariff evidence, but their VAT basis is not independently exposed by Kraken."] : []),
+    ] });
 
   return (
     <main className="min-h-screen bg-zinc-950 px-6 py-10 text-white">

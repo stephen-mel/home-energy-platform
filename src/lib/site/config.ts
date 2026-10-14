@@ -23,6 +23,7 @@ export type SiteIntegrationConfig = {
     homeAssistant: {
         enabled: boolean;
         assets?: HomeEnergyAssetConfig[];
+        financialEnergy?: { gridImportEntityId: string; gridExportEntityId: string };
     };
 
     tesla: {

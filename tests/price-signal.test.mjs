@@ -23,9 +23,54 @@ const curve = load('src/lib/tariff/price-signal.ts');
 const effectiveTariff = load('src/lib/tariff/effective-tariff.ts', { './price-signal': curve });
 const { effectivePriceCurveKey } = load('src/lib/tariff/compare-price-signal.ts');
 const adapter = load('src/lib/tariff/kraken-dispatches.ts', { './price-signal': curve });
-const { getSitePriceSignal } = load('src/lib/site/get-site-price-signal.ts', {
+const { getSitePriceSignal, getSitePriceSignalForPeriod } = load('src/lib/site/get-site-price-signal.ts', {
   '../tariff/price-signal': curve, '../tariff/kraken-dispatches': adapter,
   '../tariff/effective-tariff': effectiveTariff,
+});
+
+test('financial history never falls back to configured example rates without verified Kraken evidence', () => {
+  const config={integrations:{kraken:{enabled:true,wholeHomeDispatchRate:{enabled:true,importPrice:null},
+    importTariffIdentity:{tariffCode:'IMPORT',meterPointRef:'METER'},
+    exportTariffIdentity:{accountRef:'EXPORT',productCode:'EXPORT_PRODUCT',tariffCode:'EXPORT_TARIFF'}}},
+    tariff:{timeZone:'Europe/London',normalImport:price(0.99),export:price(0.88),versions:[{id:'configured',name:'configured',provider:'configured',
+      effectiveFrom:'2026-09-01T00:00:00Z',effectiveTo:'2026-10-01T00:00:00Z',pricesIncludeVat:true,
+      normalImport:price(0.99),export:price(0.88),scheduledChargingImport:price(0.01),standingCharge:null,dailyImportWindows:[]}]}};
+  const horizon={start:'2026-09-25T00:00:00Z',end:'2026-09-26T00:00:00Z'};
+  const absent=getSitePriceSignalForPeriod(config,null,'2026-09-25T12:00:00Z',horizon,true);
+  assert.ok(absent.signal.import.every(window=>window.price===null));
+  assert.ok(absent.signal.export.every(window=>window.price===null));
+
+  const version={id:'verified',name:'verified',provider:'eon-next-kraken',effectiveFrom:horizon.start,effectiveTo:horizon.end,
+    pricesIncludeVat:true,normalImport:price(0.23978),export:null,scheduledChargingImport:price(0.0285),standingCharge:null,
+    dailyImportWindows:[{start:'00:00',end:'06:00',kind:'guaranteed-off-peak',price:price(0.0285)}]};
+  const snapshot={stale:false,lastSuccessfulUpdate:'2026-09-25T12:00:00Z',vehicles:[],importTariff:{status:'available',accountRef:'IMPORT_ACCOUNT',
+    observedAt:'2026-09-25T12:00:00Z',agreement:{validFrom:'2026-01-01T00:00:00Z',validTo:'2027-01-01T00:00:00Z',
+      productCode:'IMPORT_PRODUCT',tariffCode:'IMPORT',meterPointRef:'METER'},version,exportStatus:'unknown'},
+    exportTariff:{status:'available',accountRef:'EXPORT',observedAt:'2026-09-25T12:00:00Z',
+      agreement:{validFrom:'2026-01-01T00:00:00Z',validTo:'2027-01-01T00:00:00Z',productCode:'EXPORT_PRODUCT',tariffCode:'EXPORT_TARIFF'},price:price(0.175)}};
+  const verified=getSitePriceSignalForPeriod(config,snapshot,'2026-09-25T12:00:00Z',horizon,true);
+  assert.ok(verified.signal.import.some(window=>window.price?.amount===0.0285));
+  assert.ok(verified.signal.import.some(window=>window.price?.amount===0.23978));
+  assert.ok(verified.signal.export.every(window=>window.price?.amount===0.175));
+});
+test('strict financial history uses only exact-period historical applicable-rate evidence',()=>{
+ const horizon={start:'2026-10-13T10:00:00.000Z',end:'2026-10-14T10:00:00.000Z'},now='2026-10-14T10:01:00.000Z';
+ const config={integrations:{kraken:{enabled:true,wholeHomeDispatchRate:{enabled:true,importPrice:null},
+  importTariffIdentity:{tariffCode:'IMPORT',meterPointRef:'METER'}}},tariff:{timeZone:'Europe/London',normalImport:null,export:null,versions:[]}};
+ const current={id:'current',name:'current',provider:'eon-next-kraken',effectiveFrom:'2026-10-13T23:00:00.000Z',effectiveTo:'2026-10-15T23:00:00.000Z',
+  pricesIncludeVat:true,normalImport:price(0.23978),export:null,scheduledChargingImport:price(0.0285),standingCharge:null,dailyImportWindows:[]};
+ const source=[{provider:'eon-next-kraken',description:'Historical applicable import rate',observedAt:now,stale:false}];
+ const snapshot={stale:false,lastSuccessfulUpdate:now,vehicles:[],importTariff:{status:'available',accountRef:'ACCOUNT',observedAt:now,
+  agreement:{validFrom:'2026-01-17T00:00:00.000Z',validTo:'2027-01-17T00:00:00.000Z',productCode:'PRODUCT',tariffCode:'IMPORT',meterPointRef:'METER'},version:current,exportStatus:'unknown'},
+  historicalImportRates:{status:'available',accountRef:'ACCOUNT',meterPointRef:'METER',observedAt:now,period:horizon,
+   vatBasis:'corroborated-not-independent',windows:[{start:horizon.start,end:'2026-10-13T23:00:00.000Z',price:price(0.23978),kind:'standard',condition:'none',sources:source},
+    {start:'2026-10-13T23:00:00.000Z',end:'2026-10-14T05:00:00.000Z',price:price(0.0285),kind:'standard',condition:'none',sources:source},
+    {start:'2026-10-14T05:00:00.000Z',end:horizon.end,price:price(0.23978),kind:'standard',condition:'none',sources:source}]}};
+ const result=getSitePriceSignalForPeriod(config,snapshot,now,horizon,true);
+ assert.ok(result.signal.import.every(window=>window.price!==null));
+ assert.equal(result.signal.import[0].start,horizon.start);assert.equal(result.signal.import.at(-1).end,horizon.end);
+ const missing=structuredClone(snapshot);missing.historicalImportRates.period.start='2026-10-13T10:30:00.000Z';
+ assert.ok(getSitePriceSignalForPeriod(config,missing,now,horizon,true).signal.import.some(window=>window.price===null));
 });
 const { default: HomeEnergyPlan } = load('src/components/HomeEnergyPlan.tsx', { react, './selected-home-energy-plan': { selectedHomeEnergyPlan() { throw Error('Legacy default must not invoke preview'); } }, 'react/jsx-runtime': jsxRuntime, './home-energy-plan-view': load('src/components/home-energy-plan-view.ts'), './use-dashboard-time': { useDashboardTime: value => value }, '../lib/presentation/local-time': load('src/lib/presentation/local-time.ts') });
 const now = '2026-09-18T00:00:00.000Z';

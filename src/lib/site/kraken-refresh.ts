@@ -10,6 +10,7 @@ import {
 import { requireCompleteDispatches } from "../kraken/dispatch-response";
 import { validateKrakenImportTariff } from "../kraken/import-tariff";
 import { validateKrakenExportTariff } from "../kraken/export-tariff";
+import { validateHistoricalImportRates } from "../kraken/historical-import-rates";
 import {
     scheduleObservationStore,
     scheduleScopeId,
@@ -44,91 +45,102 @@ type Dependencies = {
     readCompatibility: (scopeId: string) => Promise<KrakenState | null>;
     writeCompatibility: (scopeId: string, state: KrakenState) => Promise<void>;
 };
-type Entry = { state: KrakenState; storedAt: number; exportContextKey: string };
+type Entry = { state: KrakenState; storedAt: number; requestContextKey: string };
 
-function data(value: unknown, key: string): unknown {
-    if (!value || typeof value !== "object" || Array.isArray(value)) throw Error("KRAKEN_DEVICE_RESPONSE_INVALID");
+function invalidDevice(path: string): never { throw Error(`KRAKEN_DEVICE_RESPONSE_INVALID:${path}`); }
+function data(value: unknown, key: string, path: string): unknown {
+    if (!value || typeof value !== "object" || Array.isArray(value)) invalidDevice(path);
     const prototype = Object.getPrototypeOf(value);
     const constructor = prototype && Object.getOwnPropertyDescriptor(prototype, "constructor");
     if (!(prototype === null || Object.getPrototypeOf(prototype) === null && constructor
         && "value" in constructor && typeof constructor.value === "function" && constructor.value.name === "Object")
-        || Reflect.ownKeys(value).some(property => typeof property !== "string")) throw Error("KRAKEN_DEVICE_RESPONSE_INVALID");
+        || Reflect.ownKeys(value).some(property => typeof property !== "string")) invalidDevice(path);
     for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(value))) {
-        if (!("value" in descriptor) || !descriptor.enumerable) throw Error("KRAKEN_DEVICE_RESPONSE_INVALID");
+        if (!("value" in descriptor) || !descriptor.enumerable) invalidDevice(path);
     }
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (!descriptor) return undefined;
     return descriptor.value;
 }
-function list(value: unknown): unknown[] {
-    if (!Array.isArray(value)) throw Error("KRAKEN_DEVICE_RESPONSE_INVALID");
+function list(value: unknown, path: string): unknown[] {
+    if (!Array.isArray(value)) invalidDevice(path);
     const length = Object.getOwnPropertyDescriptor(value, "length");
-    if (!length || !("value" in length) || !Number.isInteger(length.value) || length.value < 0) throw Error("KRAKEN_DEVICE_RESPONSE_INVALID");
+    if (!length || !("value" in length) || !Number.isInteger(length.value) || length.value < 0) invalidDevice(path);
     const result: unknown[] = [];
     for (let index = 0; index < length.value; index++) {
         const item = Object.getOwnPropertyDescriptor(value, String(index));
-        if (!item || !("value" in item) || !item.enumerable) throw Error("KRAKEN_DEVICE_RESPONSE_INVALID");
+        if (!item || !("value" in item) || !item.enumerable) invalidDevice(`${path}[${index}]`);
         result.push(item.value);
     }
-    if (Reflect.ownKeys(value).length !== result.length + 1) throw Error("KRAKEN_DEVICE_RESPONSE_INVALID");
+    if (Reflect.ownKeys(value).length !== result.length + 1) invalidDevice(path);
     return result;
 }
-const requiredText = (value: unknown) => {
-    if (typeof value !== "string" || !value.trim()) throw Error("KRAKEN_DEVICE_RESPONSE_INVALID");
+const requiredText = (value: unknown, path: string): string => {
+    if (typeof value !== "string" || !value.trim()) invalidDevice(path);
     return value;
 };
-const nullableText = (value: unknown) => value === null || value === undefined ? null : requiredText(value);
-const nullableNumber = (value: unknown) => {
+const nullableText = (value: unknown, path: string): string | null => value === null || value === undefined ? null : requiredText(value, path);
+const nullableNumber = (value: unknown, path: string): number | null => {
     if (value === null || value === undefined) return null;
-    if (typeof value !== "number" || !Number.isFinite(value)) throw Error("KRAKEN_DEVICE_RESPONSE_INVALID");
+    if (typeof value !== "number" || !Number.isFinite(value)) invalidDevice(path);
     return value;
 };
 function schedules(value: unknown): KrakenVehicleState["preferences"] {
     if (value === null || value === undefined) return null;
-    return { schedules: list(data(value, "schedules")).map(item => ({
-        dayOfWeek: requiredText(data(item, "dayOfWeek")),
-        time: requiredText(data(item, "time")),
-        min: nullableNumber(data(item, "min")),
-        max: nullableNumber(data(item, "max")),
-        upperLimit: nullableNumber(data(item, "upperLimit")),
+    return { schedules: list(data(value, "schedules", "preferences"), "preferences.schedules").map((item, index) => ({
+        dayOfWeek: requiredText(data(item, "dayOfWeek", `preferences.schedules[${index}]`), `preferences.schedules[${index}].dayOfWeek`),
+        time: requiredText(data(item, "time", `preferences.schedules[${index}]`), `preferences.schedules[${index}].time`),
+        min: nullableNumber(data(item, "min", `preferences.schedules[${index}]`), `preferences.schedules[${index}].min`),
+        max: nullableNumber(data(item, "max", `preferences.schedules[${index}]`), `preferences.schedules[${index}].max`),
+        upperLimit: nullableNumber(data(item, "upperLimit", `preferences.schedules[${index}]`), `preferences.schedules[${index}].upperLimit`),
     })) };
 }
 function preferenceSetting(value: unknown): KrakenVehicleState["preferenceSetting"] {
     if (value === null || value === undefined) return null;
-    return { scheduleSettings: list(data(value, "scheduleSettings")).map(item => {
-        const timeStep = data(item, "timeStep");
-        if (typeof timeStep !== "number" || !Number.isFinite(timeStep)) throw Error("KRAKEN_DEVICE_RESPONSE_INVALID");
-        return { timeFrom: nullableText(data(item, "timeFrom")), timeTo: nullableText(data(item, "timeTo")),
-            timeStep, min: nullableText(data(item, "min")), max: nullableText(data(item, "max")),
-            step: requiredText(data(item, "step")) };
+    return { scheduleSettings: list(data(value, "scheduleSettings", "preferenceSetting"), "preferenceSetting.scheduleSettings").map((item, index) => {
+        const path = `preferenceSetting.scheduleSettings[${index}]`, timeStep = data(item, "timeStep", path);
+        if (typeof timeStep !== "number" || !Number.isFinite(timeStep)) invalidDevice(`${path}.timeStep`);
+        return { timeFrom: nullableText(data(item, "timeFrom", path), `${path}.timeFrom`),
+            timeTo: nullableText(data(item, "timeTo", path), `${path}.timeTo`), timeStep,
+            min: nullableText(data(item, "min", path), `${path}.min`), max: nullableText(data(item, "max", path), `${path}.max`),
+            step: requiredText(data(item, "step", path), `${path}.step`) };
     }) };
 }
-function metric(value: unknown): { value: number | null } | null {
+function metric(value: unknown, path: string): { value: number | null } | null {
     if (value === null || value === undefined) return null;
-    return { value: nullableNumber(data(value, "value")) };
+    const raw = data(value, "value", path);
+    if (raw === null || raw === undefined) return { value: null };
+    if (typeof raw !== "string" || !/^[+-]?(?:0|[1-9]\d*)(?:\.\d+)?$/.test(raw))
+        invalidDevice(`${path}.value`);
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) invalidDevice(`${path}.value`);
+    return { value: parsed };
 }
 function status(value: ClientVehicleStatus): KrakenVehicleStatus {
-    if (!value || typeof value !== "object" || Array.isArray(value)) throw Error("KRAKEN_DEVICE_RESPONSE_INVALID");
-    const currentState = data(value, "currentState"), isSuspended = data(value, "isSuspended");
+    if (!value || typeof value !== "object" || Array.isArray(value)) invalidDevice("status");
+    const currentState = data(value, "currentState", "status"), isSuspended = data(value, "isSuspended", "status");
     if (!(currentState === null || currentState === undefined || typeof currentState === "string")
         || !(isSuspended === null || isSuspended === undefined || typeof isSuspended === "boolean")) {
-        throw Error("KRAKEN_DEVICE_RESPONSE_INVALID");
+        invalidDevice(typeof currentState !== "string" && currentState !== null && currentState !== undefined
+            ? "status.currentState" : "status.isSuspended");
     }
     return { currentState: currentState ?? null, isSuspended: isSuspended ?? null,
-        stateOfCharge: metric(data(value, "stateOfCharge")), activePower: metric(data(value, "activePower")) };
+        stateOfCharge: metric(data(value, "stateOfCharge", "status"), "status.stateOfCharge"),
+        activePower: metric(data(value, "activePower", "status"), "status.activePower") };
 }
 function devices(value: unknown): KrakenDevice[] {
     const ids = new Set<string>();
-    return list(value).map(raw => {
-        const id = requiredText(data(raw, "id")), name = requiredText(data(raw, "name"));
-        if (ids.has(id)) throw Error("KRAKEN_DEVICE_RESPONSE_INVALID");
+    return list(value, "devices").map((raw, index) => {
+        const path = `devices[${index}]`, id = requiredText(data(raw, "id", path), `${path}.id`),
+            name = requiredText(data(raw, "name", path), `${path}.name`);
+        if (ids.has(id)) invalidDevice(`${path}.id`);
         ids.add(id);
-        return { id, name, deviceType: requiredText(data(raw, "deviceType")),
-            provider: requiredText(data(raw, "provider")),
-            vehicleBatterySize: nullableText(data(raw, "vehicleBatterySize")),
-            chargePointPowerOutput: nullableText(data(raw, "chargePointPowerOutput")),
-            preferences: schedules(data(raw, "preferences")),
-            preferenceSetting: preferenceSetting(data(raw, "preferenceSetting")) };
+        return { id, name, deviceType: requiredText(data(raw, "deviceType", path), `${path}.deviceType`),
+            provider: requiredText(data(raw, "provider", path), `${path}.provider`),
+            vehicleBatterySize: nullableText(data(raw, "vehicleBatterySize", path), `${path}.vehicleBatterySize`),
+            chargePointPowerOutput: nullableText(data(raw, "chargePointPowerOutput", path), `${path}.chargePointPowerOutput`),
+            preferences: schedules(data(raw, "preferences", path)),
+            preferenceSetting: preferenceSetting(data(raw, "preferenceSetting", path)) };
     });
 }
 function recording(result: ScheduleStoreWrite): KrakenScheduleRecording {
@@ -186,17 +198,20 @@ export function createKrakenRefreshCoordinator(dependencies: Dependencies) {
     async function refresh(scope: ScheduleScope, scopeId: string,
         tariffIdentity?: { tariffCode: string; meterPointRef: string },
         exportTariffIdentity?: { accountRef: string; productCode: string; tariffCode: string },
-        expectedExportAccountRef: string | null = null): Promise<KrakenState> {
+        expectedExportAccountRef: string | null = null,
+        historicalPeriod?: { start: string; end: string }): Promise<KrakenState> {
         const startedAt = new Date(dependencies.now()).toISOString();
         try {
             const session = dependencies.createSession();
-            if (requiredText(session.accountRef) !== scope.accountRef) throw Error("KRAKEN_ACCOUNT_CONTEXT_CHANGED");
+            if (requiredText(session.accountRef, "session.accountRef") !== scope.accountRef) throw Error("KRAKEN_ACCOUNT_CONTEXT_CHANGED");
             if (exportTariffIdentity && session.exportAccountRef !== expectedExportAccountRef)
                 throw Error("KRAKEN_EXPORT_ACCOUNT_CONTEXT_CHANGED");
-            const [deviceResponse, tariffRead, exportTariffRead] = await Promise.all([
+            const [deviceResponse, tariffRead, exportTariffRead, historicalRead] = await Promise.all([
                 session.getDevices(), session.getImportTariff().then(value => ({ ok: true as const, value }))
                     .catch(() => ({ ok: false as const })),
                 exportTariffIdentity ? session.getExportTariff().then(value => ({ ok: true as const, value }))
+                    .catch(() => ({ ok: false as const })) : Promise.resolve({ ok: false as const }),
+                historicalPeriod ? session.getHistoricalImportRates(historicalPeriod).then(value => ({ ok: true as const, value }))
                     .catch(() => ({ ok: false as const })) : Promise.resolve({ ok: false as const }),
             ]);
             const enumerated = devices(deviceResponse);
@@ -221,6 +236,15 @@ export function createKrakenRefreshCoordinator(dependencies: Dependencies) {
                 productCode: exportTariffIdentity?.productCode, tariffCode: exportTariffIdentity?.tariffCode,
             }) : { status: "unavailable" as const, code: exportTariffRead.ok
                 ? "EXPORT_ACCOUNT_IDENTITY_UNAVAILABLE" : "EXPORT_TARIFF_RETRIEVAL_FAILED" };
+            const historicalImportRates = historicalPeriod && historicalRead.ok && importTariff.status === "available"
+                ? validateHistoricalImportRates(historicalRead.value, { accountRef: scope.accountRef,
+                    meterPointRef: importTariff.agreement.meterPointRef, observedAt: retrievedAt, period: historicalPeriod,
+                    agreement: { validFrom: importTariff.agreement.validFrom, validTo: importTariff.agreement.validTo },
+                    corroboratingValues: [importTariff.version.normalImport, importTariff.version.scheduledChargingImport]
+                        .flatMap(price => price ? [Number((price.amount * 100).toPrecision(15))] : []) })
+                : { status: "unavailable" as const, code: historicalPeriod
+                    ? historicalRead.ok ? "CURRENT_TARIFF_EVIDENCE_UNAVAILABLE" : "HISTORICAL_RATE_RETRIEVAL_FAILED"
+                    : "HISTORICAL_RATE_PERIOD_NOT_REQUESTED" };
             const read: ScheduleRead = { scopeId, startedAt, retrievedAt, status: "complete",
                 provenance: "authenticated-query", vehicles: vehicles.map(vehicle => ({ id: vehicle.id,
                     name: vehicle.name, plannedDispatches: vehicle.plannedDispatches.map(dispatch => ({ ...dispatch })) })) };
@@ -233,12 +257,14 @@ export function createKrakenRefreshCoordinator(dependencies: Dependencies) {
                 ...(importTariff.status === "available" ? { importTariff }
                     : { importTariffDiagnostic: { status: "unavailable" as const, code: importTariff.code } }),
                 ...(exportTariff.status === "available" ? { exportTariff }
-                    : { exportTariffDiagnostic: { status: "unavailable" as const, code: exportTariff.code } }) };
+                    : { exportTariffDiagnostic: { status: "unavailable" as const, code: exportTariff.code } }),
+                ...(historicalImportRates.status === "available" ? { historicalImportRates }
+                    : { historicalImportRatesDiagnostic: { status: "unavailable" as const, code: historicalImportRates.code } }) };
             await dependencies.writeCompatibility(scopeId, state);
             // Freshness begins when authenticated retrieval completed, not when
             // best-effort compatibility publication eventually settles.
             memory.set(scopeId, { state, storedAt: retrievedAtMs,
-                exportContextKey: exportContextKey(exportTariffIdentity, expectedExportAccountRef) });
+                requestContextKey: JSON.stringify([exportContextKey(exportTariffIdentity, expectedExportAccountRef), historicalPeriod ?? null]) });
             return state;
         } catch (error) {
             const cached = memory.get(scopeId)?.state ?? await dependencies.readCompatibility(scopeId);
@@ -248,20 +274,23 @@ export function createKrakenRefreshCoordinator(dependencies: Dependencies) {
     }
     return {
         async get(siteId: string, tariffIdentity?: { tariffCode: string; meterPointRef: string },
-            exportTariffIdentity?: { accountRef: string; productCode: string; tariffCode: string }): Promise<KrakenState> {
-            const scope = { siteId: requiredText(siteId), accountRef: requiredText(dependencies.accountRef()) };
+            exportTariffIdentity?: { accountRef: string; productCode: string; tariffCode: string },
+            historicalPeriod?: { start: string; end: string }): Promise<KrakenState> {
+            const scope = { siteId: requiredText(siteId, "scope.siteId"),
+                accountRef: requiredText(dependencies.accountRef(), "scope.accountRef") };
             const scopeId = scheduleScopeId(scope);
             const expectedExportAccountRef = dependencies.exportAccountRef?.() ?? null;
             const currentExportContextKey = exportContextKey(exportTariffIdentity, expectedExportAccountRef);
-            const flightId = JSON.stringify([scopeId, currentExportContextKey]);
+            const requestContextKey = JSON.stringify([currentExportContextKey, historicalPeriod ?? null]);
+            const flightId = JSON.stringify([scopeId, requestContextKey]);
             const running = flights.get(flightId);
             if (running) return classifyAtDelivery(await running);
             const cached = memory.get(scopeId);
             if (cached && !cached.state.stale && dependencies.now() - cached.storedAt < CACHE_MS
-                && cached.exportContextKey === currentExportContextKey) {
+                && cached.requestContextKey === requestContextKey) {
                 return classifyAtDelivery(cached.state);
             }
-            const promise = refresh(scope, scopeId, tariffIdentity, exportTariffIdentity, expectedExportAccountRef);
+            const promise = refresh(scope, scopeId, tariffIdentity, exportTariffIdentity, expectedExportAccountRef, historicalPeriod);
             flights.set(flightId, promise);
             try { return classifyAtDelivery(await promise); }
             finally { if (flights.get(flightId) === promise) flights.delete(flightId); }
@@ -276,5 +305,6 @@ const coordinator = processState.__hepKrakenRefreshCoordinator ??=
     createKrakenRefreshCoordinator(productionDependencies());
 export const getRecordedKrakenState = (siteId: string,
     tariffIdentity?: { tariffCode: string; meterPointRef: string },
-    exportTariffIdentity?: { accountRef: string; productCode: string; tariffCode: string }) =>
-    coordinator.get(siteId, tariffIdentity, exportTariffIdentity);
+    exportTariffIdentity?: { accountRef: string; productCode: string; tariffCode: string },
+    historicalPeriod?: { start: string; end: string }) =>
+    coordinator.get(siteId, tariffIdentity, exportTariffIdentity, historicalPeriod);

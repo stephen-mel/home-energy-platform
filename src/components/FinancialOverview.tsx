@@ -27,7 +27,7 @@ export default function FinancialOverview({ overview, timeZone }: { overview: El
         <details className="mt-4 text-sm text-zinc-400"><summary className="cursor-pointer">Rates and calculation basis</summary>
             <p className="mt-3">Verified import rates in this period: {overview.rates.import.length ? overview.rates.import.map(value => rate(value.amount, value.currency)).join(", ") : "Unavailable"}.</p>
             <p className="mt-2">Verified export rates in this period: {overview.rates.export.length ? overview.rates.export.map(value => rate(value.amount, value.currency)).join(", ") : "Unavailable"}.</p>
-            <ul className="mt-3 list-disc space-y-1 pl-5">{overview.limitations.map(value => <li key={value}>{value}</li>)}</ul>
+            <ul className="mt-3 list-disc space-y-1 pl-5">{overview.limitations.map((value, index) => <li key={`${index}:${value}`}>{value}</li>)}</ul>
         </details>
     </section>;
 }

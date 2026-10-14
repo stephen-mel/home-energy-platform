@@ -31,7 +31,8 @@ export function verifiedKrakenExportTariff(site: Site, kraken: KrakenState | nul
         ? kraken.exportTariff : null;
 }
 
-export function siteWithKrakenImportTariff(site: Site, kraken: KrakenState | null, now: string): Site {
+export function siteWithKrakenImportTariff(site: Site, kraken: KrakenState | null, now: string,
+    requireVerifiedEvidence = false): Site {
     const age = Date.parse(now) - Date.parse(kraken?.importTariff?.observedAt ?? "");
     const identity = site.integrations.kraken.importTariffIdentity;
     const verified = kraken?.stale === false && kraken.importTariff?.status === "available"
@@ -42,7 +43,9 @@ export function siteWithKrakenImportTariff(site: Site, kraken: KrakenState | nul
         && Date.parse(now) >= Date.parse(kraken.importTariff.agreement.validFrom)
         && Date.parse(now) < Date.parse(kraken.importTariff.agreement.validTo)
         ? kraken.importTariff : null;
-    if (!verified || !site.tariff) return site;
+    if (!verified || !site.tariff) return requireVerifiedEvidence && site.tariff
+        ? { ...site, tariff: { ...site.tariff, normalImport: null, export: null, importWindows: [], exportWindows: [], versions: [] } }
+        : site;
     const verifiedExport = verifiedKrakenExportTariff(site, kraken, now);
     const exportWindows = verifiedExport ? [{ start: verifiedExport.agreement.validFrom, end: verifiedExport.agreement.validTo,
         price: verifiedExport.price, kind: "standard" as const, condition: "none" as const,
@@ -53,14 +56,27 @@ export function siteWithKrakenImportTariff(site: Site, kraken: KrakenState | nul
 }
 
 // Uses the already loaded site snapshot. No fetching, refresh or control actions.
-export function getSitePriceSignal(site: Site, kraken: KrakenState | null, now: string): SitePricePlan {
-    const tariff = siteWithKrakenImportTariff(site, kraken, now).tariff;
+export function getSitePriceSignalForPeriod(site: Site, kraken: KrakenState | null, now: string,
+    horizon: { start: string; end: string }, requireVerifiedEvidence = false): SitePricePlan {
+    const tariff = siteWithKrakenImportTariff(site, kraken, now, requireVerifiedEvidence).tariff;
     const rule = site.integrations.kraken.wholeHomeDispatchRate;
     const enabled = site.integrations.kraken.enabled && rule?.enabled === true;
-    const horizon = { start: now, end: new Date(Date.parse(now) + 48 * 60 * 60 * 1000).toISOString() };
     const effective = tariff?.versions ? resolveEffectiveTariff(tariff, horizon) : null;
-    const dispatches = enabled && kraken ? krakenDispatchPriceWindows(kraken, rule.importPrice) : [];
-    const opportunities = effective ? applyDispatchRates(dispatches, effective.dispatchRates) : dispatches;
+    const historical = requireVerifiedEvidence && !kraken?.stale && kraken?.historicalImportRates?.status === "available"
+        && kraken.historicalImportRates.period.start === horizon.start && kraken.historicalImportRates.period.end === horizon.end
+        && kraken.historicalImportRates.accountRef === kraken.importTariff?.accountRef
+        && kraken.historicalImportRates.meterPointRef === kraken.importTariff?.agreement.meterPointRef
+        ? kraken.historicalImportRates : null;
+    const historicalDispatchRates = historical && kraken?.importTariff?.version.scheduledChargingImport
+        && Date.parse(kraken.importTariff.agreement.validFrom) <= Date.parse(horizon.start)
+        && Date.parse(kraken.importTariff.agreement.validTo) >= Date.parse(horizon.end)
+        ? [{ start: horizon.start, end: horizon.end, price: kraken.importTariff.version.scheduledChargingImport,
+            kind: "standard" as const, condition: "none" as const, sources: [{ provider: "eon-next-kraken",
+                description: "Current agreement SMART rate; planned qualification remains estimated",
+                observedAt: kraken.importTariff.observedAt, stale: false }] }] : [];
+    const dispatches = enabled && kraken ? krakenDispatchPriceWindows(kraken, requireVerifiedEvidence ? null : rule.importPrice) : [];
+    const opportunities = historical ? applyDispatchRates(dispatches, historicalDispatchRates)
+        : effective ? applyDispatchRates(dispatches, effective.dispatchRates) : dispatches;
     return {
         timeZone: tariff?.timeZone ?? "UTC",
         kraken: {
@@ -69,9 +85,15 @@ export function getSitePriceSignal(site: Site, kraken: KrakenState | null, now: 
         },
         signal: {
             scope: "whole-home", generatedAt: now, horizon,
-            import: buildPriceCurve(horizon, effective ? null : tariff?.normalImport ?? null, [...(effective?.import ?? tariff?.importWindows ?? []), ...opportunities]),
+            import: buildPriceCurve(horizon, historical || effective ? null : tariff?.normalImport ?? null,
+                [...(historical?.windows ?? effective?.import ?? tariff?.importWindows ?? []), ...opportunities]),
             export: buildPriceCurve(horizon, effective ? null : tariff?.export ?? null,
                 tariff?.exportWindows ?? effective?.export ?? []),
         },
     };
+}
+
+export function getSitePriceSignal(site: Site, kraken: KrakenState | null, now: string): SitePricePlan {
+    return getSitePriceSignalForPeriod(site, kraken, now,
+        { start: now, end: new Date(Date.parse(now) + 48 * 60 * 60 * 1000).toISOString() });
 }

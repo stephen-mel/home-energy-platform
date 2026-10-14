@@ -106,6 +106,7 @@ export function calculateElectricityFinancialOverview(input: {
     period: { start: string; end: string };
     signal: PriceSignal;
     readings: EnergyIntervalReading[];
+    dataLimitations?: string[];
 }): ElectricityFinancialOverview {
     const start = time(input.period.start), end = time(input.period.end);
     if (start === null || end === null || end <= start) throw new Error("INVALID_FINANCIAL_PERIOD");
@@ -135,6 +136,7 @@ export function calculateElectricityFinancialOverview(input: {
             "Costs require interval energy readings; instantaneous power is not converted into energy.",
             "Planned conditional SMART pricing is labelled as an estimate until qualification or billing evidence exists.",
             ...(temporalConflict ? ["Overlapping energy readings conflict, so financial totals are unavailable."] : []),
+            ...(input.dataLimitations ?? []),
             "Solar savings, battery savings and investment payback are not calculated in this stage.",
         ],
     };

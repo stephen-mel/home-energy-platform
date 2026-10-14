@@ -1,6 +1,7 @@
 import { getRecordedKrakenState } from "./kraken-refresh";
 import type { KrakenImportTariffEvidence } from "../kraken/import-tariff";
 import type { KrakenExportTariffEvidence } from "../kraken/export-tariff";
+import type { KrakenHistoricalImportRates } from "../kraken/historical-import-rates";
 
 export type KrakenVehicleStatus = {
     currentState: string | null;
@@ -64,6 +65,8 @@ export type KrakenState = {
     importTariffDiagnostic?: { status: "unavailable"; code: string };
     exportTariff?: KrakenExportTariffEvidence;
     exportTariffDiagnostic?: { status: "unavailable"; code: string };
+    historicalImportRates?: KrakenHistoricalImportRates;
+    historicalImportRatesDiagnostic?: { status: "unavailable"; code: string };
 };
 
 export type KrakenScheduleRecording = {
@@ -82,7 +85,7 @@ export function getSmartControlSetting(isSuspended: boolean | null): string {
 export async function getKrakenState(site: { id: string; integrations?: { kraken: {
     importTariffIdentity?: { tariffCode: string; meterPointRef: string };
     exportTariffIdentity?: { accountRef: string; productCode: string; tariffCode: string };
-} } }): Promise<KrakenState> {
+} } }, historicalPeriod?: { start: string; end: string }): Promise<KrakenState> {
     return getRecordedKrakenState(site.id, site.integrations?.kraken.importTariffIdentity,
-        site.integrations?.kraken.exportTariffIdentity);
+        site.integrations?.kraken.exportTariffIdentity, historicalPeriod);
 }

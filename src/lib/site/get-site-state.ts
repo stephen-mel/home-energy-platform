@@ -23,11 +23,11 @@ export type SiteState = {
 };
 
 export async function getSiteState(
-    site: Site
+    site: Site, historicalPeriod?: { start: string; end: string }
 ): Promise<SiteState> {
 
     const [kraken, homeAssistant] = await Promise.all([
-        loadIntegration(site.integrations.kraken.enabled, () => getKrakenState(site)),
+        loadIntegration(site.integrations.kraken.enabled, () => getKrakenState(site, historicalPeriod)),
         loadIntegration(site.integrations.homeAssistant.enabled, () =>
             getHomeAssistantSiteState(site.integrations.homeAssistant)),
     ]);

@@ -148,8 +148,8 @@ export type KrakenDevice = {
   } | null;
 };
 
-async function getKrakenDevicesFor(configuration: KrakenReadConfiguration): Promise<KrakenDevice[]> {
-  const token = await obtainKrakenToken(configuration);
+async function getKrakenDevicesFor(configuration: KrakenReadConfiguration, suppliedToken?: Promise<string>): Promise<KrakenDevice[]> {
+  const token = await (suppliedToken ?? obtainKrakenToken(configuration));
   const { accountNumber } = configuration;
 
   const query = `
@@ -202,8 +202,8 @@ async function getKrakenDevicesFor(configuration: KrakenReadConfiguration): Prom
   return data.devices;
 }
 
-async function getKrakenImportTariffFor(configuration: KrakenReadConfiguration) {
-  const token = await obtainKrakenToken(configuration);
+async function getKrakenImportTariffFor(configuration: KrakenReadConfiguration, suppliedToken?: Promise<string>) {
+  const token = await (suppliedToken ?? obtainKrakenToken(configuration));
   const data = await krakenGraphQL<{ account: { electricityAgreements: Array<Record<string, unknown>> } }>(`
     query {
       account(accountNumber: ${JSON.stringify(configuration.accountNumber)}) {
@@ -231,8 +231,8 @@ async function getKrakenImportTariffFor(configuration: KrakenReadConfiguration) 
   return { accountRef: configuration.accountRef, electricityAgreements };
 }
 
-async function getKrakenExportTariffFor(configuration: KrakenExportReadConfiguration) {
-  const token = await obtainKrakenToken(configuration);
+async function getKrakenExportTariffFor(configuration: KrakenExportReadConfiguration, suppliedToken?: Promise<string>) {
+  const token = await (suppliedToken ?? obtainKrakenToken(configuration));
   const data = await krakenGraphQL<{ account: { electricityAgreements: Array<Record<string, unknown>> } }>(`
     query {
       account(accountNumber: ${JSON.stringify(configuration.accountNumber)}) {
@@ -261,10 +261,10 @@ export type KrakenVehicleStatus = {
   currentState: string | null;
   isSuspended: boolean | null;
   stateOfCharge: {
-    value: number | null;
+    value: string | null;
   } | null;
   activePower: {
-    value: number | null;
+    value: string | null;
   } | null;
   stateOfChargeLimit: {
     value: number | null;
@@ -272,9 +272,9 @@ export type KrakenVehicleStatus = {
 };
 
 async function getKrakenVehicleStatusFor(
-  deviceId: string, configuration: KrakenReadConfiguration
+  deviceId: string, configuration: KrakenReadConfiguration, suppliedToken?: Promise<string>
 ): Promise<KrakenVehicleStatus> {
-  const token = await obtainKrakenToken(configuration);
+  const token = await (suppliedToken ?? obtainKrakenToken(configuration));
   const { accountNumber } = configuration;
 
   const query = `
@@ -334,10 +334,10 @@ export async function getKrakenPlannedDispatchResponse(deviceId: string): Promis
 }
 
 async function getKrakenPlannedDispatchResponseFor(
-  deviceId: string, authentication: KrakenAuthentication
+  deviceId: string, authentication: KrakenAuthentication, suppliedToken?: Promise<string>
 ): Promise<DispatchResponse & { deviceId: string }> {
   try {
-    const token = await obtainKrakenToken(authentication);
+    const token = await (suppliedToken ?? obtainKrakenToken(authentication));
 
     const query = `
       query {
@@ -362,17 +362,63 @@ async function getKrakenPlannedDispatchResponseFor(
 export function createKrakenReadSession() {
   const configuration = captureKrakenReadConfiguration();
   const exportConfiguration = captureKrakenExportConfiguration(configuration);
+  // One lazy authentication exchange is shared by every read in this snapshot.
+  const token = obtainKrakenToken(configuration);
   return Object.freeze({
     accountRef: configuration.accountRef,
     exportAccountRef: exportConfiguration?.accountRef ?? null,
-    getDevices: () => getKrakenDevicesFor(configuration),
-    getImportTariff: () => getKrakenImportTariffFor(configuration),
+    getDevices: () => getKrakenDevicesFor(configuration, token),
+    getImportTariff: () => getKrakenImportTariffFor(configuration, token),
     getExportTariff: () => exportConfiguration
-      ? getKrakenExportTariffFor(exportConfiguration)
+      ? getKrakenExportTariffFor(exportConfiguration, token)
       : Promise.reject(Error("E.ON export account is not configured")),
-    getVehicleStatus: (deviceId: string) => getKrakenVehicleStatusFor(deviceId, configuration),
+    getVehicleStatus: (deviceId: string) => getKrakenVehicleStatusFor(deviceId, configuration, token),
     getPlannedDispatchResponse: (deviceId: string) =>
-      getKrakenPlannedDispatchResponseFor(deviceId, configuration),
+      getKrakenPlannedDispatchResponseFor(deviceId, configuration, token),
+    getHistoricalImportRates: async (period: { start: string; end: string }) => {
+      const jwt = await token;
+      const source = await krakenGraphQL<{ account: { electricityAgreements: Array<{ meterPoint?: { mpan?: unknown; direction?: unknown } }> } }>(`
+        query { account(accountNumber: ${JSON.stringify(configuration.accountNumber)}) {
+          electricityAgreements(active: true) { meterPoint { mpan direction } }
+        } }
+      `, jwt);
+      const agreements = source.account.electricityAgreements;
+      if (agreements.length !== 1 || agreements[0].meterPoint?.direction !== "IMPORT"
+          || typeof agreements[0].meterPoint.mpan !== "string") throw Error("HISTORICAL_RATE_METER_POINT_UNAVAILABLE");
+      const mpxn = agreements[0].meterPoint.mpan;
+      type HistoricalEdge = { cursor: string; node: { value: unknown; validFrom: unknown; validTo: unknown } };
+      type HistoricalConnection = { edges: HistoricalEdge[]; totalCount: number; edgeCount: number;
+        pageInfo: { hasNextPage: boolean; endCursor: string | null } };
+      const edges: HistoricalEdge[] = [];
+      let after: string | null = null;
+      const cursors = new Set<string>();
+      for (let page = 0; page < 20; page++) {
+        const response: { applicableRates: HistoricalConnection } = await krakenGraphQL<{ applicableRates: HistoricalConnection }>(`
+          query { applicableRates(accountNumber: ${JSON.stringify(configuration.accountNumber)} mpxn: ${JSON.stringify(mpxn)}
+            startAt: ${JSON.stringify(period.start)} endAt: ${JSON.stringify(period.end)} first: 100${after ? ` after: ${JSON.stringify(after)}` : ""}) {
+            edges { cursor node { value validFrom validTo } }
+            pageInfo { hasNextPage endCursor }
+            totalCount edgeCount
+          } }
+        `, jwt);
+        const connection: HistoricalConnection = response.applicableRates;
+        if (!connection || !Array.isArray(connection.edges) || connection.edgeCount !== connection.edges.length
+            || !Number.isInteger(connection.totalCount) || connection.totalCount < 0) throw Error("HISTORICAL_RATE_PAGINATION_INVALID");
+        for (const edge of connection.edges) {
+          if (typeof edge.cursor !== "string" || !edge.cursor || cursors.has(edge.cursor)) throw Error("HISTORICAL_RATE_CURSOR_INVALID");
+          cursors.add(edge.cursor); edges.push(structuredClone(edge));
+        }
+        if (!connection.pageInfo.hasNextPage) {
+          if (edges.length !== connection.totalCount) throw Error("HISTORICAL_RATE_PAGINATION_INCOMPLETE");
+          return { accountRef: configuration.accountRef,
+            meterPointRef: createHash("sha256").update(`eon-meter-point\0${mpxn}`).digest("hex"), complete: true, edges };
+        }
+        if (typeof connection.pageInfo.endCursor !== "string" || !connection.pageInfo.endCursor
+            || connection.pageInfo.endCursor === after) throw Error("HISTORICAL_RATE_CURSOR_INVALID");
+        after = connection.pageInfo.endCursor;
+      }
+      throw Error("HISTORICAL_RATE_PAGINATION_INCOMPLETE");
+    },
   });
 }
 

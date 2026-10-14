@@ -60,6 +60,13 @@ function exportTariff() {
       productCode:'NEXT_EXPORT_PREMIUM_V3',tariffCode:'E-1R-NEXT_EXPORT_PREMIUM_V3-G'},
     price:{amount:0.175,currency:'GBP',unit:'kWh'}};
 }
+function historicalRates() {
+  const period={start:'2026-09-17T10:00:00.000Z',end:'2026-09-18T10:00:00.000Z'};
+  return {status:'available',accountRef:'account',meterPointRef:'meter-a',observedAt:'2026-09-18T10:00:00.000Z',period,
+    vatBasis:'corroborated-not-independent',windows:[{start:period.start,end:period.end,
+      price:{amount:0.23978,currency:'GBP',unit:'kWh'},kind:'standard',condition:'none',
+      sources:[{provider:'eon-next-kraken',description:'Historical applicable import rate',observedAt:'2026-09-18T10:00:00.000Z',stale:false}]}]};
+}
 const plain = value => JSON.parse(JSON.stringify(value));
 const scopeId = '["site","account"]';
 
@@ -102,11 +109,12 @@ test('writes only allowlisted fields; permissions are private; stale and invalid
 });
 
 test('canonical tariff evidence and vehicle data round-trip together', async t => {
-  const {store}=await fixture(t);const input={...state(),importTariff:tariff(),exportTariff:exportTariff()};
+  const {store}=await fixture(t);const input={...state(),importTariff:tariff(),exportTariff:exportTariff(),historicalImportRates:historicalRates()};
   await store.writeLastKnownKrakenState(scopeId,input);
   const recovered=await store.readLastKnownKrakenState(scopeId);
   assert.equal(recovered.stale,true);assert.deepEqual(plain(recovered.importTariff),tariff());
   assert.deepEqual(plain(recovered.exportTariff),exportTariff());
+  assert.deepEqual(plain(recovered.historicalImportRates),historicalRates());
   assert.deepEqual(plain(recovered.vehicles),state().vehicles);
 });
 

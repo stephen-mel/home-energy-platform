@@ -21,6 +21,10 @@ export const currentSite: Site = {
 
         homeAssistant: {
             enabled: true,
+            financialEnergy: {
+                gridImportEntityId: "sensor.powerwall_192_168_68_74_site_import",
+                gridExportEntityId: "sensor.powerwall_192_168_68_74_site_export",
+            },
             assets: [{
                 id: "powerwall-home",
                 name: "Powerwall & Home",
