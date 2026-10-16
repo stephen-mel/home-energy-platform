@@ -10,10 +10,8 @@ import { createTariffProposal, approveTariffProposal, assessProposalCurrentUse }
 import { representationKey } from "./rollback-evidence";
 import { reviewObservedRestoration, compareObservedTariffReadBack } from "./restoration-review";
 
-export const CAPTURE_TTL_MS = 120_000;
-export const EVIDENCE_TTL_MS = 60_000;
-export const APPROVAL_TTL_MS = 60_000;
-export const MIN_WRITE_REMAINING_MS = 30_000;
+import { CAPTURE_TTL_MS, EVIDENCE_TTL_MS, APPROVAL_TTL_MS, MIN_WRITE_REMAINING_MS, smartEvidenceKey } from "./smart-evidence";
+export { CAPTURE_TTL_MS, EVIDENCE_TTL_MS, APPROVAL_TTL_MS, MIN_WRITE_REMAINING_MS, smartEvidenceKey } from "./smart-evidence";
 // An experiment may acknowledge these risks; none is removed from production.
 const MANUAL_RECOVERY_RISKS = new Set([
     "ROLLBACK_UNPROVEN", "BUY_BELOW_SELL", "BOUNDED_FORECAST", "RESTORATION_REQUIRED",
@@ -55,16 +53,6 @@ export class StaleApprovalOrEvidenceError extends Error {
             krakenStale: { pass: !stale, value: typeof stale === "boolean" ? stale : null },
         };
     }
-}
-
-/** Compare actual SMART data independently of freshness timestamps. Includes
- * original boundaries, vehicle identity, type and energy; BOOST is not a price event.
- */
-export function smartEvidenceKey(state: KrakenState) {
-    return representationKey(state.vehicles.map(v => ({ id: v.id, name: v.name,
-        dispatches: v.plannedDispatches.filter(d => d.type === "SMART").map(d => ({ start: d.start, end: d.end,
-            type: d.type, energyAddedKwh: d.energyAddedKwh })).sort((a, b) => representationKey(a).localeCompare(representationKey(b)))
-    })).sort((a, b) => a.id.localeCompare(b.id)));
 }
 
 export function prepareSupervisedExperiment(site: Site, selection: Selection, capture: Capture, generatedAt: string) {
