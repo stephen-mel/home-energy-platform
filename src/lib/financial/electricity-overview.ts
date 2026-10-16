@@ -13,6 +13,7 @@ export type FinancialValue = {
     amount: number | null;
     currency: string | null;
     basis: "no-energy-data" | "calculated-from-measured-energy" | "contains-estimates" | "partial-coverage";
+    pricingBasis: "unknown" | "verified" | "user-confirmed-assumption" | "mixed";
 };
 
 export type ElectricityFinancialOverview = {
@@ -26,7 +27,8 @@ export type ElectricityFinancialOverview = {
     limitations: string[];
 };
 
-const unavailable = (): FinancialValue => ({ status: "unavailable", amount: null, currency: null, basis: "no-energy-data" });
+const unavailable = (): FinancialValue => ({ status: "unavailable", amount: null, currency: null,
+    basis: "no-energy-data", pricingBasis: "unknown" });
 const time = (value: string) => {
     const parsed = Date.parse(value);
     return Number.isFinite(parsed) ? parsed : null;
@@ -48,19 +50,21 @@ function qualifying(window: PriceWindow, start: number, end: number) {
 function rateFor(windows: PriceWindow[], start: number, end: number) {
     const overlaps = windows.filter(window => time(window.start)! < end && time(window.end)! > start)
         .sort((a, b) => time(a.start)! - time(b.start)!);
-    let cursor = start, price: EnergyPrice | null = null, estimated = false;
+    let cursor = start, price: EnergyPrice | null = null, estimated = false, assumed = false;
     for (const window of overlaps) {
         const from = Math.max(start, time(window.start)!), to = Math.min(end, time(window.end)!);
         if (from !== cursor || to <= from || window.stale || window.priceStatus !== "known" || !validPrice(window.price)) return null;
         const eligibility = qualifying(window, from, to);
         if (!eligibility.usable || price && key(price) !== key(window.price)) return null;
-        price ??= window.price; estimated ||= eligibility.estimated; cursor = to;
+        const assumption = window.sources.some(source => source.provider === "user-confirmed-commercial-assumption");
+        price ??= window.price; estimated ||= eligibility.estimated || assumption; assumed ||= assumption; cursor = to;
     }
-    return cursor === end && price ? { price: { ...price }, estimated } : null;
+    return cursor === end && price ? { price: { ...price }, estimated, assumed } : null;
 }
 
 function channel(readings: EnergyIntervalReading[], windows: PriceWindow[], period: { start: number; end: number }, field: "importKwh" | "exportKwh") {
-    let amount = 0, covered = 0, estimated = false, currency: string | null = null, previousEnd = period.start;
+    let amount = 0, covered = 0, estimated = false, assumed = false, verified = false,
+        currency: string | null = null, previousEnd = period.start;
     const relevant = readings.flatMap(reading => {
         const start = time(reading.start), end = time(reading.end), energy = reading[field];
         return start !== null && end !== null && start >= period.start && end <= period.end && end > start
@@ -74,6 +78,7 @@ function channel(readings: EnergyIntervalReading[], windows: PriceWindow[], peri
         covered += item.end - item.start;
         currency ??= rate.price.currency;
         estimated ||= item.reading.quality === "estimated" || rate.estimated;
+        assumed ||= rate.assumed; verified ||= !rate.assumed;
         previousEnd = item.end;
     }
     if (!covered || !currency) return { value: unavailable(), covered: 0 };
@@ -83,6 +88,8 @@ function channel(readings: EnergyIntervalReading[], windows: PriceWindow[], peri
         amount: rounded(amount), currency,
         basis: estimated ? "contains-estimates" as const : complete
             ? "calculated-from-measured-energy" as const : "partial-coverage" as const,
+        pricingBasis: assumed && verified ? "mixed" as const : assumed
+            ? "user-confirmed-assumption" as const : "verified" as const,
     } };
 }
 
@@ -123,7 +130,10 @@ export function calculateElectricityFinancialOverview(input: {
         && imported.value.currency === exported.value.currency && importPercent === 100 && exportPercent === 100) {
         const estimated = imported.value.status === "estimated" || exported.value.status === "estimated";
         netCost = { status: estimated ? "estimated" : "calculated", amount: rounded(imported.value.amount - exported.value.amount),
-            currency: imported.value.currency, basis: estimated ? "contains-estimates" : "calculated-from-measured-energy" };
+            currency: imported.value.currency, basis: estimated ? "contains-estimates" : "calculated-from-measured-energy",
+            pricingBasis: imported.value.pricingBasis === "user-confirmed-assumption"
+                && exported.value.pricingBasis === "user-confirmed-assumption" ? "user-confirmed-assumption"
+                : imported.value.pricingBasis !== "verified" || exported.value.pricingBasis !== "verified" ? "mixed" : "verified" };
     }
     const result: ElectricityFinancialOverview = {
         period: { ...input.period }, importCost: imported.value, exportEarnings: exported.value, netCost,

@@ -16,8 +16,13 @@ export type SiteIntegrationConfig = {
     kraken: {
         enabled: boolean;
         wholeHomeDispatchRate?: { enabled: boolean; importPrice: EnergyPrice | null };
-        importTariffIdentity?: { tariffCode: string; meterPointRef: string };
-        exportTariffIdentity?: { accountRef: string; productCode: string; tariffCode: string };
+        importTariffIdentity?: { accountRef?: string; tariffCode: string; meterPointRef: string };
+        exportTariffIdentity?: { accountRef: string; meterPointRef?: string; productCode: string; tariffCode: string };
+        fixedExportAssumption?: {
+            provider: "eon-next";
+            tariff: "Export Premium v3";
+            price: EnergyPrice;
+        };
     };
 
     homeAssistant: {

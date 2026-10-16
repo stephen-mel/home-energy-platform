@@ -66,6 +66,12 @@ const device = (id = "ev-a", name = "EV A") => ({ id, name, deviceType: "EV", pr
   vehicleBatterySize: "77.0", chargePointPowerOutput: "7.2", preferences: null, preferenceSetting: null });
 const vehicleStatus = () => ({ currentState: "SMART_CHARGING", isSuspended: false,
   stateOfCharge: { value: "42.00" }, activePower: { value: "7.1" }, stateOfChargeLimit: null });
+
+test('independently configured import account rejects runtime substitution before cache recovery',async()=>{
+ const intended='a'.repeat(64),other='b'.repeat(64),h=harness({accountRef:other,compatible:{vehicles:[],lastSuccessfulUpdate:'2026-10-11T10:00:00.000Z',stale:false}});
+ await assert.rejects(()=>h.coordinator.get('site-a',{accountRef:intended,tariffCode:'tariff',meterPointRef:'meter-a'}),/KRAKEN_CONFIGURED_IMPORT_ACCOUNT_MISMATCH/);
+ assert.equal(h.counts().sessions,0);
+});
 function harness(options = {}) {
   let now = options.now ?? Date.parse("2026-10-11T10:00:00Z");
   let sessions = 0, deviceCalls = 0, statusCalls = 0, dispatchCalls = 0, records = 0, writes = 0;

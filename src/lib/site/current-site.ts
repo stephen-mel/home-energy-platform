@@ -17,6 +17,11 @@ export const currentSite: Site = {
                 productCode: "NEXT_EXPORT_PREMIUM_V3",
                 tariffCode: "E-1R-NEXT_EXPORT_PREMIUM_V3-G",
             },
+            fixedExportAssumption: {
+                provider: "eon-next",
+                tariff: "Export Premium v3",
+                price: { amount: 0.175, currency: "GBP", unit: "kWh" },
+            },
         },
 
         homeAssistant: {

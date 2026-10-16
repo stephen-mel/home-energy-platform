@@ -7,6 +7,8 @@ function money(value: FinancialValue) {
         minimumFractionDigits: 2, maximumFractionDigits: 4 }).format(value.amount);
 }
 const label = (value: FinancialValue) => value.status === "calculated" ? "Calculated from measured energy"
+    : value.status === "estimated" && value.pricingBasis === "user-confirmed-assumption" ? "Estimate using a user-confirmed tariff assumption"
+    : value.status === "estimated" && value.pricingBasis === "mixed" ? "Estimate using mixed verified and assumed pricing"
     : value.status === "estimated" ? "Estimate" : value.status === "partial" ? "Calculated for covered data only" : "No interval energy data";
 const rate = (amount: number, currency: string) => currency === "GBP" ? `${Number((amount * 100).toFixed(5))}p/kWh` : `${amount} ${currency}/kWh`;
 
@@ -26,7 +28,9 @@ export default function FinancialOverview({ overview, timeZone }: { overview: El
         {!overview.coverage.complete && <p role="status" className="mt-3 text-sm text-amber-300">Complete interval import and export energy readings are unavailable, so full-period costs are not shown.</p>}
         <details className="mt-4 text-sm text-zinc-400"><summary className="cursor-pointer">Rates and calculation basis</summary>
             <p className="mt-3">Verified import rates in this period: {overview.rates.import.length ? overview.rates.import.map(value => rate(value.amount, value.currency)).join(", ") : "Unavailable"}.</p>
-            <p className="mt-2">Verified export rates in this period: {overview.rates.export.length ? overview.rates.export.map(value => rate(value.amount, value.currency)).join(", ") : "Unavailable"}.</p>
+            <p className="mt-2">{overview.exportEarnings.pricingBasis === "verified" ? "Verified export rates"
+                : overview.exportEarnings.pricingBasis === "unknown" ? "Export rates"
+                : "Export rates including user-confirmed assumptions"} in this period: {overview.rates.export.length ? overview.rates.export.map(value => rate(value.amount, value.currency)).join(", ") : "Unavailable"}.</p>
             <ul className="mt-3 list-disc space-y-1 pl-5">{overview.limitations.map((value, index) => <li key={`${index}:${value}`}>{value}</li>)}</ul>
         </details>
     </section>;

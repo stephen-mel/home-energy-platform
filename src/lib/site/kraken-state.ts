@@ -83,8 +83,8 @@ export function getSmartControlSetting(isSuspended: boolean | null): string {
 }
 
 export async function getKrakenState(site: { id: string; integrations?: { kraken: {
-    importTariffIdentity?: { tariffCode: string; meterPointRef: string };
-    exportTariffIdentity?: { accountRef: string; productCode: string; tariffCode: string };
+    importTariffIdentity?: { accountRef?: string; tariffCode: string; meterPointRef: string };
+    exportTariffIdentity?: { accountRef: string; meterPointRef?: string; productCode: string; tariffCode: string };
 } } }, historicalPeriod?: { start: string; end: string }): Promise<KrakenState> {
     return getRecordedKrakenState(site.id, site.integrations?.kraken.importTariffIdentity,
         site.integrations?.kraken.exportTariffIdentity, historicalPeriod);

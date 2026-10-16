@@ -27,6 +27,8 @@ const { getSitePriceSignal, getSitePriceSignalForPeriod } = load('src/lib/site/g
   '../tariff/price-signal': curve, '../tariff/kraken-dispatches': adapter,
   '../tariff/effective-tariff': effectiveTariff,
 });
+const {calculateElectricityFinancialOverview}=load('src/lib/financial/electricity-overview.ts',{},
+  {structuredClone,Object,Map,Date,Number,Error});
 
 test('financial history never falls back to configured example rates without verified Kraken evidence', () => {
   const config={integrations:{kraken:{enabled:true,wholeHomeDispatchRate:{enabled:true,importPrice:null},
@@ -52,6 +54,65 @@ test('financial history never falls back to configured example rates without ver
   assert.ok(verified.signal.import.some(window=>window.price?.amount===0.0285));
   assert.ok(verified.signal.import.some(window=>window.price?.amount===0.23978));
   assert.ok(verified.signal.export.every(window=>window.price?.amount===0.175));
+});
+test('user-confirmed fixed export assumption remains financial evidence without becoming authenticated identity',()=>{
+ const horizon={start:'2026-10-15T00:00:00.000Z',end:'2026-10-16T00:00:00.000Z'};
+ const config={integrations:{kraken:{enabled:true,wholeHomeDispatchRate:{enabled:true,importPrice:null},
+  fixedExportAssumption:{provider:'eon-next',tariff:'Export Premium v3',price:price(.175)}}},
+  tariff:{timeZone:'Europe/London',normalImport:null,export:null,versions:[]}};
+ const result=getSitePriceSignalForPeriod(config,null,horizon.start,horizon,true);
+ assert.ok(result.signal.import.every(window=>window.price===null));
+ assert.equal(result.signal.export.length,1);assert.equal(result.signal.export[0].price.amount,.175);
+ assert.equal(result.signal.export[0].sources[0].provider,'user-confirmed-commercial-assumption');
+ assert.match(result.signal.export[0].sources[0].description,/contractual expiry not established/);
+});
+test('fixed export assumption applies only to absence, never rejected authenticated evidence',()=>{
+ const horizon={start:'2026-10-15T00:00:00.000Z',end:'2026-10-16T00:00:00.000Z'},now='2026-10-15T00:00:00.000Z';
+ const config={integrations:{kraken:{enabled:true,wholeHomeDispatchRate:{enabled:true,importPrice:null},
+  exportTariffIdentity:{accountRef:'EXPECTED',productCode:'PRODUCT',tariffCode:'TARIFF'},
+  fixedExportAssumption:{provider:'eon-next',tariff:'Export Premium v3',price:price(.175)}}},tariff:{timeZone:'Europe/London',normalImport:null,export:null,versions:[]}};
+ const evidence={status:'available',accountRef:'EXPECTED',observedAt:now,agreement:{validFrom:'2026-01-01T00:00:00.000Z',validTo:'2027-01-01T00:00:00.000Z',productCode:'PRODUCT',tariffCode:'TARIFF'},price:price(.22)};
+ const base={stale:false,lastSuccessfulUpdate:now,vehicles:[],exportTariff:evidence};
+ const cases=[s=>s.exportTariff.accountRef='WRONG',s=>s.stale=true,s=>s.exportTariff.agreement.validTo=now,
+  s=>s.exportTariff.agreement=null,s=>s.exportTariff.agreement.tariffCode='OTHER'];
+ for(const mutate of cases){const state=structuredClone(base);mutate(state);const result=getSitePriceSignalForPeriod(config,state,now,horizon,true);
+  assert.ok(result.signal.export.every(window=>window.price===null));assert.equal(result.kraken.exportPricing,'rejected');
+  assert.ok(result.kraken.exportDiagnostic);}
+ for(const state of [null,{stale:false,lastSuccessfulUpdate:now,vehicles:[],exportTariffDiagnostic:{status:'unavailable',code:'EXPORT_TARIFF_RETRIEVAL_FAILED'}}]){
+  const result=getSitePriceSignalForPeriod(config,state,now,horizon,true);assert.ok(result.signal.export.every(window=>window.price?.amount===.175));
+  assert.equal(result.kraken.exportPricing,'user-confirmed-assumption');}
+});
+test('export diagnostics suppress contradictory authenticated evidence and commercial fallback',()=>{
+ const horizon={start:'2026-10-15T00:00:00.000Z',end:'2026-10-16T00:00:00.000Z'},now=horizon.start;
+ const config={integrations:{kraken:{enabled:true,wholeHomeDispatchRate:{enabled:true,importPrice:null},
+  exportTariffIdentity:{accountRef:'EXPECTED',productCode:'PRODUCT',tariffCode:'TARIFF'},
+  fixedExportAssumption:{provider:'eon-next',tariff:'Export Premium v3',price:price(.175)}}},tariff:{timeZone:'Europe/London',normalImport:null,export:null,versions:[]}};
+ const evidence={status:'available',accountRef:'EXPECTED',observedAt:now,agreement:{validFrom:'2026-01-01T00:00:00.000Z',validTo:'2027-01-01T00:00:00.000Z',productCode:'PRODUCT',tariffCode:'TARIFF'},price:price(.22)};
+ const cases=[
+  {exportTariff:structuredClone(evidence),exportTariffDiagnostic:{status:'unavailable',code:'EXPORT_ACCOUNT_CONTEXT_CHANGED'}},
+  {exportTariff:structuredClone(evidence),exportTariffDiagnostic:{status:'unavailable',code:'EXPORT_TARIFF_RETRIEVAL_FAILED'}},
+  {exportTariff:{...structuredClone(evidence),accountRef:'WRONG'},exportTariffDiagnostic:{status:'unavailable',code:'EXPORT_TARIFF_RETRIEVAL_FAILED'}},
+  {exportTariffDiagnostic:{status:'unavailable',code:'EXPORT_ACCOUNT_CONTEXT_CHANGED'}},
+ ];
+ for(const values of cases){const state={stale:false,lastSuccessfulUpdate:now,vehicles:[],...values};
+  const result=getSitePriceSignalForPeriod(config,state,now,horizon,true);
+  assert.ok(result.signal.export.every(window=>window.price===null));assert.equal(result.kraken.exportPricing,'rejected');
+  assert.ok(result.signal.export.every(window=>window.sources.some(source=>source.provider==='kraken-export-evidence-rejected')));
+  assert.ok(result.kraken.exportDiagnostic);
+  const financial=calculateElectricityFinancialOverview({period:horizon,signal:result.signal,
+   readings:[{start:horizon.start,end:horizon.end,importKwh:0,exportKwh:10,quality:'measured'}]});
+  assert.equal(financial.exportEarnings.status,'unavailable');assert.equal(financial.exportEarnings.amount,null);}
+});
+test('malformed and unrecognised export diagnostics fail closed rather than becoming absence',()=>{
+ const horizon={start:'2026-10-15T00:00:00.000Z',end:'2026-10-16T00:00:00.000Z'},now=horizon.start;
+ const config={integrations:{kraken:{enabled:true,wholeHomeDispatchRate:{enabled:true,importPrice:null},
+  fixedExportAssumption:{provider:'eon-next',tariff:'Export Premium v3',price:price(.175)}}},tariff:{timeZone:'Europe/London',normalImport:null,export:null,versions:[]}};
+ for(const diagnostic of [{},null,0,'unavailable',[],{status:'unavailable'},{code:'EXPORT_TARIFF_RETRIEVAL_FAILED'},
+  {status:'unavailable',code:null},{status:'other',code:'EXPORT_TARIFF_RETRIEVAL_FAILED'},
+  {status:'unavailable',code:'UNKNOWN_CODE'},{status:'unavailable',code:'EXPORT_TARIFF_RETRIEVAL_FAILED',extra:true}]){
+  const state={stale:false,lastSuccessfulUpdate:now,vehicles:[],exportTariffDiagnostic:diagnostic};
+  const result=getSitePriceSignalForPeriod(config,state,now,horizon,true);
+  assert.equal(result.kraken.exportPricing,'rejected');assert.ok(result.signal.export.every(window=>window.price===null));}
 });
 test('strict financial history uses only exact-period historical applicable-rate evidence',()=>{
  const horizon={start:'2026-10-13T10:00:00.000Z',end:'2026-10-14T10:00:00.000Z'},now='2026-10-14T10:01:00.000Z';

@@ -196,8 +196,8 @@ export function createKrakenRefreshCoordinator(dependencies: Dependencies) {
             exportTariffDiagnostic: { status: "unavailable", code: "EXPORT_ACCOUNT_CONTEXT_CHANGED" } };
     }
     async function refresh(scope: ScheduleScope, scopeId: string,
-        tariffIdentity?: { tariffCode: string; meterPointRef: string },
-        exportTariffIdentity?: { accountRef: string; productCode: string; tariffCode: string },
+        tariffIdentity?: { accountRef?: string; tariffCode: string; meterPointRef: string },
+        exportTariffIdentity?: { accountRef: string; meterPointRef?: string; productCode: string; tariffCode: string },
         expectedExportAccountRef: string | null = null,
         historicalPeriod?: { start: string; end: string }): Promise<KrakenState> {
         const startedAt = new Date(dependencies.now()).toISOString();
@@ -273,11 +273,14 @@ export function createKrakenRefreshCoordinator(dependencies: Dependencies) {
         }
     }
     return {
-        async get(siteId: string, tariffIdentity?: { tariffCode: string; meterPointRef: string },
-            exportTariffIdentity?: { accountRef: string; productCode: string; tariffCode: string },
+        async get(siteId: string, tariffIdentity?: { accountRef?: string; tariffCode: string; meterPointRef: string },
+            exportTariffIdentity?: { accountRef: string; meterPointRef?: string; productCode: string; tariffCode: string },
             historicalPeriod?: { start: string; end: string }): Promise<KrakenState> {
             const scope = { siteId: requiredText(siteId, "scope.siteId"),
                 accountRef: requiredText(dependencies.accountRef(), "scope.accountRef") };
+            if (tariffIdentity?.accountRef !== undefined
+                && (!/^[a-f0-9]{64}$/.test(tariffIdentity.accountRef) || tariffIdentity.accountRef !== scope.accountRef))
+                throw Error("KRAKEN_CONFIGURED_IMPORT_ACCOUNT_MISMATCH");
             const scopeId = scheduleScopeId(scope);
             const expectedExportAccountRef = dependencies.exportAccountRef?.() ?? null;
             const currentExportContextKey = exportContextKey(exportTariffIdentity, expectedExportAccountRef);
@@ -304,7 +307,7 @@ const processState = globalThis as typeof globalThis & {
 const coordinator = processState.__hepKrakenRefreshCoordinator ??=
     createKrakenRefreshCoordinator(productionDependencies());
 export const getRecordedKrakenState = (siteId: string,
-    tariffIdentity?: { tariffCode: string; meterPointRef: string },
-    exportTariffIdentity?: { accountRef: string; productCode: string; tariffCode: string },
+    tariffIdentity?: { accountRef?: string; tariffCode: string; meterPointRef: string },
+    exportTariffIdentity?: { accountRef: string; meterPointRef?: string; productCode: string; tariffCode: string },
     historicalPeriod?: { start: string; end: string }) =>
     coordinator.get(siteId, tariffIdentity, exportTariffIdentity, historicalPeriod);

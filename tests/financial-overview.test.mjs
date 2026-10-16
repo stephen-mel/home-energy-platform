@@ -91,6 +91,41 @@ test("estimated energy remains labelled estimate and future savings stay unset",
   assert.deepEqual(JSON.parse(JSON.stringify(result.future)), { solarSavings: null, batterySavings: null, investmentPayback: null });
 });
 
+test("measured exports priced by a user-confirmed assumption remain estimated", () => {
+  const assumed = { provider: "user-confirmed-commercial-assumption", description: "Export Premium v3",
+    observedAt: null, stale: false };
+  const assumedSignal = signal(); assumedSignal.export[0].sources = [assumed];
+  let displayed;
+  for (const exported of [10, 0]) {
+    const result = calculate({ period, signal: assumedSignal,
+      readings: [
+        reading(period.start, "2026-10-12T22:00:00Z", 0, exported / 2),
+        reading("2026-10-12T22:00:00Z", period.end, 0, exported / 2),
+      ] });
+    if (exported === 10) displayed=result;
+    assert.equal(result.exportEarnings.amount, exported * .175);
+    assert.equal(result.exportEarnings.status, "estimated");
+    assert.equal(result.exportEarnings.pricingBasis, "user-confirmed-assumption");
+    assert.equal(result.netCost.status, "estimated");
+  }
+  const local={};vm.runInNewContext(ts.transpileModule(fs.readFileSync("src/lib/presentation/local-time.ts","utf8"),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText,{exports:local,Intl,Date,RangeError});
+  const component={};vm.runInNewContext(ts.transpileModule(fs.readFileSync("src/components/FinancialOverview.tsx","utf8"),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,jsx:ts.JsxEmit.ReactJSX}}).outputText,{exports:component,Intl,require(name){if(name==="react/jsx-runtime")return jsxRuntime;if(name==="../lib/presentation/local-time")return local;throw Error(name);}});
+  const html=renderToStaticMarkup(component.default({overview:displayed,timeZone:"Europe/London"}));
+  assert.match(html,/£1\.75/);assert.match(html,/Estimate using a user-confirmed tariff assumption/);
+  assert.match(html,/Export rates including user-confirmed assumptions/);assert.doesNotMatch(html,/Verified export rates/);
+});
+
+test("mixed verified and assumed export periods remain estimated while unknown pricing stays unavailable", () => {
+  const mixed = signal(); mixed.export = [window(period.start,"2026-10-12T22:00:00Z",.175),
+    window("2026-10-12T22:00:00Z",period.end,.175)];
+  mixed.export[1].sources=[{provider:"user-confirmed-commercial-assumption",description:"assumed",observedAt:null,stale:false}];
+  let result=calculate({period,signal:mixed,readings:[reading(period.start,"2026-10-12T22:00:00Z",0,5),reading("2026-10-12T22:00:00Z",period.end,0,5)]});
+  assert.equal(result.exportEarnings.amount,1.75);assert.equal(result.exportEarnings.status,"estimated");assert.equal(result.exportEarnings.pricingBasis,"mixed");
+  const unknown=signal();unknown.export[0].price=null;unknown.export[0].priceStatus="unknown";
+  result=calculate({period,signal:unknown,readings:[reading(period.start,period.end,0,10)]});
+  assert.equal(result.exportEarnings.status,"unavailable");assert.equal(result.exportEarnings.pricingBasis,"unknown");
+});
+
 test("dashboard card reports unavailable totals, coverage and verified rates honestly", () => {
   const result = calculate({ period, signal: signal(), readings: [] });
   const local = {};
