@@ -16,33 +16,45 @@ async function krakenGraphQL<T>(
   query: string,
   token?: string
 ): Promise<T> {
-  const response = await fetch(KRAKEN_GRAPHQL_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(token ? { Authorization: `JWT ${token}` } : {}),
-    },
-    body: JSON.stringify({ query }),
-    cache: "no-store",
-  });
-
-  if (!response.ok) {
-    const errorBody = await response.text();
-    throw new Error(`Kraken HTTP error ${response.status}: ${errorBody}`);
+  let response: Response;
+  try {
+    response = await fetch(KRAKEN_GRAPHQL_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `JWT ${token}` } : {}),
+      },
+      body: JSON.stringify({ query }),
+      cache: "no-store",
+    });
+  } catch {
+    throw new Error("KRAKEN_TRANSPORT_FAILURE");
   }
 
-  const result: GraphQLResponse<T> = await response.json();
+  if (!response.ok) {
+    throw new Error("KRAKEN_HTTP_FAILURE");
+  }
 
-  if (result.errors?.length) {
-    throw new Error(
-      `Kraken GraphQL error: ${result.errors
-        .map((error) => error.message)
-        .join(", ")}`
-    );
+  let result: GraphQLResponse<T>;
+  try {
+    result = await response.json() as GraphQLResponse<T>;
+  } catch {
+    throw new Error("KRAKEN_RESPONSE_INVALID");
+  }
+
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    throw new Error("KRAKEN_RESPONSE_INVALID");
+  }
+
+  if (Array.isArray(result.errors) && result.errors.length > 0) {
+    throw new Error("KRAKEN_GRAPHQL_REJECTED");
+  }
+  if (result.errors !== undefined && !Array.isArray(result.errors)) {
+    throw new Error("KRAKEN_RESPONSE_INVALID");
   }
 
   if (!result.data) {
-    throw new Error("Kraken returned no data");
+    throw new Error("KRAKEN_RESPONSE_INVALID");
   }
 
   return result.data;
@@ -52,18 +64,26 @@ export async function getKrakenToken(): Promise<string> {
   return obtainKrakenToken(captureKrakenAuthentication());
 }
 
-type KrakenAuthentication = { email: string; password: string };
+type KrakenAuthentication = { kind: "api-key"; apiKey: string }
+  | { kind: "legacy-email-password"; email: string; password: string };
 type KrakenReadConfiguration = KrakenAuthentication & { accountNumber: string; accountRef: string };
 type KrakenExportReadConfiguration = KrakenAuthentication & { accountNumber: string; accountRef: string };
 
 function captureKrakenAuthentication(): KrakenAuthentication {
+  const apiKey = process.env.EON_KRAKEN_API_KEY;
+  if (apiKey !== undefined) {
+    if (!apiKey || apiKey !== apiKey.trim() || apiKey.length > 4096 || /[\u0000-\u001f\u007f]/.test(apiKey)) {
+      throw new Error("KRAKEN_API_KEY_INVALID");
+    }
+    return { kind: "api-key", apiKey };
+  }
   const email = process.env.EON_EMAIL;
   const password = process.env.EON_PASSWORD;
 
   if (!email || !password) {
     throw new Error("E.ON credentials are not configured");
   }
-  return { email, password };
+  return { kind: "legacy-email-password", email, password };
 }
 
 function captureKrakenAccount(): Pick<KrakenReadConfiguration, "accountNumber" | "accountRef"> {
@@ -97,13 +117,15 @@ function captureKrakenExportConfiguration(authentication: KrakenAuthentication):
     accountRef: createHash("sha256").update(`eon-account\0${accountNumber}`).digest("hex") };
 }
 
-async function obtainKrakenToken({ email, password }: KrakenAuthentication): Promise<string> {
+async function obtainKrakenToken(authentication: KrakenAuthentication): Promise<string> {
+  const input = authentication.kind === "api-key"
+    ? `APIKey: ${JSON.stringify(authentication.apiKey)}`
+    : `email: ${JSON.stringify(authentication.email)}\n        password: ${JSON.stringify(authentication.password)}`;
   const query = `
   mutation {
     obtainKrakenToken(
       input: {
-        email: ${JSON.stringify(email)}
-        password: ${JSON.stringify(password)}
+        ${input}
       }
     ) {
       token
@@ -111,13 +133,31 @@ async function obtainKrakenToken({ email, password }: KrakenAuthentication): Pro
   }
 `;
 
-  const data = await krakenGraphQL<{
+  const exchange = () => krakenGraphQL<{
     obtainKrakenToken: {
       token: string;
     };
   }>(query);
 
-  return data.obtainKrakenToken.token;
+  if (authentication.kind === "legacy-email-password") {
+    const data = await exchange();
+    return data.obtainKrakenToken.token;
+  }
+
+  try {
+    const data = await exchange();
+    const token = data.obtainKrakenToken.token;
+    const segments = typeof token === "string" ? token.split(".") : [];
+    const validCompactJwt = segments.length === 3 && segments.every((segment) =>
+      segment.length > 0 && segment.length % 4 !== 1 && /^[A-Za-z0-9_-]+$/.test(segment));
+    if (!validCompactJwt || token === authentication.apiKey
+        || token !== token.trim() || /[\u0000-\u001f\u007f]/.test(token)) throw new Error();
+    return token;
+  } catch {
+    // Authentication responses can include provider-controlled text. Never let
+    // credentials, response bodies or GraphQL details cross this boundary.
+    throw new Error("KRAKEN_AUTHENTICATION_FAILED");
+  }
 }
 export type KrakenDevice = {
   id: string;
