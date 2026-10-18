@@ -47,6 +47,10 @@ function snapshotEvidence(value: unknown, seen = new Set<object>()): unknown {
             throw Error("INVALID_EVIDENCE");
         if (array && (!/^(0|[1-9]\d*)$/.test(key) || Number(key) >= (descriptors.length as PropertyDescriptor & { value: number }).value))
             throw Error("INVALID_EVIDENCE");
+        // Cache reconstruction represents absent optional object fields as own
+        // properties with undefined values. Preserve absence without inventing a
+        // value; fixed-shape validators still reject required fields so omitted.
+        if (!array && descriptor.value === undefined) continue;
         const copied = snapshotEvidence(descriptor.value, seen);
         if (array) (result as unknown[])[Number(key)] = copied;
         else (result as Record<string, unknown>)[key] = copied;

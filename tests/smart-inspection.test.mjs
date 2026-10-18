@@ -89,11 +89,35 @@ test('display does not extrapolate known slot prices past verified tariff covera
  const f=fixture();f.kraken.importTariff.version.effectiveTo='2026-10-11T13:15:00Z';
  const r=inspectSmartTariff(f);assert.equal(r.slots[0].price,null);assert.equal(r.payload,null);
 });
+function recoveredOptionalShape(f){
+ f.kraken.importTariffDiagnostic=undefined;f.kraken.exportTariffDiagnostic=undefined;
+ f.kraken.historicalImportRates={status:'available',accountRef:'synthetic-account',meterPointRef:'synthetic-meter',observedAt:f.now,
+  period:{start:'2026-10-10T00:00:00.000Z',end:'2026-10-10T00:30:00.000Z'},vatBasis:'corroborated-not-independent',
+  windows:[{start:'2026-10-10T00:00:00.000Z',end:'2026-10-10T00:30:00.000Z',price:{amount:0.0285,currency:'GBP',unit:'kWh'},
+   kind:'standard',condition:'none',sources:[{provider:'eon-next-kraken',description:'Synthetic history',tariffVersion:undefined,
+    observedAt:f.now,stale:false,cause:undefined}]}]};
+ f.kraken.historicalImportRatesDiagnostic=undefined;
+ return f;
+}
+test('cache-reconstructed optional undefined fields are omitted without changing a valid proposal',()=>{
+ const expected=inspectSmartTariff(fixture()),f=recoveredOptionalShape(fixture()),actual=inspectSmartTariff(f);
+ assert.deepEqual(structuredClone(actual.payload),structuredClone(expected.payload));
+ assert.deepEqual(structuredClone(actual.restorationCandidate),structuredClone(expected.restorationCandidate));
+ assert.equal(actual.payloadUnavailableReason,expected.payloadUnavailableReason);
+ for(const key of ['writeReady','rollbackProven','restorationProven','resolvesHistoricalJournal','grantsRepeatAuthority'])assert.equal(actual[key],false);
+});
+test('stale recovered optional evidence remains unavailable rather than malformed or current',()=>{
+ const f=recoveredOptionalShape(fixture());f.kraken.stale=true;const r=inspectSmartTariff(f);
+ assert.equal(r.payload,null);assert.equal(r.importRate,null);assert.equal(r.payloadUnavailableReason,'VERIFIED_IMPORT_TARIFF_REQUIRED');
+ assert.ok(!r.blockers.includes('INSPECTION_KRAKEN_TARIFF_EVIDENCE_INVALID'));
+ for(const key of ['writeReady','rollbackProven','restorationProven','resolvesHistoricalJournal','grantsRepeatAuthority'])assert.equal(r[key],false);
+});
 test('incomplete and malformed normalized import tariff evidence fails closed without leaking input',()=>{
  const cases=[
   f=>{f.kraken.importTariff={status:'available',accountRef:'synthetic-account'};},
   f=>{delete f.kraken.importTariff.agreement.tariffCode;},
   f=>{delete f.kraken.importTariff.version.dailyImportWindows;},
+  f=>{f.kraken.importTariff.version.normalImport=undefined;},
   f=>{f.kraken.importTariff.version.normalImport={amount:Infinity,currency:'GBP',unit:'kWh'};},
  ];
  for(const change of cases){const f=fixture();change(f);let r;
@@ -101,6 +125,11 @@ test('incomplete and malformed normalized import tariff evidence fails closed wi
   assert.equal(r.payloadUnavailableReason,'INSPECTION_KRAKEN_TARIFF_EVIDENCE_INVALID');
   assert.ok(r.blockers.includes('INSPECTION_KRAKEN_TARIFF_EVIDENCE_INVALID'));
   assert.doesNotMatch(formatSmartInspection(r),/synthetic-account|synthetic-meter/);
+ }
+});
+test('undefined and sparse array elements remain invalid evidence',()=>{
+ for(const dispatches of [[undefined],new Array(1)]){const f=fixture();f.kraken.vehicles[0].plannedDispatches=dispatches;const r=inspectSmartTariff(f);
+  assert.equal(r.payload,null);assert.equal(r.payloadUnavailableReason,'INSPECTION_KRAKEN_TARIFF_EVIDENCE_INVALID');
  }
 });
 test('cyclic, malformed and unsupported Tesla evidence fails closed before fingerprinting',()=>{
