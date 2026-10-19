@@ -1,7 +1,7 @@
 import { managedSmartTarget, type ManagedImportEvidence } from "./managed-smart";
 import type { Site } from "../site/types";
 import type { KrakenState } from "../site/kraken-state";
-import { getSitePriceSignal, siteWithKrakenImportTariff, verifiedKrakenExportTariff } from "../site/get-site-price-signal";
+import { getSitePriceSignalForPeriod, siteWithKrakenImportTariff, verifiedKrakenExportTariff } from "../site/get-site-price-signal";
 import { instant } from "../tariff/price-signal";
 import { comparePriceSignalsInDomain } from "../tariff/comparison-domain";
 import type { ObservedTariff } from "./observed-tariff";
@@ -74,7 +74,7 @@ export function reconcileTeslaTariff(input: ReconciliationInput) {
             return fail("INVALID_SMART_EVIDENCE");
         const economicSite = siteWithKrakenImportTariff(input.site, input.kraken, input.now);
         const usingVerifiedImport = economicSite !== input.site;
-        const hep = getSitePriceSignal(economicSite, input.kraken, input.now).signal;
+        const hep = getSitePriceSignalForPeriod(economicSite, input.kraken, input.now, domain).signal;
         const observed = observedEconomicSignal(input.observation, domain);
         // Kraken proves import economics only. The observed Tesla export curve is
         // preserved as unmanaged state in the replacement. Independently verified
@@ -87,7 +87,7 @@ export function reconcileTeslaTariff(input: ReconciliationInput) {
         if ([...validated.projected.current.import, ...validated.projected.current.export].some(w => w.stale || w.sources.some(s => s.stale))) return fail("STALE_EVIDENCE");
         const comparison = comparePriceSignalsInDomain(observed.signal, monetarySignal(validated.projected.current), domain);
         if (comparison.status === "indeterminate") return fail(comparison.diagnostic.code);
-        const baseImport = getSitePriceSignal(economicSite, null, input.now).signal;
+        const baseImport = getSitePriceSignalForPeriod(economicSite, null, input.now, domain).signal;
         const managedScope = { baseSignal: usingVerifiedImport ? { ...baseImport, export: observed.signal.export } : baseImport,
             previous: input.managedImport };
         let managed;

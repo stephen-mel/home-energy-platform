@@ -22,6 +22,7 @@ const {inspectSmartTariff,formatSmartInspection}=load('src/lib/tesla-tariff/smar
 const {validateKrakenImportTariff}=load('src/lib/kraken/import-tariff.ts');
 const {captureObservedTariff}=load('src/lib/tesla-tariff/observed-tariff.ts');
 const {observedEconomicSignal}=load('src/lib/tesla-tariff/observed-economic.ts');
+const {comparePriceSignalsInDomain}=load('src/lib/tariff/comparison-domain.ts');
 function fixture(){
  const now='2026-10-11T12:00:00.000Z';
  const site=structuredClone(load('src/lib/site/current-site.ts').currentSite);
@@ -91,7 +92,7 @@ test('two independently scheduled vehicles produce one bounded daytime SMART cha
  {start:'2026-10-19T12:00:00.000Z',end:'2026-10-19T14:00:00.000Z',amount:0.23978},
  {start:'2026-10-19T14:00:00.000Z',end:'2026-10-19T15:30:00.000Z',amount:0.0285},
  {start:'2026-10-19T15:30:00.000Z',end:'2026-10-19T23:00:00.000Z',amount:0.23978},
-  {start:'2026-10-19T23:00:00.000Z',end:'2026-10-20T12:00:00.000Z',amount:0.23978},
+  {start:'2026-10-19T23:00:00.000Z',end:'2026-10-20T23:00:00.000Z',amount:0.23978},
  ];
  const assertPrices=payload=>{
   const curve=payloadCurve(payload).map(w=>({start:w.start,end:w.end,amount:w.price?.amount}));
@@ -152,7 +153,59 @@ test('stale, incomplete, missing and wrong-account evidence cannot create payloa
 test('BOOST excluded; original half-hour and explicit DST-fold boundaries survive',()=>{
  const f=fixture();f.kraken.vehicles[0].plannedDispatches[0].type='BOOST';assert.equal(inspectSmartTariff(f).slots.length,0);
  f.now='2026-10-25T00:00:00Z';f.kraken.vehicles[0].plannedDispatches=[{start:'2026-10-25T01:00:00+01:00',end:'2026-10-25T01:30:00+00:00',type:'SMART',energyAddedKwh:null}];
+ f.kraken.lastSuccessfulUpdate=f.kraken.importTariff.observedAt=f.observation.source.observedAt=f.now;
+ f.kraken.importTariff.version.effectiveFrom='2026-10-24T23:00:00.000Z';f.kraken.importTariff.version.effectiveTo='2026-10-26T00:00:00.000Z';
  const r=inspectSmartTariff(f);assert.equal(r.slots[0].start,'2026-10-25T00:00:00.000Z');assert.equal(r.slots[0].end,'2026-10-25T01:30:00.000Z');assert.equal(r.payload,null);
+});
+test('inspection domain is minute-aligned and bounded by authenticated tariff coverage',()=>{
+ const f=fixture();f.now='2026-10-19T08:18:29.438Z';f.kraken.lastSuccessfulUpdate=f.kraken.importTariff.observedAt=f.observation.source.observedAt=f.now;
+ f.kraken.importTariff.version.effectiveFrom='2026-10-18T23:00:00.000Z';f.kraken.importTariff.version.effectiveTo='2026-10-19T23:00:00.000Z';
+ f.kraken.vehicles[0].plannedDispatches=[{start:'2026-10-19T08:08:00Z',end:'2026-10-19T10:00:00Z',type:'SMART',energyAddedKwh:'2'}];
+ const r=inspectSmartTariff(f);assert.ok(r.payload,JSON.stringify(r));assert.equal(r.status,'update-required');
+ assert.deepEqual(structuredClone(r.domain),{start:'2026-10-19T08:19:00.000Z',end:'2026-10-19T23:00:00.000Z'});
+ assert.deepEqual(structuredClone(r.differences),[{start:'2026-10-19T08:19:00.000Z',end:'2026-10-19T10:00:00.000Z',channels:['import']}]);
+ const proposed=captureObservedTariff({response:{energy_site_id:123,installation_time_zone:'Europe/London',
+  tariff_content_v2:r.payload.tou_settings.tariff_content_v2}},'123',f.now);
+ assert.ok(proposed.tariff);
+ for(const outside of [{start:'2026-10-18T23:00:00.000Z',end:r.domain.start},{start:'2026-10-19T10:00:00.000Z',end:r.domain.end}]){
+  const before=observedEconomicSignal(f.observation,outside).signal,after=observedEconomicSignal(proposed,outside).signal;
+  assert.equal(comparePriceSignalsInDomain(before,after,outside).status,'unchanged');
+ }
+ for(const key of ['writeReady','rollbackProven','restorationProven','resolvesHistoricalJournal','grantsRepeatAuthority'])assert.equal(r[key],false);
+});
+test('SMART dispatch coverage accepts the exact tariff boundary and rejects every uncovered future portion',()=>{
+ const prepare=dispatch=>{const f=fixture();f.now='2026-10-19T21:00:00.000Z';
+  f.kraken.lastSuccessfulUpdate=f.kraken.importTariff.observedAt=f.observation.source.observedAt=f.now;
+  f.kraken.importTariff.version.effectiveFrom='2026-10-18T23:00:00.000Z';f.kraken.importTariff.version.effectiveTo='2026-10-19T23:00:00.000Z';
+  f.kraken.vehicles[0].plannedDispatches=[dispatch];return f;};
+ const exact=inspectSmartTariff(prepare({start:'2026-10-19T22:00:00Z',end:'2026-10-19T23:00:00Z',type:'SMART',energyAddedKwh:null}));
+ assert.notEqual(exact.payloadUnavailableReason,'SMART_DISPATCH_OUTSIDE_VERIFIED_TARIFF_COVERAGE');assert.ok(exact.payload);
+ for(const dispatch of [
+  {start:'2026-10-19T22:30:00Z',end:'2026-10-19T23:30:00Z',type:'SMART',energyAddedKwh:null},
+  {start:'2026-10-19T23:00:00Z',end:'2026-10-19T23:30:00Z',type:'SMART',energyAddedKwh:null},
+ ]){const r=inspectSmartTariff(prepare(dispatch));assert.equal(r.payload,null);
+  assert.equal(r.payloadUnavailableReason,'SMART_DISPATCH_OUTSIDE_VERIFIED_TARIFF_COVERAGE');
+  assert.ok(r.blockers.includes('SMART_DISPATCH_OUTSIDE_VERIFIED_TARIFF_COVERAGE'));
+ }
+});
+test('long authenticated coverage is capped at the supported 48-hour comparison horizon',()=>{
+ const prepare=dispatch=>{const f=fixture();f.now='2026-10-19T08:18:29.438Z';
+  f.kraken.lastSuccessfulUpdate=f.kraken.importTariff.observedAt=f.observation.source.observedAt=f.now;
+  f.kraken.importTariff.version.effectiveFrom='2026-10-18T23:00:00.000Z';f.kraken.importTariff.version.effectiveTo='2026-10-25T23:00:00.000Z';
+  f.kraken.vehicles[0].plannedDispatches=[dispatch];return f;};
+ const end='2026-10-21T08:19:00.000Z';
+ const sameDay=inspectSmartTariff(prepare({start:'2026-10-19T14:00:00Z',end:'2026-10-19T15:00:00Z',type:'SMART',energyAddedKwh:null}));
+ assert.deepEqual(structuredClone(sameDay.domain),{start:'2026-10-19T08:19:00.000Z',end});
+ assert.ok(sameDay.payload,JSON.stringify(sameDay));assert.equal(sameDay.status,'update-required');
+ const exact=inspectSmartTariff(prepare({start:'2026-10-21T07:19:00Z',end,type:'SMART',energyAddedKwh:null}));
+ assert.ok(exact.payload,JSON.stringify(exact));assert.notEqual(exact.payloadUnavailableReason,'SMART_DISPATCH_OUTSIDE_SUPPORTED_COMPARISON_HORIZON');
+ for(const dispatch of [
+  {start:'2026-10-21T08:19:00Z',end:'2026-10-21T08:49:00Z',type:'SMART',energyAddedKwh:null},
+  {start:'2026-10-21T07:49:00Z',end:'2026-10-21T08:49:00Z',type:'SMART',energyAddedKwh:null},
+ ]){const r=inspectSmartTariff(prepare(dispatch));assert.equal(r.payload,null);
+  assert.equal(r.payloadUnavailableReason,'SMART_DISPATCH_OUTSIDE_SUPPORTED_COMPARISON_HORIZON');
+  assert.ok(r.blockers.includes('SMART_DISPATCH_OUTSIDE_SUPPORTED_COMPARISON_HORIZON'));
+ }
 });
 test('server entry acquires each production adapter once and sanitizes failures',async()=>{
  let k=0,t=0;const f=fixture();

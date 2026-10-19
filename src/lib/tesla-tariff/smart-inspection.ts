@@ -136,17 +136,35 @@ export function inspectSmartTariff(input: {
         provenance: "authenticated-query", status: "complete", vehicles: detachedKraken.vehicles }) : null;
     const kraken = schedule?.current ? detachedKraken : null;
     const time = Date.parse(now);
-    const domain = { start: now, end: Number.isFinite(time) ? new Date(time + 86400000).toISOString() : now };
+    const comparisonStart = Number.isFinite(time) ? Math.ceil(time / 60_000) * 60_000 : NaN;
     const identity = site.integrations.kraken.importTariffIdentity;
     const economicSite = siteWithKrakenImportTariff(site, kraken, now, true);
     const version = economicSite.tariff?.versions?.[0];
     const bound = !!identity && !!kraken?.importTariff?.accountRef
         && (!identity.accountRef || identity.accountRef === kraken.importTariff.accountRef);
     const verified = bound && !!version && !kraken?.importTariffDiagnostic;
+    const coverageStart = Date.parse(version?.effectiveFrom ?? ""), coverageEnd = Date.parse(version?.effectiveTo ?? "");
+    const supportedEnd = comparisonStart + 48 * 3_600_000;
+    const comparisonEnd = Math.min(coverageEnd, supportedEnd);
+    const domain = { start: Number.isFinite(comparisonStart) ? new Date(comparisonStart).toISOString() : now,
+        end: Number.isFinite(comparisonEnd) ? new Date(comparisonEnd).toISOString() : now };
+    const relevantSmart = kraken?.vehicles.flatMap(vehicle => vehicle.plannedDispatches
+        .filter(dispatch => dispatch.type === "SMART" && Date.parse(dispatch.end) > time)) ?? [];
+    const tariffDomainUnavailable = !Number.isFinite(comparisonStart) || !Number.isFinite(coverageStart)
+        || !Number.isFinite(coverageEnd) || comparisonStart >= coverageEnd || comparisonStart < coverageStart;
+    const dispatchOutsideCoverage = relevantSmart.some(dispatch => {
+        const start = Date.parse(dispatch.start), end = Date.parse(dispatch.end);
+        return !Number.isFinite(start) || !Number.isFinite(end) || end <= start
+            || Math.max(start, comparisonStart) < coverageStart || end > coverageEnd;
+    });
+    const dispatchOutsideSupportedHorizon = relevantSmart.some(dispatch => Date.parse(dispatch.end) > comparisonEnd);
     const result = krakenInvalid ? unavailableReconciliation("INSPECTION_KRAKEN_TARIFF_EVIDENCE_INVALID", domain)
         : teslaInvalid ? unavailableReconciliation("INSPECTION_TESLA_EVIDENCE_INVALID", domain)
         : !kraken ? unavailableReconciliation(input.kraken ? "INCOMPLETE_KRAKEN_OBSERVATION" : "KRAKEN_UNAVAILABLE", domain)
         : !verified ? unavailableReconciliation("VERIFIED_IMPORT_TARIFF_REQUIRED", domain)
+        : tariffDomainUnavailable ? unavailableReconciliation("VERIFIED_IMPORT_TARIFF_DOMAIN_UNAVAILABLE", domain)
+        : dispatchOutsideCoverage ? unavailableReconciliation("SMART_DISPATCH_OUTSIDE_VERIFIED_TARIFF_COVERAGE", domain)
+        : dispatchOutsideSupportedHorizon ? unavailableReconciliation("SMART_DISPATCH_OUTSIDE_SUPPORTED_COMPARISON_HORIZON", domain)
         : !observation ? unavailableReconciliation("TESLA_OBSERVATION_UNAVAILABLE", domain)
         : reconcileTeslaTariff({ site, kraken, observation, now, comparisonDomain: domain,
             energySiteId: site.integrations.tesla.energySiteId ?? "" });
