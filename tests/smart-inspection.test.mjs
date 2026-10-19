@@ -21,6 +21,7 @@ function load(file, overrides={}) {
 const {inspectSmartTariff,formatSmartInspection}=load('src/lib/tesla-tariff/smart-inspection.ts');
 const {validateKrakenImportTariff}=load('src/lib/kraken/import-tariff.ts');
 const {captureObservedTariff}=load('src/lib/tesla-tariff/observed-tariff.ts');
+const {observedEconomicSignal}=load('src/lib/tesla-tariff/observed-economic.ts');
 function fixture(){
  const now='2026-10-11T12:00:00.000Z';
  const site=structuredClone(load('src/lib/site/current-site.ts').currentSite);
@@ -47,6 +48,95 @@ test('real reconciliation creates exact inspection candidate with no executor or
  for(const b of ['BUY_BELOW_SELL','ROLLBACK_UNPROVEN','BOUNDED_FORECAST','HISTORICAL_JOURNAL_UNRESOLVED','TRUSTED_EON_EXPORT_METER_POINT_EVIDENCE_UNAVAILABLE'])assert.ok(r.blockers.includes(b));
  assert.doesNotMatch(formatSmartInspection(r),/synthetic-account|synthetic-meter/);
  assert.deepEqual(structuredClone(r.payload.tou_settings.tariff_content_v2.sell_tariff),structuredClone(input.observation.tariff.sell_tariff));
+});
+test('two independently scheduled vehicles produce one bounded daytime SMART change with exact provenance',()=>{
+ const f=fixture();
+ f.now='2026-10-19T12:00:00.000Z';f.kraken.lastSuccessfulUpdate=f.now;f.kraken.importTariff.observedAt=f.now;
+ f.kraken.importTariff.version.effectiveFrom='2026-10-18T23:00:00.000Z';f.kraken.importTariff.version.effectiveTo='2026-10-20T23:00:00.000Z';
+ f.observation.source.observedAt=f.now;
+ f.kraken.vehicles=[
+  {id:'vehicle-a',name:'Vehicle A',plannedDispatches:[{start:'2026-10-19T14:00:00Z',end:'2026-10-19T15:00:00Z',type:'SMART',energyAddedKwh:'2.0'}]},
+  {id:'vehicle-b',name:'Vehicle B',plannedDispatches:[{start:'2026-10-19T14:30:00Z',end:'2026-10-19T15:30:00Z',type:'SMART',energyAddedKwh:'3.0'}]},
+ ];
+ const before=JSON.stringify(f),r=inspectSmartTariff(f);
+ assert.equal(r.status,'update-required');assert.ok(r.payload);assert.notEqual(r.payloadUnavailableReason,'NO_MANAGED_ECONOMIC_CHANGE');
+ assert.deepEqual(structuredClone(r.slots),[
+  {start:'2026-10-19T14:00:00.000Z',end:'2026-10-19T15:00:00.000Z',vehicle:'Vehicle A',eligibility:'planned-conditional',price:{amount:0.0285,currency:'GBP',unit:'kWh'}},
+  {start:'2026-10-19T14:30:00.000Z',end:'2026-10-19T15:30:00.000Z',vehicle:'Vehicle B',eligibility:'planned-conditional',price:{amount:0.0285,currency:'GBP',unit:'kWh'}},
+ ]);
+ assert.deepEqual(structuredClone(r.differences),[
+  {start:'2026-10-19T14:00:00.000Z',end:'2026-10-19T15:30:00.000Z',channels:['import']},
+ ]);
+ const canonical=value=>Array.isArray(value)?`[${value.map(canonical).join(',')}]`:value&&typeof value==='object'
+  ?`{${Object.keys(value).sort().map(k=>`${JSON.stringify(k)}:${canonical(value[k])}`).join(',')}}`:JSON.stringify(value);
+ const evidenceDigest=value=>crypto.createHash('sha256').update(canonical(value)).digest('hex');
+ const expectedDispatches=[
+  {id:'vehicle-a',name:'Vehicle A',dispatches:[{start:'2026-10-19T14:00:00Z',end:'2026-10-19T15:00:00Z',type:'SMART',energyAddedKwh:'2.0'}]},
+  {id:'vehicle-b',name:'Vehicle B',dispatches:[{start:'2026-10-19T14:30:00Z',end:'2026-10-19T15:30:00Z',type:'SMART',energyAddedKwh:'3.0'}]},
+ ];
+ const expectedScheduleKey=canonical(expectedDispatches),session=s=>JSON.stringify([Date.parse(s.start),Date.parse(s.end),s.type,s.energyAddedKwh]);
+ const expectedObservationKey=JSON.stringify([f.site.id,expectedDispatches.map(v=>[v.id,v.dispatches.map(session)])]);
+ const assertEvidence=report=>{
+  assert.equal(report.scheduleEvidenceIdentity,evidenceDigest(expectedScheduleKey));
+  assert.equal(report.observationContentIdentity,evidenceDigest(expectedObservationKey));
+ };
+ assertEvidence(r);
+ const decodePayload=payload=>{
+  const observed=captureObservedTariff({response:{energy_site_id:123,installation_time_zone:'Europe/London',
+   tariff_content_v2:payload.tou_settings.tariff_content_v2}},'123',f.now);
+  assert.ok(observed.tariff);return observedEconomicSignal(observed,r.domain);
+ };
+ const payloadCurve=payload=>decodePayload(payload).signal.import;
+ const expectedCurve=[
+ {start:'2026-10-19T12:00:00.000Z',end:'2026-10-19T14:00:00.000Z',amount:0.23978},
+ {start:'2026-10-19T14:00:00.000Z',end:'2026-10-19T15:30:00.000Z',amount:0.0285},
+ {start:'2026-10-19T15:30:00.000Z',end:'2026-10-19T23:00:00.000Z',amount:0.23978},
+  {start:'2026-10-19T23:00:00.000Z',end:'2026-10-20T12:00:00.000Z',amount:0.23978},
+ ];
+ const assertPrices=payload=>{
+  const curve=payloadCurve(payload).map(w=>({start:w.start,end:w.end,amount:w.price?.amount}));
+  assert.deepEqual(structuredClone(curve),expectedCurve);
+ };
+ assertPrices(r.payload);
+ const london=time=>new Intl.DateTimeFormat('en-GB',{timeZone:'Europe/London',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).format(new Date(time));
+ assert.equal(london('2026-10-19T14:00:00.000Z'),'15:00');assert.equal(london('2026-10-19T15:30:00.000Z'),'16:30');
+ assert.equal(r.exportPreserved,true);
+ assert.deepEqual(structuredClone(r.payload.tou_settings.tariff_content_v2.sell_tariff),structuredClone(f.observation.tariff.sell_tariff));
+ for(const key of ['writeReady','rollbackProven','restorationProven','resolvesHistoricalJournal','grantsRepeatAuthority'])assert.equal(r[key],false);
+ const tampered=structuredClone(r.payload);
+ for(const charges of Object.values(tampered.tou_settings.tariff_content_v2.energy_charges))
+  for(const key of Object.keys(charges.rates))if(charges.rates[key]===0.0285)charges.rates[key]=0.99;
+ assert.throws(()=>assertPrices(tampered),assert.AssertionError);
+ const gap=structuredClone(r.payload),tariff=gap.tou_settings.tariff_content_v2;
+ const season=Object.keys(tariff.energy_charges).find(key=>Object.values(tariff.energy_charges[key].rates).includes(0.0285));
+ assert.ok(season);const rates=tariff.energy_charges[season].rates;
+ const periods=key=>tariff.seasons[season].tou_periods[key].periods;
+ const appliesOnMonday=period=>period.fromDayOfWeek<=1&&period.toDayOfWeek>=1;
+ const cheap=Object.keys(rates).find(key=>rates[key]===0.0285&&periods(key).some(period=>appliesOnMonday(period)
+  &&period.fromHour*60+period.fromMinute<=15*60+10&&period.toHour*60+period.toMinute>=15*60+20));
+ const peak=Object.keys(rates).find(key=>rates[key]===0.23978&&periods(key).some(appliesOnMonday));
+ assert.ok(cheap&&peak);const cheapPeriods=tariff.seasons[season].tou_periods[cheap].periods;
+ const original=cheapPeriods.find(period=>period.fromHour*60+period.fromMinute<=15*60+10
+  &&period.toHour*60+period.toMinute>=15*60+20);
+ assert.ok(original);tariff.seasons[season].tou_periods[cheap].periods=cheapPeriods.flatMap(period=>period===original?[
+  {...period,toHour:15,toMinute:10},
+  {...period,fromHour:15,fromMinute:20},
+ ]:[period]);
+ tariff.seasons[season].tou_periods[peak].periods.push(
+  {...original,fromHour:15,fromMinute:10,toHour:15,toMinute:20});
+ const decodedGap=decodePayload(gap),gapAtQuarterPast=decodedGap.signal.import.find(window=>
+  Date.parse(window.start)<=Date.parse('2026-10-19T14:15:00.000Z')&&Date.parse(window.end)>Date.parse('2026-10-19T14:15:00.000Z'));
+ assert.equal(gapAtQuarterPast?.start,'2026-10-19T14:10:00.000Z');
+ assert.equal(gapAtQuarterPast?.end,'2026-10-19T14:20:00.000Z');
+ assert.equal(gapAtQuarterPast?.priceStatus,'known');assert.equal(gapAtQuarterPast?.price?.amount,0.23978);
+ assert.throws(()=>assertPrices(gap),assert.AssertionError);
+ const unrelated={...r,scheduleEvidenceIdentity:evidenceDigest(canonical([{id:'unrelated',name:'Unrelated',dispatches:[]}])),
+  observationContentIdentity:evidenceDigest('unrelated-observation')};
+ assert.throws(()=>assertEvidence(unrelated),assert.AssertionError);
+ assert.equal(r.importRate.amount,0.0285);assert.deepEqual(structuredClone(r.differences),[
+  {start:'2026-10-19T14:00:00.000Z',end:'2026-10-19T15:30:00.000Z',channels:['import']},
+ ]);
+ assert.equal(JSON.stringify(f),before);
 });
 test('interval and rate changes invalidate proposal; unchanged schedule identity survives fresh retrieval',()=>{
  const f=fixture(),a=inspectSmartTariff(f);f.kraken.vehicles[0].plannedDispatches[0].end='2026-10-11T14:00:00Z';const b=inspectSmartTariff(f);
