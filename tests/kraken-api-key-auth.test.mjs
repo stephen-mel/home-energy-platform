@@ -24,7 +24,20 @@ function harness(env,auth='success',read='success'){
   calls.push({query,authorization});
   if(query.includes('obtainKrakenToken')){
    if(auth==='transport')throw Error('PRIVATE_RESPONSE_MARKER');
+   if(auth.startsWith('unsafe:'))return {ok:true,status:200,json:async()=>{
+    const unsafe=Error('placeholder');
+    if(auth==='unsafe:getter')Object.defineProperty(unsafe,'message',{get(){throw Error('PRIVATE_GETTER_MARKER')}});
+    if(auth==='unsafe:object')Object.defineProperty(unsafe,'message',{value:{toString(){throw Error('PRIVATE_COERCION_MARKER')}}});
+    if(auth==='unsafe:changing'){let reads=0;Object.defineProperty(unsafe,'message',{
+     get(){return reads++===0?'KRAKEN_HTTP_FAILURE':'constructor'}})}
+    return Object.defineProperty({},'data',{get(){throw unsafe}});
+   }};
+   if(auth.startsWith('unexpected:'))return {ok:true,status:200,json:async()=>Object.defineProperty({},'data',{
+    get(){throw Error(auth.slice('unexpected:'.length))}})};
+   if(auth==='unknown')return {ok:true,status:200,json:async()=>Object.defineProperty({},'data',{
+    get(){throw Error('PRIVATE_RESPONSE_MARKER')}})};
    const failed=failureResponse(auth);if(failed)return failed;
+   if(auth==='missing')return response({obtainKrakenToken:{}});
    if(auth==='equal')return response({obtainKrakenToken:{token:env.EON_KRAKEN_API_KEY}});
    if(auth==='malformed')return response({obtainKrakenToken:{token:'not-a-jwt'}});
    return response({obtainKrakenToken:{token:validJwt}});
@@ -66,20 +79,47 @@ test('malformed configured API keys fail before transport without legacy fallbac
  }
 });
 
-test('rejected API-key exchange is sanitized and never falls back or retries',async()=>{
- for(const failure of ['transport','http','graphql','json','equal','malformed']){const {api,calls}=harness({EON_KRAKEN_API_KEY:'private-api-key',
+test('API-key exchange failures retain fixed stages without fallback, retry or private content',async()=>{
+ const expected={transport:'KRAKEN_AUTH_TRANSPORT_FAILURE',http:'KRAKEN_AUTH_HTTP_FAILURE',
+  graphql:'KRAKEN_AUTH_GRAPHQL_REJECTED',json:'KRAKEN_AUTH_RESPONSE_INVALID',
+  missing:'KRAKEN_AUTH_RESPONSE_INVALID',malformed:'KRAKEN_AUTH_TOKEN_INVALID',
+  unknown:'KRAKEN_AUTHENTICATION_FAILED'};
+ for(const [failure,code] of Object.entries(expected)){const {api,calls}=harness({EON_KRAKEN_API_KEY:'private-api-key',
   EON_EMAIL:'legacy@example.invalid',EON_PASSWORD:'legacy-secret',EON_ACCOUNT:'account'},failure);
   const session=api.createKrakenReadSession();
-  await assert.rejects(session.getDevices(),error=>error.message==='KRAKEN_AUTHENTICATION_FAILED'
+  await assert.rejects(session.getDevices(),error=>error.message===code
    && !error.message.includes('private-api-key')&&!error.message.includes('PRIVATE'));
   assert.equal(calls.length,1);assert.match(calls[0].query,/APIKey:/);assert.doesNotMatch(calls[0].query,/email:|password:/);
+ }
+});
+
+test('inherited and unknown exception messages cannot select outward authentication codes',async()=>{
+ const permitted=new Set(['KRAKEN_AUTH_TRANSPORT_FAILURE','KRAKEN_AUTH_HTTP_FAILURE',
+  'KRAKEN_AUTH_GRAPHQL_REJECTED','KRAKEN_AUTH_RESPONSE_INVALID','KRAKEN_AUTH_TOKEN_INVALID',
+  'KRAKEN_AUTHENTICATION_FAILED']);
+ for(const message of ['constructor','toString','__proto__','private-marker']){
+  const {api,calls}=harness({EON_KRAKEN_API_KEY:'private-api-key',EON_ACCOUNT:'account'},`unexpected:${message}`);
+  await assert.rejects(api.createKrakenReadSession().getDevices(),error=>
+   typeof error.message==='string'&&error.message==='KRAKEN_AUTHENTICATION_FAILED'
+   &&permitted.has(error.message)&&!error.message.includes(message));
+  assert.equal(calls.length,1);
+ }
+});
+
+test('unsafe exception message metadata always becomes the primitive generic authentication code',async()=>{
+ for(const scenario of ['getter','object','changing']){
+  const {api,calls}=harness({EON_KRAKEN_API_KEY:'private-api-key',EON_ACCOUNT:'account'},`unsafe:${scenario}`);
+  await assert.rejects(api.createKrakenReadSession().getDevices(),error=>
+   typeof error.message==='string'&&error.message==='KRAKEN_AUTHENTICATION_FAILED'
+   &&!error.message.includes('PRIVATE')&&!error.message.includes('constructor'));
+  assert.equal(calls.length,1);
  }
 });
 
 test('a valid-shaped returned token identical to the configured API key is rejected',async()=>{
  const {api,calls}=harness({EON_KRAKEN_API_KEY:validJwt,EON_EMAIL:'legacy@example.invalid',
   EON_PASSWORD:'legacy-secret',EON_ACCOUNT:'account'},'equal');
- await assert.rejects(api.createKrakenReadSession().getDevices(),/^Error: KRAKEN_AUTHENTICATION_FAILED$/);
+ await assert.rejects(api.createKrakenReadSession().getDevices(),/^Error: KRAKEN_AUTH_TOKEN_INVALID$/);
  assert.equal(calls.length,1);assert.match(calls[0].query,/APIKey:/);assert.doesNotMatch(calls[0].query,/email:|password:/);
 });
 

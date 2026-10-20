@@ -19,7 +19,12 @@ The exchange result must have the three-segment compact JWT syntax before it is
 used; this is a structural check, not local cryptographic verification. Kraken
 remains responsible for authenticating and authorising the token. Upstream
 transport, HTTP, GraphQL and response-format failures expose only fixed error
-codes, never provider response content.
+codes, never provider response content. API-key exchange failures distinguish
+transport, HTTP, GraphQL rejection, invalid response structure and invalid JWT
+shape as `KRAKEN_AUTH_TRANSPORT_FAILURE`, `KRAKEN_AUTH_HTTP_FAILURE`,
+`KRAKEN_AUTH_GRAPHQL_REJECTED`, `KRAKEN_AUTH_RESPONSE_INVALID` and
+`KRAKEN_AUTH_TOKEN_INVALID`. Genuinely unclassified exchange failures retain the
+sanitized `KRAKEN_AUTHENTICATION_FAILED` fallback.
 
 The key and returned JWT are process-only authentication material. They are not
 written to Kraken state, schedule observations, SQLite, the compatibility cache,

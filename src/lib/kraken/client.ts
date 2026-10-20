@@ -146,17 +146,46 @@ async function obtainKrakenToken(authentication: KrakenAuthentication): Promise<
 
   try {
     const data = await exchange();
-    const token = data.obtainKrakenToken.token;
+    if (!data || typeof data !== "object" || Array.isArray(data))
+      throw new Error("KRAKEN_AUTH_RESPONSE_INVALID");
+    const exchangeResult = Object.getOwnPropertyDescriptor(data, "obtainKrakenToken");
+    if (!exchangeResult || !("value" in exchangeResult) || !exchangeResult.value
+        || typeof exchangeResult.value !== "object" || Array.isArray(exchangeResult.value))
+      throw new Error("KRAKEN_AUTH_RESPONSE_INVALID");
+    const tokenResult = Object.getOwnPropertyDescriptor(exchangeResult.value, "token");
+    if (!tokenResult || !("value" in tokenResult) || typeof tokenResult.value !== "string")
+      throw new Error("KRAKEN_AUTH_RESPONSE_INVALID");
+    const token = tokenResult.value;
     const segments = typeof token === "string" ? token.split(".") : [];
     const validCompactJwt = segments.length === 3 && segments.every((segment) =>
       segment.length > 0 && segment.length % 4 !== 1 && /^[A-Za-z0-9_-]+$/.test(segment));
     if (!validCompactJwt || token === authentication.apiKey
-        || token !== token.trim() || /[\u0000-\u001f\u007f]/.test(token)) throw new Error();
+        || token !== token.trim() || /[\u0000-\u001f\u007f]/.test(token))
+      throw new Error("KRAKEN_AUTH_TOKEN_INVALID");
     return token;
-  } catch {
+  } catch (error) {
     // Authentication responses can include provider-controlled text. Never let
     // credentials, response bodies or GraphQL details cross this boundary.
-    throw new Error("KRAKEN_AUTHENTICATION_FAILED");
+    const authFailureCodes = {
+      KRAKEN_TRANSPORT_FAILURE: "KRAKEN_AUTH_TRANSPORT_FAILURE",
+      KRAKEN_HTTP_FAILURE: "KRAKEN_AUTH_HTTP_FAILURE",
+      KRAKEN_GRAPHQL_REJECTED: "KRAKEN_AUTH_GRAPHQL_REJECTED",
+      KRAKEN_RESPONSE_INVALID: "KRAKEN_AUTH_RESPONSE_INVALID",
+      KRAKEN_AUTH_RESPONSE_INVALID: "KRAKEN_AUTH_RESPONSE_INVALID",
+      KRAKEN_AUTH_TOKEN_INVALID: "KRAKEN_AUTH_TOKEN_INVALID",
+    } as const;
+    let message: string | undefined;
+    try {
+      const descriptor = error instanceof Error
+        ? Object.getOwnPropertyDescriptor(error, "message") : undefined;
+      if (descriptor && "value" in descriptor && typeof descriptor.value === "string")
+        message = descriptor.value;
+    } catch {
+      // Unsafe exception metadata is never exposed or used for classification.
+    }
+    const code = message !== undefined && Object.hasOwn(authFailureCodes, message)
+      ? authFailureCodes[message as keyof typeof authFailureCodes] : undefined;
+    throw new Error(code ?? "KRAKEN_AUTHENTICATION_FAILED");
   }
 }
 export type KrakenDevice = {

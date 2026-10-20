@@ -17,7 +17,7 @@ function loadCoordinator() {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText;
   const exports = {};
-  vm.runInNewContext(source, {
+  vm.runInNewContext(`${source}\nexports.__testError = message => new Error(message);`, {
     exports, Buffer, structuredClone, console: { error() {} }, process,
     require(name) {
       if (name === "server-only") return {};
@@ -89,7 +89,9 @@ function harness(options = {}) {
       ? options.expectedExportAccountRef() : options.expectedExportAccountRef ?? "export-account-a",
     createSession: () => {
       sessions++;
-      if (options.credentialFailure?.()) throw Error(options.credentialError ?? "E.ON credentials are not configured");
+      if (options.credentialFailure?.()) throw options.credentialErrorFromModule
+        ? api.__testError(options.credentialError ?? "E.ON credentials are not configured")
+        : Error(options.credentialError ?? "E.ON credentials are not configured");
       const exportAccountRef = typeof options.sessionExportAccountRef === 'function'
         ? options.sessionExportAccountRef() : options.sessionExportAccountRef ?? "export-account-a";
       return { accountRef: options.accountRef ?? "account-a",
@@ -158,6 +160,14 @@ test("inspection acquisition result is transient, sanitized and distinguishes fr
   assert.equal(Object.hasOwn(recovered.state, "acquisition"), false);
   assert.doesNotMatch(JSON.stringify(recovered), /private-token/);
   assert.equal(failed.counts().writes, 0);
+
+  const stagedFailure = harness({ compatible, credentialFailure: () => true,
+    credentialError: "KRAKEN_AUTH_HTTP_FAILURE", credentialErrorFromModule: true });
+  const stagedRecovery = await stagedFailure.coordinator.getWithAcquisition("site-a");
+  assert.equal(stagedRecovery.state.stale, true);
+  assert.deepEqual(plain(stagedRecovery.acquisition), { attempted: true, freshEvidenceObtained: false,
+    staleFallbackUsed: true, code: "KRAKEN_AUTH_HTTP_FAILURE" });
+  assert.equal(Object.hasOwn(stagedRecovery.state, "acquisition"), false);
 });
 
 test("one refresh session carries exact bounded historical evidence without another session", async () => {
