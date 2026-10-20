@@ -70,22 +70,26 @@ const vehicleStatus = () => ({ currentState: "SMART_CHARGING", isSuspended: fals
 test('independently configured import account rejects runtime substitution before cache recovery',async()=>{
  const intended='a'.repeat(64),other='b'.repeat(64),h=harness({accountRef:other,compatible:{vehicles:[],lastSuccessfulUpdate:'2026-10-11T10:00:00.000Z',stale:false}});
  await assert.rejects(()=>h.coordinator.get('site-a',{accountRef:intended,tariffCode:'tariff',meterPointRef:'meter-a'}),/KRAKEN_CONFIGURED_IMPORT_ACCOUNT_MISMATCH/);
+ const diagnostic=await h.coordinator.inspect('site-a',{accountRef:intended,tariffCode:'tariff',meterPointRef:'meter-a'});
+ assert.equal(diagnostic.state,null);assert.deepEqual(plain(diagnostic.acquisition),{attempted:false,
+  freshEvidenceObtained:false,staleFallbackUsed:false,code:'KRAKEN_CONFIGURED_IMPORT_ACCOUNT_MISMATCH'});
  assert.equal(h.counts().sessions,0);
 });
 function harness(options = {}) {
   let now = options.now ?? Date.parse("2026-10-11T10:00:00Z");
+  let afterNextNow = null;
   let sessions = 0, deviceCalls = 0, statusCalls = 0, dispatchCalls = 0, records = 0, writes = 0;
   let compatible = options.compatible ?? null;
   const storeResults = [...(options.storeResults ?? [{ status: "persisted", change: "initial", ledger: {} }])];
   const sessionsByDevice = options.sessionsByDevice ?? { "ev-a": [slot()] };
   const coordinator = api.createKrakenRefreshCoordinator({
-    now: () => now,
+    now: () => { const value = now; const after = afterNextNow; afterNextNow = null; after?.(); return value; },
     accountRef: () => options.accountRef ?? "account-a",
     exportAccountRef: () => typeof options.expectedExportAccountRef === 'function'
       ? options.expectedExportAccountRef() : options.expectedExportAccountRef ?? "export-account-a",
     createSession: () => {
       sessions++;
-      if (options.credentialFailure?.()) throw Error("E.ON credentials are not configured");
+      if (options.credentialFailure?.()) throw Error(options.credentialError ?? "E.ON credentials are not configured");
       const exportAccountRef = typeof options.sessionExportAccountRef === 'function'
         ? options.sessionExportAccountRef() : options.sessionExportAccountRef ?? "export-account-a";
       return { accountRef: options.accountRef ?? "account-a",
@@ -115,7 +119,9 @@ function harness(options = {}) {
       compatible = structuredClone(state);
     },
   });
-  return { coordinator, advance: ms => { now += ms; }, counts: () => ({ sessions, deviceCalls, statusCalls, dispatchCalls, records, writes }), compatible: () => compatible };
+  return { coordinator, advance: ms => { now += ms; }, advanceAfterNextNow: ms => {
+    afterNextNow = () => { now += ms; };
+  }, counts: () => ({ sessions, deviceCalls, statusCalls, dispatchCalls, records, writes }), compatible: () => compatible };
 }
 
 test("complete and explicit-empty refreshes create detached reads with exact values", async () => {
@@ -132,6 +138,26 @@ test("complete and explicit-empty refreshes create detached reads with exact val
   assert.equal(captured[0].read.provenance, "authenticated-query");
   assert.equal(captured[0].read.vehicles[0].plannedDispatches[0].start, slot().start);
   assert.deepEqual(h.counts(), { sessions: 1, deviceCalls: 1, statusCalls: 2, dispatchCalls: 2, records: 1, writes: 1 });
+});
+
+test("inspection acquisition result is transient, sanitized and distinguishes fresh from stale fallback", async () => {
+  const fresh = harness();
+  const acquired = await fresh.coordinator.getWithAcquisition("site-a");
+  assert.equal(acquired.state.stale, false);
+  assert.deepEqual(plain(acquired.acquisition), { attempted: true, freshEvidenceObtained: true,
+    staleFallbackUsed: false, code: null });
+  assert.equal(Object.hasOwn(acquired.state, "acquisition"), false);
+
+  const compatible = structuredClone(acquired.state);
+  const failed = harness({ compatible, credentialFailure: () => true,
+    credentialError: "private-token upstream detail" });
+  const recovered = await failed.coordinator.getWithAcquisition("site-a");
+  assert.equal(recovered.state.stale, true);
+  assert.deepEqual(plain(recovered.acquisition), { attempted: true, freshEvidenceObtained: false,
+    staleFallbackUsed: true, code: "KRAKEN_REFRESH_UNAVAILABLE" });
+  assert.equal(Object.hasOwn(recovered.state, "acquisition"), false);
+  assert.doesNotMatch(JSON.stringify(recovered), /private-token/);
+  assert.equal(failed.counts().writes, 0);
 });
 
 test("one refresh session carries exact bounded historical evidence without another session", async () => {
@@ -335,9 +361,31 @@ test("60-second memory cache introduces no retrieval, recording or publication c
   assert.deepEqual(h.counts(), { sessions: 2, deviceCalls: 2, statusCalls: 2, dispatchCalls: 2, records: 2, writes: 2 });
 });
 
+test("memory-cache freshness and acquisition diagnostics share delivery-time classification", async () => {
+  const h = harness();
+  await h.coordinator.getWithAcquisition("site-a");
+  h.advance(59_999);
+
+  const fresh = await h.coordinator.getWithAcquisition("site-a");
+  assert.equal(fresh.state.stale, false);
+  assert.deepEqual(plain(fresh.acquisition), { attempted: false, freshEvidenceObtained: true,
+    staleFallbackUsed: false, code: null });
+
+  h.advanceAfterNextNow(2);
+  const expired = await h.coordinator.getWithAcquisition("site-a");
+  assert.equal(expired.state.stale, true);
+  assert.deepEqual(plain(expired.acquisition), { attempted: false, freshEvidenceObtained: false,
+    staleFallbackUsed: false, code: "KRAKEN_EVIDENCE_EXPIRED_BEFORE_DELIVERY" });
+  assert.deepEqual(h.counts(), { sessions: 1, deviceCalls: 1, statusCalls: 1,
+    dispatchCalls: 1, records: 1, writes: 1 });
+});
+
 test("slow compatibility publication cannot renew authenticated retrieval freshness", async () => {
   const successful = harness({ onWrite: async (_scope, _state, clock) => clock.advance(60_001) });
-  assert.equal((await successful.coordinator.get("site-a")).stale, true);
+  const expired = await successful.coordinator.getWithAcquisition("site-a");
+  assert.equal(expired.state.stale, true);
+  assert.deepEqual(plain(expired.acquisition), { attempted: true, freshEvidenceObtained: false,
+    staleFallbackUsed: false, code: "KRAKEN_EVIDENCE_EXPIRED_BEFORE_DELIVERY" });
   await successful.coordinator.get("site-a");
   assert.equal(successful.counts().deviceCalls, 2);
   assert.equal(successful.counts().records, 2);
@@ -367,10 +415,11 @@ async function joinedPublicationScenario({ publicationFailure }) {
     // boundary, so a failed rename resolves after recording that it occurred.
     if (publicationFailure) failureObserved = true;
   } });
-  const original = h.coordinator.get("site-a");
+  const original = h.coordinator.getWithAcquisition("site-a");
   await enteredPublication;
   h.advance(60_001);
-  const joined = [h.coordinator.get("site-a"), h.coordinator.get("site-a"), h.coordinator.get("site-a")];
+  const joined = [h.coordinator.getWithAcquisition("site-a"), h.coordinator.getWithAcquisition("site-a"),
+    h.coordinator.getWithAcquisition("site-a")];
   releasePublication();
   const results = await Promise.all([original, ...joined]);
   return { h, results, failureObserved };
@@ -378,15 +427,19 @@ async function joinedPublicationScenario({ publicationFailure }) {
 
 test("all callers joining delayed successful publication receive delivery-time stale classification", async () => {
   const { h, results } = await joinedPublicationScenario({ publicationFailure: false });
-  assert.ok(results.every(result => result.stale === true));
-  assert.ok(results.every(result => result.lastSuccessfulUpdate === results[0].lastSuccessfulUpdate));
+  assert.ok(results.every(result => result.state.stale === true));
+  assert.ok(results.every(result => result.state.lastSuccessfulUpdate === results[0].state.lastSuccessfulUpdate));
+  assert.ok(results.every(result => result.acquisition.freshEvidenceObtained === false
+    && result.acquisition.staleFallbackUsed === false
+    && result.acquisition.code === "KRAKEN_EVIDENCE_EXPIRED_BEFORE_DELIVERY"));
   assert.deepEqual(h.counts(), { sessions: 1, deviceCalls: 1, statusCalls: 1, dispatchCalls: 1, records: 1, writes: 1 });
 });
 
 test("all callers joining delayed failed publication receive delivery-time stale classification", async () => {
   const { h, results, failureObserved } = await joinedPublicationScenario({ publicationFailure: true });
   assert.equal(failureObserved, true);
-  assert.ok(results.every(result => result.stale === true));
+  assert.ok(results.every(result => result.state.stale === true));
+  assert.ok(results.every(result => result.acquisition.code === "KRAKEN_EVIDENCE_EXPIRED_BEFORE_DELIVERY"));
   assert.deepEqual(h.counts(), { sessions: 1, deviceCalls: 1, statusCalls: 1, dispatchCalls: 1, records: 1, writes: 1 });
 });
 
@@ -396,13 +449,15 @@ test("callers joining publication inside the deadline remain fresh", async () =>
   const gate = new Promise(resolve => { releasePublication = resolve; });
   const entered = new Promise(resolve => { publicationStarted = resolve; });
   const h = harness({ onWrite: async () => { publicationStarted(); await gate; } });
-  const original = h.coordinator.get("site-a");
+  const original = h.coordinator.getWithAcquisition("site-a");
   await entered;
   h.advance(59_999);
-  const joined = [h.coordinator.get("site-a"), h.coordinator.get("site-a")];
+  const joined = [h.coordinator.getWithAcquisition("site-a"), h.coordinator.getWithAcquisition("site-a")];
   releasePublication();
   const results = await Promise.all([original, ...joined]);
-  assert.ok(results.every(result => result.stale === false));
+  assert.ok(results.every(result => result.state.stale === false));
+  assert.ok(results.every(result => result.acquisition.freshEvidenceObtained === true
+    && result.acquisition.code === null));
   assert.deepEqual(h.counts(), { sessions: 1, deviceCalls: 1, statusCalls: 1, dispatchCalls: 1, records: 1, writes: 1 });
 });
 

@@ -40,7 +40,8 @@ async function authenticatedRead(resource: "products" | `energy_sites/${number}/
                     }
                     throw new Error(`Tesla Fleet API ${resource === "products" ? "products" : "site info"} HTTP error ${response.status}`);
                 }
-                return await response.json();
+                try { return await response.json(); }
+                catch { throw new Error("TESLA_RESPONSE_INVALID"); }
             }
             throw new Error("TESLA_READ_UNAVAILABLE");
         })(), deadline]);
@@ -48,7 +49,8 @@ async function authenticatedRead(resource: "products" | `energy_sites/${number}/
         controller.abort(); activeRequest?.abort();
         // Never propagate token-file, transport, JSON or OAuth response contents.
         const message = error instanceof Error ? error.message : "";
-        if (/^Tesla Fleet API (products|site info) HTTP error \d{3}$/.test(message)) throw new Error(message);
+        if (/^Tesla Fleet API (products|site info) HTTP error \d{3}$/.test(message)
+            || message === "TESLA_REFRESH_UNAVAILABLE" || message === "TESLA_RESPONSE_INVALID") throw new Error(message);
         throw new Error("TESLA_READ_UNAVAILABLE");
     } finally {
         clearTimeout(timer);

@@ -46,6 +46,26 @@ type Dependencies = {
     writeCompatibility: (scopeId: string, state: KrakenState) => Promise<void>;
 };
 type Entry = { state: KrakenState; storedAt: number; requestContextKey: string };
+export type KrakenAcquisitionDiagnostic = {
+    attempted: boolean;
+    freshEvidenceObtained: boolean;
+    staleFallbackUsed: boolean;
+    code: string | null;
+};
+type KrakenAcquisitionResult = { state: KrakenState; acquisition: KrakenAcquisitionDiagnostic };
+class KrakenPreAcquisitionError extends Error {}
+const KRAKEN_ACQUISITION_CODES = new Set([
+    "KRAKEN_API_KEY_INVALID", "KRAKEN_AUTHENTICATION_FAILED", "KRAKEN_TRANSPORT_FAILURE",
+    "KRAKEN_HTTP_FAILURE", "KRAKEN_RESPONSE_INVALID", "KRAKEN_GRAPHQL_REJECTED",
+    "KRAKEN_CONFIGURATION_INVALID",
+    "KRAKEN_CONFIGURED_IMPORT_ACCOUNT_MISMATCH", "KRAKEN_ACCOUNT_CONTEXT_CHANGED",
+    "KRAKEN_EXPORT_ACCOUNT_CONTEXT_CHANGED", "KRAKEN_OBSERVATION_REJECTED",
+]);
+function acquisitionCode(error: unknown): string {
+    const message = error instanceof Error ? error.message : "";
+    if (message.startsWith("KRAKEN_DEVICE_RESPONSE_INVALID:")) return "KRAKEN_DEVICE_RESPONSE_INVALID";
+    return KRAKEN_ACQUISITION_CODES.has(message) ? message : "KRAKEN_REFRESH_UNAVAILABLE";
+}
 
 function invalidDevice(path: string): never { throw Error(`KRAKEN_DEVICE_RESPONSE_INVALID:${path}`); }
 function data(value: unknown, key: string, path: string): unknown {
@@ -170,7 +190,7 @@ function productionDependencies(): Dependencies {
 /** One process, scope-keyed coordination. SQLite remains the cross-process ordering boundary. */
 export function createKrakenRefreshCoordinator(dependencies: Dependencies) {
     const memory = new Map<string, Entry>();
-    const flights = new Map<string, Promise<KrakenState>>();
+    const flights = new Map<string, Promise<KrakenAcquisitionResult>>();
     function classifyAtDelivery(state: KrakenState): KrakenState {
         if (state.stale) return state;
         const retrievedAt = Date.parse(state.lastSuccessfulUpdate);
@@ -178,6 +198,12 @@ export function createKrakenRefreshCoordinator(dependencies: Dependencies) {
             return { ...state, stale: true };
         }
         return state;
+    }
+    function classifyResultAtDelivery(result: KrakenAcquisitionResult): KrakenAcquisitionResult {
+        const state = classifyAtDelivery(result.state);
+        if (!state.stale || result.state.stale || !result.acquisition.freshEvidenceObtained) return { ...result, state };
+        return { state, acquisition: { attempted: result.acquisition.attempted, freshEvidenceObtained: false,
+            staleFallbackUsed: false, code: "KRAKEN_EVIDENCE_EXPIRED_BEFORE_DELIVERY" } };
     }
     const exportContextKey = (identity: { accountRef: string; productCode: string; tariffCode: string } | undefined,
         accountRef: string | null) => JSON.stringify([accountRef, identity?.accountRef ?? null,
@@ -199,7 +225,7 @@ export function createKrakenRefreshCoordinator(dependencies: Dependencies) {
         tariffIdentity?: { accountRef?: string; tariffCode: string; meterPointRef: string },
         exportTariffIdentity?: { accountRef: string; meterPointRef?: string; productCode: string; tariffCode: string },
         expectedExportAccountRef: string | null = null,
-        historicalPeriod?: { start: string; end: string }): Promise<KrakenState> {
+        historicalPeriod?: { start: string; end: string }): Promise<KrakenAcquisitionResult> {
         const startedAt = new Date(dependencies.now()).toISOString();
         try {
             const session = dependencies.createSession();
@@ -265,38 +291,58 @@ export function createKrakenRefreshCoordinator(dependencies: Dependencies) {
             // best-effort compatibility publication eventually settles.
             memory.set(scopeId, { state, storedAt: retrievedAtMs,
                 requestContextKey: JSON.stringify([exportContextKey(exportTariffIdentity, expectedExportAccountRef), historicalPeriod ?? null]) });
-            return state;
+            return { state, acquisition: { attempted: true, freshEvidenceObtained: true,
+                staleFallbackUsed: false, code: null } };
         } catch (error) {
             const cached = memory.get(scopeId)?.state ?? await dependencies.readCompatibility(scopeId);
-            if (cached) return staleRecovery(cached, exportTariffIdentity, expectedExportAccountRef);
+            if (cached) return { state: staleRecovery(cached, exportTariffIdentity, expectedExportAccountRef),
+                acquisition: { attempted: true, freshEvidenceObtained: false,
+                    staleFallbackUsed: true, code: acquisitionCode(error) } };
             throw error;
         }
     }
-    return {
-        async get(siteId: string, tariffIdentity?: { accountRef?: string; tariffCode: string; meterPointRef: string },
+    async function getWithAcquisition(siteId: string,
+        tariffIdentity?: { accountRef?: string; tariffCode: string; meterPointRef: string },
             exportTariffIdentity?: { accountRef: string; meterPointRef?: string; productCode: string; tariffCode: string },
-            historicalPeriod?: { start: string; end: string }): Promise<KrakenState> {
-            const scope = { siteId: requiredText(siteId, "scope.siteId"),
-                accountRef: requiredText(dependencies.accountRef(), "scope.accountRef") };
+            historicalPeriod?: { start: string; end: string }): Promise<KrakenAcquisitionResult> {
+            let scope: ScheduleScope;
+            try { scope = { siteId: requiredText(siteId, "scope.siteId"),
+                accountRef: requiredText(dependencies.accountRef(), "scope.accountRef") }; }
+            catch { throw new KrakenPreAcquisitionError("KRAKEN_CONFIGURATION_INVALID"); }
             if (tariffIdentity?.accountRef !== undefined
                 && (!/^[a-f0-9]{64}$/.test(tariffIdentity.accountRef) || tariffIdentity.accountRef !== scope.accountRef))
-                throw Error("KRAKEN_CONFIGURED_IMPORT_ACCOUNT_MISMATCH");
+                throw new KrakenPreAcquisitionError("KRAKEN_CONFIGURED_IMPORT_ACCOUNT_MISMATCH");
             const scopeId = scheduleScopeId(scope);
             const expectedExportAccountRef = dependencies.exportAccountRef?.() ?? null;
             const currentExportContextKey = exportContextKey(exportTariffIdentity, expectedExportAccountRef);
             const requestContextKey = JSON.stringify([currentExportContextKey, historicalPeriod ?? null]);
             const flightId = JSON.stringify([scopeId, requestContextKey]);
             const running = flights.get(flightId);
-            if (running) return classifyAtDelivery(await running);
+            if (running) return classifyResultAtDelivery(await running);
             const cached = memory.get(scopeId);
             if (cached && !cached.state.stale && dependencies.now() - cached.storedAt < CACHE_MS
                 && cached.requestContextKey === requestContextKey) {
-                return classifyAtDelivery(cached.state);
+                return classifyResultAtDelivery({ state: cached.state, acquisition: { attempted: false,
+                    freshEvidenceObtained: true, staleFallbackUsed: false, code: null } });
             }
             const promise = refresh(scope, scopeId, tariffIdentity, exportTariffIdentity, expectedExportAccountRef, historicalPeriod);
             flights.set(flightId, promise);
-            try { return classifyAtDelivery(await promise); }
+            try { return classifyResultAtDelivery(await promise); }
             finally { if (flights.get(flightId) === promise) flights.delete(flightId); }
+    }
+    return {
+        getWithAcquisition,
+        async inspect(siteId: string, tariffIdentity?: { accountRef?: string; tariffCode: string; meterPointRef: string },
+            exportTariffIdentity?: { accountRef: string; meterPointRef?: string; productCode: string; tariffCode: string },
+            historicalPeriod?: { start: string; end: string }) {
+            try { return await getWithAcquisition(siteId, tariffIdentity, exportTariffIdentity, historicalPeriod); }
+            catch (error) { return { state: null, acquisition: { attempted: !(error instanceof KrakenPreAcquisitionError),
+                freshEvidenceObtained: false, staleFallbackUsed: false, code: acquisitionCode(error) } }; }
+        },
+        async get(siteId: string, tariffIdentity?: { accountRef?: string; tariffCode: string; meterPointRef: string },
+            exportTariffIdentity?: { accountRef: string; meterPointRef?: string; productCode: string; tariffCode: string },
+            historicalPeriod?: { start: string; end: string }): Promise<KrakenState> {
+            return (await getWithAcquisition(siteId, tariffIdentity, exportTariffIdentity, historicalPeriod)).state;
         },
     };
 }
@@ -311,3 +357,11 @@ export const getRecordedKrakenState = (siteId: string,
     exportTariffIdentity?: { accountRef: string; meterPointRef?: string; productCode: string; tariffCode: string },
     historicalPeriod?: { start: string; end: string }) =>
     coordinator.get(siteId, tariffIdentity, exportTariffIdentity, historicalPeriod);
+export async function getRecordedKrakenStateForInspection(siteId: string,
+    tariffIdentity?: { accountRef?: string; tariffCode: string; meterPointRef: string },
+    exportTariffIdentity?: { accountRef: string; meterPointRef?: string; productCode: string; tariffCode: string },
+    historicalPeriod?: { start: string; end: string }): Promise<KrakenAcquisitionResult | {
+        state: null; acquisition: KrakenAcquisitionDiagnostic;
+    }> {
+    return coordinator.inspect(siteId, tariffIdentity, exportTariffIdentity, historicalPeriod);
+}

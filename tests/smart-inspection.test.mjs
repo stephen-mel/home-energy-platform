@@ -275,8 +275,60 @@ test('long authenticated coverage is capped at the supported 48-hour comparison 
 });
 test('server entry acquires each production adapter once and sanitizes failures',async()=>{
  let k=0,t=0;const f=fixture();
- const api=load('src/lib/site/inspect-smart-charge.ts',{'server-only':{},'./kraken-refresh':{getRecordedKrakenState:async()=>{k++;return f.kraken;}},'./tesla-observation':{getSiteTeslaObservation:async()=>{t++;throw Error('secret');}}});
- const r=await api.inspectSmartCharge(f.site);assert.equal(k,1);assert.equal(t,1);assert.equal(r.report.payload,null);assert.doesNotMatch(r.text,/secret/);
+ const api=load('src/lib/site/inspect-smart-charge.ts',{'server-only':{},'./kraken-refresh':{
+  getRecordedKrakenStateForInspection:async()=>{k++;return {state:{...f.kraken,stale:true},acquisition:{attempted:true,
+   freshEvidenceObtained:false,staleFallbackUsed:true,code:'KRAKEN_AUTHENTICATION_FAILED'}};}},
+ './tesla-observation':{teslaObservationConfigurationDiagnostic:()=>null,
+  getSiteTeslaObservation:async()=>{t++;throw Error('TESLA_REFRESH_UNAVAILABLE');}}});
+ const r=await api.inspectSmartCharge(f.site);assert.equal(k,1);assert.equal(t,1);assert.equal(r.report.payload,null);
+ assert.deepEqual(structuredClone(r.report.acquisitionDiagnostics),{
+  kraken:{attempted:true,freshEvidenceObtained:false,staleFallbackUsed:true,code:'KRAKEN_AUTHENTICATION_FAILED'},
+  tesla:{attempted:true,freshEvidenceObtained:false,staleFallbackUsed:false,code:'TESLA_REFRESH_UNAVAILABLE'},
+ });
+ assert.doesNotMatch(r.text,/secret|token|JWT/i);
+});
+test('server entry reports successful fresh acquisition without a false diagnostic',async()=>{
+ let k=0,t=0;const f=fixture();
+ const api=load('src/lib/site/inspect-smart-charge.ts',{'server-only':{},'./kraken-refresh':{
+  getRecordedKrakenStateForInspection:async()=>{k++;return {state:f.kraken,acquisition:{attempted:true,
+   freshEvidenceObtained:true,staleFallbackUsed:false,code:null}};}},
+ './tesla-observation':{teslaObservationConfigurationDiagnostic:()=>null,
+  getSiteTeslaObservation:async()=>{t++;return f.observation;}}});
+ const r=await api.inspectSmartCharge(f.site);assert.equal(k,1);assert.equal(t,1);assert.ok(r.report.teslaBaseline);
+ assert.deepEqual(structuredClone(r.report.acquisitionDiagnostics),{
+  kraken:{attempted:true,freshEvidenceObtained:true,staleFallbackUsed:false,code:null},
+  tesla:{attempted:true,freshEvidenceObtained:true,staleFallbackUsed:false,code:null},
+ });
+ for(const key of ['writeReady','rollbackProven','restorationProven','resolvesHistoricalJournal','grantsRepeatAuthority'])
+  assert.equal(r.report[key],false);
+});
+test('invalid Tesla capture reports response invalid instead of fresh evidence',async()=>{
+ let calls=0;const f=fixture();
+ const api=load('src/lib/site/inspect-smart-charge.ts',{'server-only':{},'./kraken-refresh':{
+  getRecordedKrakenStateForInspection:async()=>({state:f.kraken,acquisition:{attempted:true,
+   freshEvidenceObtained:true,staleFallbackUsed:false,code:null}})},
+ './tesla-observation':{teslaObservationConfigurationDiagnostic:()=>null,
+  getSiteTeslaObservation:async()=>{calls++;return {};}}});
+ const r=await api.inspectSmartCharge(f.site);assert.equal(calls,1);assert.equal(r.report.teslaBaseline,null);
+ assert.deepEqual(structuredClone(r.report.acquisitionDiagnostics.tesla),{attempted:true,
+  freshEvidenceObtained:false,staleFallbackUsed:false,code:'TESLA_RESPONSE_INVALID'});
+ assert.equal(r.report.payload,null);assert.equal(r.report.smartOpportunity.status,'incomplete-evidence');
+ for(const key of ['writeReady','rollbackProven','restorationProven','resolvesHistoricalJournal','grantsRepeatAuthority'])
+  assert.equal(r.report[key],false);
+});
+test('Tesla pre-acquisition configuration failures report not attempted and make no client call',async()=>{
+ for(const [code,change] of [['TESLA_DISABLED',site=>{site.integrations.tesla.enabled=false;}],
+  ['TESLA_SITE_NOT_CONFIGURED',site=>{delete site.integrations.tesla.energySiteId;}]]){
+  let calls=0;const f=fixture();change(f.site);
+  const api=load('src/lib/site/inspect-smart-charge.ts',{'server-only':{},'./kraken-refresh':{
+   getRecordedKrakenStateForInspection:async()=>({state:f.kraken,acquisition:{attempted:true,
+    freshEvidenceObtained:true,staleFallbackUsed:false,code:null}})},
+  './tesla-observation':{teslaObservationConfigurationDiagnostic:()=>code,
+   getSiteTeslaObservation:async()=>{calls++;throw Error('must-not-run');}}});
+  const r=await api.inspectSmartCharge(f.site);assert.equal(calls,0);
+  assert.deepEqual(structuredClone(r.report.acquisitionDiagnostics.tesla),{attempted:false,
+   freshEvidenceObtained:false,staleFallbackUsed:false,code});
+ }
 });
 test('incomplete lists and duplicate vehicles fail before reconciliation, not as empty schedules',()=>{
  for(const change of [f=>f.kraken.vehicles[0].plannedDispatches=null,f=>delete f.kraken.vehicles[0].plannedDispatches,f=>f.kraken.vehicles.push(structuredClone(f.kraken.vehicles[0]))]){

@@ -30,6 +30,18 @@ Fingerprints are SHA-256 digests of existing canonical identities; account and M
 references are not printed. Exact tariff payloads retain observed tariff metadata;
 keep these local rather than publishing them.
 
+`acquisitionDiagnostics` is separate from tariff evidence and authority. It reports
+whether each read was attempted, whether fresh evidence was obtained, whether Kraken
+used its existing stale fallback, and an allowlisted fixed error code. These transient
+diagnostics are not written into Kraken snapshots, SQLite observations, ownership or
+journals. Provider response text, transport exceptions and credentials are never
+included. A diagnostic explains evidence availability; it cannot make evidence valid.
+Configuration rejection before a client call reports `attempted: false`. A successful
+Kraken retrieval that crosses the freshness deadline before delivery reports
+`KRAKEN_EVIDENCE_EXPIRED_BEFORE_DELIVERY`; it is distinct from failure-driven stale
+fallback. Tesla evidence is validated by the same fixed-shape boundary used by the
+inspection before acquisition can report success.
+
 Reconciliation alone constructs the managed target, proposal and restoration
 candidate. It also reports evidence-supported per-kWh savings as a
 `planned-conditional-estimate`, never billing-confirmed cost. No missing price falls

@@ -106,10 +106,20 @@ function validatedTeslaObservation(value: unknown): ObservedTariff | null {
         diagnostics: [...value.diagnostics] as string[], rollbackProven: false };
 }
 
+/** The single fixed-shape boundary shared by acquisition reporting and inspection. */
+export function validateTeslaInspectionEvidence(value: unknown): ObservedTariff | null {
+    try { return validatedTeslaObservation(snapshotEvidence(value)); }
+    catch { return null; }
+}
+
 /** Pure inspection of production-acquired snapshots, never an authentication or
  * approval boundary. No ownership is inferred, loaded or created here. */
 export function inspectSmartTariff(input: {
     site: Site; kraken: KrakenState | null; observation: ObservedTariff | null; now: string;
+    acquisitionDiagnostics?: {
+        kraken: { attempted: boolean; freshEvidenceObtained: boolean; staleFallbackUsed: boolean; code: string | null };
+        tesla: { attempted: boolean; freshEvidenceObtained: boolean; staleFallbackUsed: boolean; code: string | null };
+    };
 }) {
     const { site, now } = input;
     let detachedKraken: KrakenState | null = null, detachedObservation: ObservedTariff | null = null;
@@ -123,11 +133,8 @@ export function inspectSmartTariff(input: {
         } catch { krakenInvalid = true; }
     }
     if (input.observation) {
-        try {
-            const snapshot = snapshotEvidence(input.observation);
-            detachedObservation = validatedTeslaObservation(snapshot);
-            teslaInvalid = detachedObservation === null;
-        } catch { teslaInvalid = true; }
+        detachedObservation = validateTeslaInspectionEvidence(input.observation);
+        teslaInvalid = detachedObservation === null;
     }
     const observation = detachedObservation;
     // Reuse the observation validator for completeness/shape, not as proof of
@@ -229,6 +236,12 @@ export function inspectSmartTariff(input: {
             status: "planned-conditional-estimate" as const } : null;
     const report = {
         mode: "inspection-only", status: result.status, generatedAt: now, domain,
+        acquisitionDiagnostics: input.acquisitionDiagnostics ?? {
+            kraken: { attempted: false, freshEvidenceObtained: !!kraken && !kraken.stale,
+                staleFallbackUsed: !!kraken?.stale, code: null },
+            tesla: { attempted: false, freshEvidenceObtained: !!observation,
+                staleFallbackUsed: false, code: null },
+        },
         smartOpportunity: { status: actionStatus, activeOrUpcomingCount: relevantSmart.length },
         teslaBaseline: observation ? { source: observation.source, representation: observation.tariff,
             fingerprint: digest(observation.tariff) } : null,

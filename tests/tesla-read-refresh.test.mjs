@@ -63,11 +63,18 @@ test('missing expiry metadata uses bounded auth recovery instead of inventing ex
   const h=harness({stored:{access_token:original.access_token,refresh_token:original.refresh_token}});
   await h.client.getTeslaProducts();assert.equal(h.calls.length,1);
 });
+test('site-info JSON parsing failure retains a fixed content-free category',async()=>{
+  const h=harness({respond:async()=>({ok:true,json:async()=>{throw Error('private response marker');}})});
+  await assert.rejects(h.client.getTeslaSiteInfo(123),error=>{
+    assert.equal(error.message,'TESLA_RESPONSE_INVALID');
+    assert.doesNotMatch(error.message,/private response marker/);return true;
+  });
+});
 test('missing, empty and invalid replacement refresh tokens fail without altering credentials',async()=>{
   for(const refresh_token of [undefined,null,'','   ',123]){
     const h=harness({stored:{...original,expires_in:1,created_at:NOW-1000},respond:async()=>({ok:true,json:async()=>({...replacement,refresh_token})})});
     const before=h.stored();
-    await assert.rejects(h.client.getTeslaSiteInfo(123),/^Error: TESLA_READ_UNAVAILABLE$/);
+    await assert.rejects(h.client.getTeslaSiteInfo(123),/^Error: TESLA_REFRESH_UNAVAILABLE$/);
     assert.deepEqual(h.stored(),before);assert.equal(h.writes.length,0);assert.equal(h.calls.length,1);
     assert.equal(h.files.size,1);
   }
@@ -115,14 +122,14 @@ test('refresh failures and malformed responses remain fixed errors, preserve fil
     {ok:true,json:async()=>({access_token:'private',expires_in:null})},
     {ok:true,json:async()=>({...replacement,refresh_token:null})}]){
     const h=harness({stored:{...original,expires_in:1,created_at:NOW-1000},respond:async()=>response});
-    const before=h.stored();await assert.rejects(h.client.getTeslaSiteInfo(123),/^Error: TESLA_READ_UNAVAILABLE$/);
+    const before=h.stored();await assert.rejects(h.client.getTeslaSiteInfo(123),/^Error: TESLA_REFRESH_UNAVAILABLE$/);
     assert.deepEqual(h.stored(),before);assert.equal(h.calls.length,1);assert.equal(h.calls[0].options.signal.aborted,true);
     assert.equal(h.timers.size,0);
   }
 });
 test('atomic persistence failure never uses unpersisted access token or replaces the old file',async()=>{
   const h=harness({stored:{...original,expires_in:1,created_at:NOW-1000},writeFails:true});
-  const before=h.stored();await assert.rejects(h.client.getTeslaSiteInfo(123),/TESLA_READ_UNAVAILABLE/);
+  const before=h.stored();await assert.rejects(h.client.getTeslaSiteInfo(123),/TESLA_REFRESH_UNAVAILABLE/);
   assert.deepEqual(h.stored(),before);assert.equal(h.calls.length,1);assert.equal(h.files.size,1);
 });
 for(const stall of ['headers','body'])test(`refresh ${stall} stall stays inside the total 5-second read budget`,async()=>{
@@ -170,7 +177,7 @@ test('delayed refresh rename holds serialization after caller timeout; queued OA
 });
 test('failed atomic rename preserves last credentials and releases the commit queue only after cleanup',async()=>{
   const h=harness({stored:{...original,expires_in:1,created_at:NOW-1000},renameFails:true});
-  const before=h.stored();await assert.rejects(h.client.getTeslaSiteInfo(123),/TESLA_READ_UNAVAILABLE/);
+  const before=h.stored();await assert.rejects(h.client.getTeslaSiteInfo(123),/TESLA_REFRESH_UNAVAILABLE/);
   assert.deepEqual(h.stored(),before);assert.equal(h.files.size,1);
   assert.equal((await h.reconnect(generationB)).status,500);assert.deepEqual(h.stored(),before);assert.equal(h.files.size,1);
 });
