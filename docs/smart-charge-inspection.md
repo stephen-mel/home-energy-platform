@@ -15,12 +15,15 @@ ownership persistence, approval or executor calls.
 The pure `inspectSmartTariff` projection reuses the schedule observation validator,
 SMART dispatch adapter, verified tariff selection and real reconciliation. Its
 inputs are server-acquired snapshots, not authentication capabilities. Caller-made
-fixtures establish no trusted authority. It selects all SMART slots intersecting
-the next 24 elapsed hours, retaining individual boundaries and vehicle names.
-Offsets/DST interpretation stays in the existing domain code. BOOST is excluded.
+fixtures establish no trusted authority. It selects active or upcoming SMART slots
+within the continuously verified tariff domain, capped by the reconciler's 48-hour
+limit, retaining individual boundaries and vehicle attribution. Offsets/DST
+interpretation stays in the existing domain code. BOOST is excluded.
 
-The report includes the verified scheduled import price, retrieval age, schedule
-identity, observation content identity and existing recording status. SMART identity
+The report includes the authenticated Tesla site/timezone and complete observed
+import/export representation, verified Kraken tariff coverage and prices, per-vehicle
+dispatches, retrieval age, schedule identity, observation content identity and
+existing recording status. SMART identity
 uses the existing `smartEvidenceKey`; the broader content identity uses observation
 semantics (including BOOST and structural revisions). No new revision is recorded.
 Fingerprints are SHA-256 digests of existing canonical identities; account and MPAN
@@ -28,12 +31,22 @@ references are not printed. Exact tariff payloads retain observed tariff metadat
 keep these local rather than publishing them.
 
 Reconciliation alone constructs the managed target, proposal and restoration
-candidate. No missing price falls back to an example tariff. Missing evidence or
+candidate. It also reports evidence-supported per-kWh savings as a
+`planned-conditional-estimate`, never billing-confirmed cost. No missing price falls
+back to an example tariff. Missing evidence or
 existing blockers are reported, never bypassed. A payload may be inspectable while
 BUY_BELOW_SELL, bounded-forecast and restoration blockers remain. A restoration
 candidate is not proven executable or accepted by Tesla. Unchanged economics may
 legitimately produce no payload. No ownership is loaded, so this slice does not
 claim to prepare safe removal of previously owned intervals.
+
+Fresh-baseline policy is evaluated only when reconciliation produces a real tariff
+change. The household path supplies no approval, attempt identity or synthetic
+restoration-ledger evidence, so it reports those blockers and cannot become eligible.
+When there is no SMART window, or all windows cause no managed economic change, the
+assessment is `not-applicable`: no proposal, journal claim or mutation identity is
+created. Missing evidence and dispatches beyond verified coverage remain separate
+`not-assessable` outcomes rather than being described as an empty schedule.
 
 Each invocation produces a new assessment; there is no saved approval. Changed
 SMART evidence or rates change the proposal fingerprint. Retrieval timestamps do

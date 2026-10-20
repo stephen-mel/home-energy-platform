@@ -11,6 +11,7 @@ import { economicInstant } from "../tariff/resolve-economic-model";
 import { inspectObservedProposalTariff } from "./experiment-tariff";
 import { smartEvidenceKey } from "./smart-evidence";
 import { representationKey } from "./rollback-evidence";
+import { assessFreshBaselineEligibility } from "./fresh-baseline-eligibility";
 
 const digest = (value: unknown) => createHash("sha256").update(representationKey(value)).digest("hex");
 const object = (value: unknown): value is Record<string, unknown> => value !== null
@@ -143,7 +144,11 @@ export function inspectSmartTariff(input: {
     const bound = !!identity && !!kraken?.importTariff?.accountRef
         && (!identity.accountRef || identity.accountRef === kraken.importTariff.accountRef);
     const verified = bound && !!version && !kraken?.importTariffDiagnostic;
-    const coverageStart = Date.parse(version?.effectiveFrom ?? ""), coverageEnd = Date.parse(version?.effectiveTo ?? "");
+    // A structurally validated, account-bound tariff may define the requested
+    // domain even when freshness projection rejects it. Reconciliation remains
+    // authoritative for freshness; rejected prices are never exposed as verified.
+    const domainVersion = bound && !kraken?.importTariffDiagnostic ? kraken?.importTariff?.version : null;
+    const coverageStart = Date.parse(domainVersion?.effectiveFrom ?? ""), coverageEnd = Date.parse(domainVersion?.effectiveTo ?? "");
     const supportedEnd = comparisonStart + 48 * 3_600_000;
     const comparisonEnd = Math.min(coverageEnd, supportedEnd);
     const domain = { start: Number.isFinite(comparisonStart) ? new Date(comparisonStart).toISOString() : now,
@@ -158,16 +163,26 @@ export function inspectSmartTariff(input: {
             || Math.max(start, comparisonStart) < coverageStart || end > coverageEnd;
     });
     const dispatchOutsideSupportedHorizon = relevantSmart.some(dispatch => Date.parse(dispatch.end) > comparisonEnd);
-    const result = krakenInvalid ? unavailableReconciliation("INSPECTION_KRAKEN_TARIFF_EVIDENCE_INVALID", domain)
+    const reconciliation = krakenInvalid ? unavailableReconciliation("INSPECTION_KRAKEN_TARIFF_EVIDENCE_INVALID", domain)
         : teslaInvalid ? unavailableReconciliation("INSPECTION_TESLA_EVIDENCE_INVALID", domain)
         : !kraken ? unavailableReconciliation(input.kraken ? "INCOMPLETE_KRAKEN_OBSERVATION" : "KRAKEN_UNAVAILABLE", domain)
-        : !verified ? unavailableReconciliation("VERIFIED_IMPORT_TARIFF_REQUIRED", domain)
+        : !bound || !domainVersion || !!kraken.importTariffDiagnostic
+            ? unavailableReconciliation("VERIFIED_IMPORT_TARIFF_REQUIRED", domain)
         : tariffDomainUnavailable ? unavailableReconciliation("VERIFIED_IMPORT_TARIFF_DOMAIN_UNAVAILABLE", domain)
         : dispatchOutsideCoverage ? unavailableReconciliation("SMART_DISPATCH_OUTSIDE_VERIFIED_TARIFF_COVERAGE", domain)
         : dispatchOutsideSupportedHorizon ? unavailableReconciliation("SMART_DISPATCH_OUTSIDE_SUPPORTED_COMPARISON_HORIZON", domain)
         : !observation ? unavailableReconciliation("TESLA_OBSERVATION_UNAVAILABLE", domain)
         : reconcileTeslaTariff({ site, kraken, observation, now, comparisonDomain: domain,
             energySiteId: site.integrations.tesla.energySiteId ?? "" });
+    // Reconciliation owns schedule freshness diagnostics. Authenticated tariff
+    // projection is an additional prerequisite: configured site prices must
+    // never make an otherwise usable result proposal-capable.
+    const reachedReconciliation = !krakenInvalid && !teslaInvalid && !!kraken && bound && !!domainVersion
+        && !kraken.importTariffDiagnostic && !tariffDomainUnavailable && !dispatchOutsideCoverage
+        && !dispatchOutsideSupportedHorizon && !!observation;
+    const result = reachedReconciliation && !verified && (!("diagnostic" in reconciliation)
+        || reconciliation.diagnostic !== "STALE_KRAKEN_EVIDENCE")
+        ? unavailableReconciliation("VERIFIED_IMPORT_TARIFF_REQUIRED", domain) : reconciliation;
     const proposal = result.proposal;
     const representation = proposal?.structurallyValid ? proposal.bound.representation : null;
     const payload = representation ? { tou_settings: { tariff_content_v2: representation } } : null;
@@ -183,8 +198,46 @@ export function inspectSmartTariff(input: {
     const restoration = "restoration" in result ? result.restoration.documentedEnvelopeCandidate : null;
     const exportPreserved = !!representation && !!observation?.tariff
         && representationKey(representation.sell_tariff) === representationKey(observation.tariff.sell_tariff);
+    const actionStatus = !kraken || !observation ? "incomplete-evidence"
+        : dispatchOutsideCoverage ? "dispatch-outside-verified-coverage"
+            : dispatchOutsideSupportedHorizon ? "dispatch-outside-supported-horizon"
+                : result.status === "indeterminate" || result.status === "blocked" ? "incomplete-evidence"
+                    : relevantSmart.length === 0 ? "no-smart-windows"
+                    : result.status === "in-sync" ? "no-managed-economic-change"
+                        : payload ? "tariff-change-proposed" : "proposal-unavailable";
+    const authority = { writeReady: false as const, rollbackProven: false as const,
+        restorationProven: false as const, resolvesHistoricalJournal: false as const,
+        grantsRepeatAuthority: false as const };
+    const eligibility = payload && proposal && observation ? assessFreshBaselineEligibility({
+        energySiteId: observation.source.energySiteId, timeZone: observation.source.timeZone!, assessedAt: now,
+        maxObservationAgeMs: 60_000,
+        current: { source: { kind: "tesla-site-info", energySiteId: observation.source.energySiteId,
+            observedAt: observation.source.observedAt, timeZone: observation.source.timeZone },
+        tariff: observation, operatingMode: null, diagnostics: ["OPERATING_MODE_UNAVAILABLE"] },
+        ownership: { status: "unavailable", code: "OWNERSHIP_NOT_ASSESSED" }, proposal, approval: null,
+        rollback: { representation: observation.tariff, maxAgeMs: 60_000 }, trustedRollbackObservations: [],
+        historical: null, nextAttempt: null,
+    }) : {
+        status: actionStatus === "no-smart-windows" || actionStatus === "no-managed-economic-change"
+            ? "not-applicable" as const : "not-assessable" as const,
+        reason: actionStatus, blockers: [] as string[], nextAttempt: null,
+        ...authority,
+    };
+    const normalImport = verified && version ? version.normalImport : null;
+    const saving = payload && normalImport && rate && normalImport.currency === rate.currency && normalImport.unit === rate.unit
+        ? { amount: normalImport.amount - rate.amount, currency: rate.currency, unit: rate.unit,
+            status: "planned-conditional-estimate" as const } : null;
     const report = {
         mode: "inspection-only", status: result.status, generatedAt: now, domain,
+        smartOpportunity: { status: actionStatus, activeOrUpcomingCount: relevantSmart.length },
+        teslaBaseline: observation ? { source: observation.source, representation: observation.tariff,
+            fingerprint: digest(observation.tariff) } : null,
+        krakenTariff: verified && version ? { observedAt: kraken!.importTariff!.observedAt,
+            effectiveFrom: version.effectiveFrom, effectiveTo: version.effectiveTo,
+            normalImport: version.normalImport, scheduledChargingImport: version.scheduledChargingImport,
+            pricesIncludeVat: version.pricesIncludeVat } : null,
+        vehicles: kraken ? kraken.vehicles.map(vehicle => ({ vehicleId: vehicle.id, name: vehicle.name,
+            dispatches: vehicle.plannedDispatches.map(dispatch => ({ ...dispatch })) })) : [],
         slots, importRate: rate, krakenObservedAt: kraken?.lastSuccessfulUpdate ?? null,
         evidenceAgeSeconds: kraken ? (time - Date.parse(kraken.lastSuccessfulUpdate)) / 1000 : null,
         scheduleEvidenceIdentity: kraken ? digest(smartEvidenceKey(kraken)) : null,
@@ -200,13 +253,15 @@ export function inspectSmartTariff(input: {
         expiresAt: "freshness" in result ? result.freshness.expiresAt : null,
         blockers: [...new Set([...result.blockers, "EXECUTION_DISABLED", "OWNERSHIP_NOT_ASSESSED",
             "HISTORICAL_JOURNAL_UNRESOLVED", "TRUSTED_EON_EXPORT_METER_POINT_EVIDENCE_UNAVAILABLE"])],
+        financialImplications: { conditionalImportSavingPerKwh: saving,
+            billingStatus: saving ? "estimated-not-billing-confirmed" as const : "unavailable" as const },
+        freshBaselineEligibility: eligibility,
         limitations: ["Supplier SMART slots are conditional opportunities, not confirmed charging or billed discounts.",
             "Configured account binding is not independent CRM identity activation.",
             "Export MPAN evidence is unavailable; commercial export assumptions establish no authority.",
             "Restoration is a candidate only; inverse write mapping and acceptance are unproven.",
             "No journal was read: this report cannot resolve September or establish live-write eligibility."],
-        writeReady: false, rollbackProven: false, restorationProven: false,
-        resolvesHistoricalJournal: false, grantsRepeatAuthority: false,
+        ...authority,
     };
     return structuredClone(report);
 }

@@ -92,11 +92,11 @@ function rollbackObservations(value: unknown): value is TrustedRollbackObservati
  */
 export function assessFreshBaselineEligibility(input: {
     energySiteId: string; timeZone: string; assessedAt: string; maxObservationAgeMs: number;
-    current: TeslaCurrentState | null; ownership: OwnershipRead;
-    proposal: Proposal; approval: BaselineApproval | null;
-    rollback: { observationId?: string; representation: unknown; maxAgeMs: number };
+    current: TeslaCurrentState | null; ownership: OwnershipRead | null;
+    proposal: Proposal | null; approval: BaselineApproval | null;
+    rollback: { observationId?: string; representation: unknown; maxAgeMs: number } | null;
     trustedRollbackObservations: readonly TrustedRollbackObservation[];
-    historical: HistoricalReference; nextAttempt: NewAttempt;
+    historical: HistoricalReference | null; nextAttempt: NewAttempt | null;
 }) {
     let value: typeof input | null = null;
     try { value = structuredClone(input); } catch { /* invalid below */ }

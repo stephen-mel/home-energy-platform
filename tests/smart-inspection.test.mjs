@@ -49,6 +49,67 @@ test('real reconciliation creates exact inspection candidate with no executor or
  for(const b of ['BUY_BELOW_SELL','ROLLBACK_UNPROVEN','BOUNDED_FORECAST','HISTORICAL_JOURNAL_UNRESOLVED','TRUSTED_EON_EXPORT_METER_POINT_EVIDENCE_UNAVAILABLE'])assert.ok(r.blockers.includes(b));
  assert.doesNotMatch(formatSmartInspection(r),/synthetic-account|synthetic-meter/);
  assert.deepEqual(structuredClone(r.payload.tou_settings.tariff_content_v2.sell_tariff),structuredClone(input.observation.tariff.sell_tariff));
+ assert.equal(r.smartOpportunity.status,'tariff-change-proposed');
+ assert.equal(r.freshBaselineEligibility.status,'blocked');
+ for(const code of ['EXACT_BASELINE_APPROVAL_REQUIRED','ROLLBACK_UNPROVEN','OWNERSHIP_UNRESOLVED'])
+  assert.ok(r.freshBaselineEligibility.blockers.includes(code),code);
+ assert.equal(r.financialImplications.conditionalImportSavingPerKwh.amount,0.21128);
+ assert.equal(r.financialImplications.billingStatus,'estimated-not-billing-confirmed');
+ for(const key of ['writeReady','rollbackProven','restorationProven','resolvesHistoricalJournal','grantsRepeatAuthority'])
+  assert.equal(r.freshBaselineEligibility[key],false);
+});
+test('no SMART windows is a successful not-applicable inspection with no proposal or attempt identity',()=>{
+ const f=fixture();f.kraken.vehicles.push({id:'second-vehicle',name:'Second vehicle',plannedDispatches:[]});
+ for(const vehicle of f.kraken.vehicles)vehicle.plannedDispatches=[];
+ const r=inspectSmartTariff(f);
+ assert.equal(r.smartOpportunity.status,'no-smart-windows');assert.equal(r.smartOpportunity.activeOrUpcomingCount,0);
+ assert.equal(r.payload,null);assert.equal(r.proposalFingerprint,null);assert.equal(r.status,'in-sync');
+ assert.equal(r.freshBaselineEligibility.status,'not-applicable');assert.equal(r.freshBaselineEligibility.reason,'no-smart-windows');
+ assert.equal(r.freshBaselineEligibility.nextAttempt,null);assert.equal(r.financialImplications.conditionalImportSavingPerKwh,null);
+ assert.equal(r.teslaBaseline.source.energySiteId,'123');assert.equal(r.teslaBaseline.source.timeZone,'Europe/London');
+ assert.equal(r.krakenTariff.scheduledChargingImport.amount,0.0285);assert.equal(r.vehicles.length,2);
+ for(const key of ['writeReady','rollbackProven','restorationProven','resolvesHistoricalJournal','grantsRepeatAuthority']){
+  assert.equal(r[key],false);assert.equal(r.freshBaselineEligibility[key],false);
+ }
+});
+test('empty schedules require accepted fresh account-bound Kraken evidence',()=>{
+ const empty=()=>{const f=fixture();for(const vehicle of f.kraken.vehicles)vehicle.plannedDispatches=[];return f;};
+ const cases=[
+  ['stale cached',f=>{f.kraken.stale=true;},'STALE_KRAKEN_EVIDENCE'],
+  ['expired retrieval',f=>{f.kraken.lastSuccessfulUpdate='2026-10-11T11:58:00Z';},'STALE_KRAKEN_EVIDENCE'],
+  ['wrong account',f=>{f.kraken.importTariff.accountRef='wrong-account';},'VERIFIED_IMPORT_TARIFF_REQUIRED'],
+  ['missing snapshot',f=>{f.kraken=null;},'KRAKEN_UNAVAILABLE'],
+ ];
+ for(const [name,change,blocker] of cases){
+  const f=empty();change(f);const r=inspectSmartTariff(f),formatted=formatSmartInspection(r);
+  assert.equal(r.smartOpportunity.status,'incomplete-evidence',name);
+  assert.equal(r.freshBaselineEligibility.status,'not-assessable',name);
+  assert.equal(r.payload,null,name);assert.equal(r.writeReady,false,name);
+  assert.ok(r.blockers.includes(blocker),`${name}: ${JSON.stringify(r.blockers)}`);
+  assert.match(formatted,/"status": "incomplete-evidence"/,name);
+  assert.match(formatted,new RegExp(blocker),name);
+  assert.doesNotMatch(formatted,/"status": "no-smart-windows"/,name);
+  for(const key of ['writeReady','rollbackProven','restorationProven','resolvesHistoricalJournal','grantsRepeatAuthority']){
+   assert.equal(r[key],false,name);assert.equal(r.freshBaselineEligibility[key],false,name);
+  }
+ }
+});
+test('stale authenticated import pricing cannot fall back to configured prices for an actionable schedule',()=>{
+ const f=fixture();
+ f.kraken.importTariff.observedAt='2026-10-11T11:58:00.000Z';
+ assert.ok(f.site.tariff?.versions?.length,'fixture must retain otherwise usable configured prices');
+ const r=inspectSmartTariff(f),formatted=formatSmartInspection(r);
+ assert.equal(r.payload,null);assert.equal(r.proposalFingerprint,null);
+ assert.equal(r.payloadUnavailableReason,'VERIFIED_IMPORT_TARIFF_REQUIRED');
+ assert.equal(r.smartOpportunity.status,'incomplete-evidence');
+ assert.equal(r.freshBaselineEligibility.status,'not-assessable');
+ assert.equal(r.krakenTariff,null);assert.equal(r.importRate,null);
+ assert.ok(r.blockers.includes('VERIFIED_IMPORT_TARIFF_REQUIRED'));
+ assert.match(formatted,/"status": "incomplete-evidence"/);
+ assert.match(formatted,/VERIFIED_IMPORT_TARIFF_REQUIRED/);
+ for(const key of ['writeReady','rollbackProven','restorationProven','resolvesHistoricalJournal','grantsRepeatAuthority']){
+  assert.equal(r[key],false);assert.equal(r.freshBaselineEligibility[key],false);
+ }
 });
 test('two independently scheduled vehicles produce one bounded daytime SMART change with exact provenance',()=>{
  const f=fixture();
@@ -61,6 +122,9 @@ test('two independently scheduled vehicles produce one bounded daytime SMART cha
  ];
  const before=JSON.stringify(f),r=inspectSmartTariff(f);
  assert.equal(r.status,'update-required');assert.ok(r.payload);assert.notEqual(r.payloadUnavailableReason,'NO_MANAGED_ECONOMIC_CHANGE');
+ assert.equal(r.smartOpportunity.status,'tariff-change-proposed');assert.equal(r.vehicles.length,2);
+ assert.deepEqual(r.vehicles.map(v=>[v.vehicleId,v.dispatches[0].start]),[
+  ['vehicle-a','2026-10-19T14:00:00Z'],['vehicle-b','2026-10-19T14:30:00Z']]);
  assert.deepEqual(structuredClone(r.slots),[
   {start:'2026-10-19T14:00:00.000Z',end:'2026-10-19T15:00:00.000Z',vehicle:'Vehicle A',eligibility:'planned-conditional',price:{amount:0.0285,currency:'GBP',unit:'kWh'}},
   {start:'2026-10-19T14:30:00.000Z',end:'2026-10-19T15:30:00.000Z',vehicle:'Vehicle B',eligibility:'planned-conditional',price:{amount:0.0285,currency:'GBP',unit:'kWh'}},
@@ -185,6 +249,8 @@ test('SMART dispatch coverage accepts the exact tariff boundary and rejects ever
   {start:'2026-10-19T23:00:00Z',end:'2026-10-19T23:30:00Z',type:'SMART',energyAddedKwh:null},
  ]){const r=inspectSmartTariff(prepare(dispatch));assert.equal(r.payload,null);
   assert.equal(r.payloadUnavailableReason,'SMART_DISPATCH_OUTSIDE_VERIFIED_TARIFF_COVERAGE');
+  assert.equal(r.smartOpportunity.status,'dispatch-outside-verified-coverage');
+  assert.equal(r.freshBaselineEligibility.status,'not-assessable');
   assert.ok(r.blockers.includes('SMART_DISPATCH_OUTSIDE_VERIFIED_TARIFF_COVERAGE'));
  }
 });
@@ -215,6 +281,7 @@ test('server entry acquires each production adapter once and sanitizes failures'
 test('incomplete lists and duplicate vehicles fail before reconciliation, not as empty schedules',()=>{
  for(const change of [f=>f.kraken.vehicles[0].plannedDispatches=null,f=>delete f.kraken.vehicles[0].plannedDispatches,f=>f.kraken.vehicles.push(structuredClone(f.kraken.vehicles[0]))]){
  const f=fixture();change(f);const r=inspectSmartTariff(f);assert.equal(r.payload,null);assert.equal(r.payloadUnavailableReason,'INCOMPLETE_KRAKEN_OBSERVATION');
+ assert.equal(r.smartOpportunity.status,'incomplete-evidence');assert.equal(r.freshBaselineEligibility.status,'not-assessable');
  }
 });
 test('reordering preserves identities and returned reports do not alias evidence',()=>{
@@ -251,7 +318,8 @@ test('cache-reconstructed optional undefined fields are omitted without changing
 });
 test('stale recovered optional evidence remains unavailable rather than malformed or current',()=>{
  const f=recoveredOptionalShape(fixture());f.kraken.stale=true;const r=inspectSmartTariff(f);
- assert.equal(r.payload,null);assert.equal(r.importRate,null);assert.equal(r.payloadUnavailableReason,'VERIFIED_IMPORT_TARIFF_REQUIRED');
+ assert.equal(r.payload,null);assert.equal(r.importRate,null);assert.equal(r.payloadUnavailableReason,'STALE_KRAKEN_EVIDENCE');
+ assert.equal(r.smartOpportunity.status,'incomplete-evidence');assert.equal(r.freshBaselineEligibility.status,'not-assessable');
  assert.ok(!r.blockers.includes('INSPECTION_KRAKEN_TARIFF_EVIDENCE_INVALID'));
  for(const key of ['writeReady','rollbackProven','restorationProven','resolvesHistoricalJournal','grantsRepeatAuthority'])assert.equal(r[key],false);
 });
