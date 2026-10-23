@@ -21,6 +21,9 @@ export const currentSite: Site = {
                 provider: "eon-next",
                 tariff: "Export Premium v3",
                 price: { amount: 0.175, currency: "GBP", unit: "kWh" },
+                validFrom: "2026-10-23T00:00:00+01:00",
+                validTo: "2027-12-01T00:00:00Z",
+                confirmedAt: "2026-10-23T00:00:00+01:00",
             },
         },
 

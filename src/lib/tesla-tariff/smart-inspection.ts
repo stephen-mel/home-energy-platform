@@ -112,6 +112,18 @@ export function validateTeslaInspectionEvidence(value: unknown): ObservedTariff 
     catch { return null; }
 }
 
+/** Shared fixed-shape detachment for the authenticated Kraken snapshot. Account,
+ * tariff and freshness acceptance remain the reconciler's responsibility. */
+export function validateKrakenInspectionEvidence(value: unknown): KrakenState | null {
+    try {
+        const detached = snapshotEvidence(value) as KrakenState;
+        const evidence = validatedImportTariff(detached.importTariff);
+        if (!evidence) return null;
+        detached.importTariff = evidence;
+        return detached;
+    } catch { return null; }
+}
+
 /** Pure inspection of production-acquired snapshots, never an authentication or
  * approval boundary. No ownership is inferred, loaded or created here. */
 export function inspectSmartTariff(input: {
@@ -125,12 +137,8 @@ export function inspectSmartTariff(input: {
     let detachedKraken: KrakenState | null = null, detachedObservation: ObservedTariff | null = null;
     let krakenInvalid = false, teslaInvalid = false;
     if (input.kraken) {
-        try {
-            detachedKraken = snapshotEvidence(input.kraken) as KrakenState;
-            const evidence = validatedImportTariff(detachedKraken.importTariff);
-            if (!evidence) { detachedKraken = null; krakenInvalid = true; }
-            else detachedKraken.importTariff = evidence;
-        } catch { krakenInvalid = true; }
+        detachedKraken = validateKrakenInspectionEvidence(input.kraken);
+        krakenInvalid = detachedKraken === null;
     }
     if (input.observation) {
         detachedObservation = validateTeslaInspectionEvidence(input.observation);

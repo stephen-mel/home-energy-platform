@@ -22,6 +22,9 @@ export type SiteIntegrationConfig = {
             provider: "eon-next";
             tariff: "Export Premium v3";
             price: EnergyPrice;
+            validFrom: string;
+            validTo: string;
+            confirmedAt: string;
         };
     };
 
