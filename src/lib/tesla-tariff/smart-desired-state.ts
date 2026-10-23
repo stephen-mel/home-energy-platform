@@ -5,6 +5,7 @@ import { ownershipFingerprint } from "./ownership-transition";
 import { planSingleSiteSynchronization, type SynchronizationAction } from "./single-site-synchronizer";
 import type { ReconciliationInput } from "./reconciliation";
 import { validateTeslaInspectionEvidence } from "./smart-inspection";
+import { observedEconomicSignal } from "./observed-economic";
 
 export type SmartDesiredStateInput = {
     current: ReconciliationInput;
@@ -24,6 +25,41 @@ const unavailable = (status: "blocked" | "indeterminate", diagnostic: string) =>
     recurringSemantics: "month-day-and-weekday-rules-repeat-until-replaced" as const,
     executionReady: false as const,
 });
+
+function restorationCoverageDiagnostic(input: ReconciliationInput, baseline: ObservedTariff) {
+    const now = Date.parse(input.now), domainStart = Date.parse(input.comparisonDomain.start), domainEnd = Date.parse(input.comparisonDomain.end);
+    const version = input.kraken.importTariff?.version, rate = version?.scheduledChargingImport;
+    if (![now, domainStart, domainEnd].every(Number.isFinite) || !version || !rate
+        || typeof rate.amount !== "number" || !Number.isFinite(rate.amount) || rate.amount < 0
+        || rate.currency !== "GBP" || rate.unit !== "kWh") return "RESTORATION_SCHEDULE_COVERAGE_UNAVAILABLE";
+    const covered = (start: number, end: number) => domainStart <= start && domainEnd >= end;
+    for (const interval of input.managedImport?.intervals ?? []) {
+        const start = Math.max(now, Date.parse(interval.start)), end = Date.parse(interval.end);
+        if (!Number.isFinite(start) || !Number.isFinite(end)) return "RESTORATION_SCHEDULE_COVERAGE_UNAVAILABLE";
+        if (end > now && !covered(start, end)) return "RESTORATION_SCHEDULE_COVERAGE_INCOMPLETE";
+    }
+    for (const dispatch of input.kraken.vehicles.flatMap(vehicle => vehicle.plannedDispatches)
+        .filter(dispatch => dispatch.type === "SMART" && Date.parse(dispatch.end) > now)) {
+        const start = Math.max(now, Date.parse(dispatch.start)), end = Date.parse(dispatch.end);
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start)
+            return "RESTORATION_SCHEDULE_COVERAGE_UNAVAILABLE";
+        let baselineSignal;
+        try { baselineSignal = observedEconomicSignal(baseline, {
+            start: new Date(start).toISOString(), end: new Date(end).toISOString(),
+        }).signal; } catch { return "RESTORATION_SCHEDULE_COVERAGE_UNAVAILABLE"; }
+        let cursor = start, relevant = false;
+        for (const window of baselineSignal.import.sort((a, b) => Date.parse(a.start) - Date.parse(b.start))) {
+            if (Date.parse(window.start) !== cursor || !window.price || window.priceStatus !== "known")
+                return "RESTORATION_SCHEDULE_COVERAGE_UNAVAILABLE";
+            cursor = Date.parse(window.end);
+            if (representationKey(window.price) !== representationKey(rate)) relevant = true;
+        }
+        if (cursor !== end) return "RESTORATION_SCHEDULE_COVERAGE_UNAVAILABLE";
+        if (relevant && (Date.parse(version.effectiveFrom) > start || Date.parse(version.effectiveTo) < end
+            || !covered(start, end))) return "RESTORATION_SCHEDULE_COVERAGE_INCOMPLETE";
+    }
+    return null;
+}
 
 /**
  * Pure desired-state projection for one household site.
@@ -65,10 +101,24 @@ export function deriveSmartTariffDesiredState(input: SmartDesiredStateInput) {
     if (!("managed" in planned.reconciliation) || !("evidence" in planned.reconciliation))
         return { ...unavailable("indeterminate", "DESIRED_STATE_UNAVAILABLE"), reconciliation: planned.reconciliation };
 
-    if (planned.status === "in-sync") {
-        const current = inspectObservedProposalTariff(currentObservation.tariff);
-        if (!current.exact || !current.tariff)
-            return { ...unavailable("indeterminate", "CURRENT_TARIFF_INVALID"), reconciliation: planned.reconciliation };
+    const current = inspectObservedProposalTariff(currentObservation.tariff);
+    if (!current.exact || !current.tariff)
+        return { ...unavailable("indeterminate", "CURRENT_TARIFF_INVALID"), reconciliation: planned.reconciliation };
+    const ownerBoundReplacement = ownership
+        && ownershipFingerprint(current.tariff) !== restorationFingerprint;
+    if (ownerBoundReplacement) {
+        const diagnostic = restorationCoverageDiagnostic(input.current, baselineObservation);
+        if (diagnostic) return { ...unavailable("blocked", diagnostic), reconciliation: planned.reconciliation };
+    }
+    // The reconciler compares only the remaining bounded economic domain. Once
+    // an owned exception has elapsed, that domain can be economically unchanged
+    // even though Tesla still stores the recurring HEP replacement. Restore the
+    // exact retained baseline only when fresh reconciliation proves that no
+    // current/future interval remains managed and the complete current
+    // representation is still the exact owner-bound HEP readback checked above.
+    const elapsedOwnedReplacement = planned.status === "in-sync" && ownerBoundReplacement
+        && planned.reconciliation.managed.ownership.every(period => period.basis === "unmanaged");
+    if (planned.status === "in-sync" && !elapsedOwnedReplacement) {
         return {
             status: "in-sync" as const,
             action: null,
@@ -86,7 +136,7 @@ export function deriveSmartTariffDesiredState(input: SmartDesiredStateInput) {
         };
     }
 
-    const action = planned.action as SynchronizationAction;
+    const action = elapsedOwnedReplacement ? "restore" : planned.action as SynchronizationAction;
     const proposed = action === "restore" ? restoration : planned.reconciliation.proposal?.bound.representation;
     const inspected = inspectObservedProposalTariff(proposed);
     if (!inspected.exact || !inspected.tariff)

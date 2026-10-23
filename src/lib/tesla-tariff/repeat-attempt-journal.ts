@@ -4,6 +4,8 @@ import { validLinkedInitialRecord, validLinkedClassifiedRecord, type LinkedIniti
 import { validOwnership } from "./ownership-evidence";
 import { ownershipFingerprint } from "./ownership-transition";
 import type { OwnershipRead, OwnershipSnapshot } from "./ownership-store";
+import { validSmartRehearsalRecords, type ApplyReview, type RestoreReview, type RehearsalApproval,
+    type AttemptResult, type LifecycleRecords } from "./smart-lifecycle-rehearsal";
 
 type CompletedAttempt = {
     version: 1; site: string; attemptId: string; mutationId: string;
@@ -246,4 +248,106 @@ export async function claimRepeatAttempt(directory: string, site: string, record
         const parent = await open(directory, "r"); try { await parent.sync(); } finally { await parent.close(); }
         return Object.freeze({ status: "classified" as const, attemptId: complete.attemptId, mutationId: complete.mutationId });
     } };
+}
+
+/** Offline-only extension of the existing journal mechanics. Its permanent
+ * active marker also blocks claimRepeatAttempt. No B2 completion or ownership
+ * capability is issued; successful rehearsal never unlocks a real site. */
+export function smartLifecycleRehearsalJournal(directory: string, site: string, durableRoot: string) {
+    if (!/^\d+$/.test(site)) throw Error("INVALID_SITE_ID");
+    const file = path.join(directory, activeName(site));
+    type Frame = { previousKey: string | null; body: LifecycleRecords; key: string };
+    const stages = ["approval,review,schema", "apply,approval,review,schema",
+        "apply,approval,restoreApproval,restoreReview,review,schema", "apply,approval,restore,restoreApproval,restoreReview,review,schema"];
+    function frame(body: LifecycleRecords, previousKey: string | null): Frame {
+        return { body, previousKey, key: ownershipFingerprint({ body, previousKey }) };
+    }
+    async function load() {
+        await assertPhysicalChain(directory, durableRoot);
+        const stat = await lstat(file);
+        if (!stat.isFile() || stat.isSymbolicLink()) throw Error("INVALID_REHEARSAL_JOURNAL");
+        const raw = await readFile(file, "utf8");
+        if (!raw.endsWith("\n")) throw Error("INVALID_REHEARSAL_JOURNAL");
+        const frames: Frame[] = raw.trimEnd().split("\n").map(line => JSON.parse(line));
+        if (!frames.length || frames.length > 4) throw Error("INVALID_REHEARSAL_JOURNAL");
+        for (let i = 0; i < frames.length; i++) {
+            const f = frames[i], prior = frames[i - 1];
+            if (!sameKeys(f, ["body", "previousKey", "key"]) || Object.keys(f.body).sort().join() !== stages[i]
+                || f.previousKey !== (prior?.key ?? null) || frame(f.body, f.previousKey).key !== f.key
+                || f.body.review.energySiteId !== site
+                || prior && Object.entries(prior.body).some(([k, v]) => ownershipFingerprint(v)
+                    !== ownershipFingerprint(f.body[k as keyof LifecycleRecords]))) throw Error("INVALID_REHEARSAL_JOURNAL");
+        }
+        // Each frame is cumulative and every prefix was checked unchanged above.
+        // Validate the complete final evidence once, not once per historical copy.
+        if (!validSmartRehearsalRecords(frames.at(-1)!.body)) throw Error("INVALID_REHEARSAL_JOURNAL");
+        return { raw, current: frames.at(-1)! };
+    }
+    async function append(body: LifecycleRecords, prior: Awaited<ReturnType<typeof load>>) {
+        if (!validSmartRehearsalRecords(body) || await readFile(file, "utf8") !== prior.raw)
+            throw Error("REHEARSAL_HISTORY_CHANGED");
+        const handle = await open(file, "a");
+        try { await handle.writeFile(JSON.stringify(frame(body, prior.current.key)) + "\n", "utf8"); await handle.sync(); }
+        finally { await handle.close(); }
+    }
+    return {
+        async read() {
+            try {
+                const { current } = await load();
+                const body = current.body;
+                const restoreClaimed = (await readdir(directory)).includes(`${activeName(site)}.restore-claimed`);
+                const status = body.restore?.classification === "submitted-representation-preserved" ? "simulated-restored"
+                    : !restoreClaimed && !body.restoreReview && body.apply?.classification === "submitted-representation-preserved"
+                        ? "restoration-review-required" : "manual-intervention-required";
+                return { status, records: structuredClone(body), executionReady: false as const };
+            } catch (error) {
+                let missing = (error as NodeJS.ErrnoException)?.code === "ENOENT";
+                if (missing) {
+                    try { missing = !(await readdir(directory)).some(name => name.startsWith(`site-${site}`)); }
+                    catch (readError) { missing = (readError as NodeJS.ErrnoException)?.code === "ENOENT"; }
+                }
+                return { status: missing ? "missing" : "manual-intervention-required",
+                    records: null, executionReady: false as const };
+            }
+        },
+        async claim(review: ApplyReview, approval: RehearsalApproval) {
+            const body: LifecycleRecords = structuredClone({ schema: "smart-offline-lifecycle-v1", review, approval });
+            if (review.energySiteId !== site || !validSmartRehearsalRecords(body)) throw Error("INVALID_REHEARSAL_JOURNAL");
+            await ensureDurableDirectory(directory, durableRoot);
+            // This rehearsal cannot override ANY retained production history.
+            const names = await readdir(directory);
+            if (names.some(name => name === legacyName(site) || name.startsWith(`site-${site}-attempt`)))
+                throw Error("SITE_ATTEMPT_ALREADY_RECORDED");
+            const handle = await open(file, "wx", 0o600);
+            try { await handle.writeFile(JSON.stringify(frame(body, null)) + "\n", "utf8"); await handle.sync(); }
+            finally { await handle.close(); }
+            await syncDirectory(directory);
+            const prior = await load();
+            let finished = false;
+            return { async finish(result: AttemptResult) {
+                if (finished) throw Error("RESULT_ALREADY_RECORDED");
+                finished = true;
+                await append({ ...body, apply: structuredClone(result) }, prior);
+            } };
+        },
+        async claimRestore(review: RestoreReview, approval: RehearsalApproval) {
+            const prior = await load();
+            if (prior.current.body.restoreReview) throw Error("RESTORATION_ALREADY_CLAIMED");
+            const body = { ...prior.current.body, restoreReview: structuredClone(review), restoreApproval: structuredClone(approval) };
+            if (!validSmartRehearsalRecords(body)) throw Error("INVALID_REHEARSAL_JOURNAL");
+            // Separate exclusive claim survives interruption BEFORE result append.
+            const handle = await open(`${file}.restore-claimed`, "wx", 0o600);
+            try { await handle.writeFile(ownershipFingerprint(body), "utf8"); await handle.sync(); }
+            finally { await handle.close(); }
+            await syncDirectory(directory);
+            await append(body, prior);
+            const approved = await load();
+            let finished = false;
+            return { async finish(result: AttemptResult) {
+                if (finished) throw Error("RESULT_ALREADY_RECORDED");
+                finished = true;
+                await append({ ...body, restore: structuredClone(result) }, approved);
+            } };
+        },
+    };
 }

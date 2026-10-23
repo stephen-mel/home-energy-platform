@@ -85,6 +85,32 @@ test('empty schedule restores the exact immutable baseline and changed schedule 
  assert.equal(ownershipFingerprint(restored.restorationCandidate),fingerprint);noAuthority(restored);
 });
 
+test('elapsed SMART exception restores the recurring representation despite future economic agreement',()=>{
+ const initial=fixture([dispatch('q7','2026-10-21T20:30:00Z','2026-10-22T03:00:00Z')]);
+ const applied=deriveSmartTariffDesiredState(initial);assert.equal(applied.action,'apply');
+ const baselineFingerprint=ownershipFingerprint(initial.restorationBaseline.tariff);
+ const ownership={version:1,energySiteId:'123',timeZone:'Europe/London',createdAt:now,updatedAt:now,validUntil:'2026-10-22T23:00:00.000Z',basis:'confirmed-write-readback',baselineFingerprint,readbackFingerprint:ownershipFingerprint(applied.desiredTariff),proposalFingerprint:'c'.repeat(64),smartEvidenceFingerprint:'d'.repeat(64),intervals:[{start:'2026-10-21T20:30:00.000Z',end:'2026-10-21T23:00:00.000Z',restoreBaselineFingerprint:baselineFingerprint,applied:price(cheap),restore:price(normal)}]};
+ const expired=fixture([dispatch('q7','2026-10-21T20:30:00Z','2026-10-22T03:00:00Z')],{current:observation(applied.desiredTariff),ownership});
+ expired.current.now='2026-10-22T06:00:00.000Z';expired.current.comparisonDomain={start:'2026-10-22T06:00:00.000Z',end:'2026-10-22T23:00:00.000Z'};
+ expired.current.observation.source.observedAt=expired.current.now;expired.current.kraken.lastSuccessfulUpdate=expired.current.now;expired.current.kraken.importTariff.observedAt=expired.current.now;
+ const restored=deriveSmartTariffDesiredState(expired);assert.equal(restored.status,'desired-state-ready');assert.equal(restored.action,'restore');
+ assert.equal(ownershipFingerprint(restored.desiredTariff),baselineFingerprint);assert.deepEqual(structuredClone(restored.desiredTariff),structuredClone(initial.restorationBaseline.tariff));noAuthority(restored);
+});
+
+test('restoration requires coverage of every active or upcoming economic exception',()=>{
+ const original=fixture([dispatch('q7','2026-10-21T20:30:00Z','2026-10-22T03:00:00Z')]),applied=deriveSmartTariffDesiredState(original);
+ const baselineFingerprint=ownershipFingerprint(original.restorationBaseline.tariff),ownership={version:1,energySiteId:'123',timeZone:'Europe/London',createdAt:now,updatedAt:now,validUntil:'2026-10-22T23:00:00.000Z',basis:'confirmed-write-readback',baselineFingerprint,readbackFingerprint:ownershipFingerprint(applied.desiredTariff),proposalFingerprint:'c'.repeat(64),smartEvidenceFingerprint:'d'.repeat(64),intervals:[{start:'2026-10-21T20:30:00.000Z',end:'2026-10-21T23:00:00.000Z',restoreBaselineFingerprint:baselineFingerprint,applied:price(cheap),restore:price(normal)}]};
+ const result=(vehicles,start,end,at=now)=>{const f=fixture(vehicles,{current:observation(applied.desiredTariff),ownership});f.current.now=at;f.current.observation.source.observedAt=at;f.current.kraken.lastSuccessfulUpdate=at;f.current.kraken.importTariff.observedAt=at;f.current.comparisonDomain={start,end};return deriveSmartTariffDesiredState(f)};
+ for(const r of [
+  result([dispatch('q7','2026-10-21T20:30:00Z','2026-10-22T03:00:00Z')],'2026-10-22T06:00:00Z','2026-10-22T23:00:00Z'),
+  result([dispatch('q7','2026-10-21T19:30:00Z','2026-10-21T21:00:00Z')],'2026-10-21T20:00:00Z','2026-10-22T23:00:00Z'),
+  result([dispatch('q7','2026-10-21T20:30:00Z','2026-10-21T22:00:00Z')],'2026-10-21T19:55:00Z','2026-10-21T21:30:00Z'),
+  result([dispatch('a3','2026-10-21T20:30:00Z','2026-10-21T22:00:00Z')],'2026-10-22T06:00:00Z','2026-10-22T23:00:00Z'),
+ ]){assert.equal(r.status,'blocked');assert.equal(r.diagnostic,'RESTORATION_SCHEDULE_COVERAGE_INCOMPLETE');assert.equal(r.action,null);noAuthority(r)}
+ const overnight=result([dispatch('a3','2026-10-21T23:30:00Z','2026-10-22T02:00:00Z')],'2026-10-21T19:55:00Z','2026-10-22T23:00:00Z');
+ assert.equal(overnight.action,'restore');noAuthority(overnight);
+});
+
 test('restoration refuses to overwrite external export, import or metadata changes',()=>{
  const initial=fixture([dispatch('q7','2026-10-21T20:30:00Z','2026-10-21T22:00:00Z')]);
  const applied=deriveSmartTariffDesiredState(initial),baselineFingerprint=ownershipFingerprint(initial.restorationBaseline.tariff);
