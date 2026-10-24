@@ -2,7 +2,7 @@ import type { ObservedTariff } from "./observed-tariff";
 import type { LifecycleOwnershipSnapshot } from "./ownership-store";
 import type { RetainedOriginal } from "./retained-original";
 import { validLifecycleOwnershipSnapshot, validRetainedOriginal, retainedOriginKey, retentionDigest } from "./retained-original";
-import { validJournalEvidenceJson } from "./linked-experiment-records";
+import { validJournalEvidenceJson } from "./journal-evidence-json";
 import { validOwnershipTimestamp } from "./ownership-evidence";
 import { ownershipFingerprint } from "./ownership-transition";
 import { representationKey } from "./rollback-evidence";
@@ -67,6 +67,94 @@ function freeze<T>(v: T): T {
 }
 const noAuthority = { executionReady: false, writeReady: false, rollbackProven: false, restorationProven: false,
     grantsRepeatAuthority: false, grantsSuccessorAuthority: false, resolvesHistoricalJournal: false } as const;
+
+/** Phase-specific content validation only. Authentication and durable admission
+ * must be supplied independently; no completion is invented to validate an initial. */
+export function validateOperationInitialRecord(value: unknown) {
+    const reject = (code: string) => freeze({ status: "rejected" as const, code, ...noAuthority });
+    try {
+        if (!validJournalEvidenceJson(value)) return reject("MALFORMED_OPERATION_INITIAL");
+        const record = structuredClone(value) as SmartOperationInitialRecord, { intent: i, approval: a } = record;
+        const { initialRecordId, ...body } = record;
+        if (!keys(record, "approval,initialRecordId,intent,journalSchemaVersion,phase") || record.journalSchemaVersion !== 2
+            || record.phase !== "approved-operation" || initialRecordId !== hash(body) || !i
+            || !keys(i, "before,energySiteId,expiresAt,kind,mutationId,operationId,origin,original,originalFingerprint,ownershipAfterGeneration,ownershipBefore,payloadFingerprint,payloadJson,predecessor,preparedAt,timeZone,validFrom")
+            || !id(i.operationId) || !id(i.mutationId) || !["apply", "update", "restore"].includes(i.kind)
+            || !generation(i.ownershipAfterGeneration) || typeof i.energySiteId !== "string" || !/^\d+$/.test(i.energySiteId)) return reject("INVALID_OPERATION_INITIAL");
+        if (!i.before || !keys(i.before, "observation,observationId") || !id(i.before.observationId)
+            || !same(validateTeslaInspectionEvidence(i.before.observation), i.before.observation)
+            || !same(validateTeslaInspectionEvidence(i.original), i.original)
+            || i.originalFingerprint !== hash(i.original.tariff)
+            || [i.before.observation, i.original].some(o => o.source.energySiteId !== i.energySiteId || o.source.timeZone !== i.timeZone
+                || !validOwnershipTimestamp(o.source.observedAt))) return reject("INVALID_OPERATION_OBSERVATION");
+        if (i.kind === "apply") {
+            if (i.ownershipBefore !== null || i.predecessor !== null || i.origin !== null || !same(i.original, i.before.observation))
+                return reject("INVALID_APPLY_INITIAL");
+        } else {
+            const s = i.ownershipBefore, p = i.predecessor;
+            if (!validLifecycleOwnershipSnapshot(s, i.energySiteId) || !generation(s.generation) || s.evidence.timeZone !== i.timeZone
+                || s.generation === i.ownershipAfterGeneration || !same(s.lifecycle.original, i.original) || !same(s.lifecycle.origin, i.origin)
+                || !p || !keys(p, "completionRecordId,evidenceId,mutationId,operationId") || !id(p.operationId) || !id(p.mutationId)
+                || !retentionDigest(p.evidenceId) || !retentionDigest(p.completionRecordId)
+                || p.operationId === i.operationId || p.mutationId === i.mutationId
+                || Date.parse(i.before.observation.source.observedAt) < Date.parse(s.evidence.updatedAt)
+                || p.mutationId !== s.lifecycle.latestReadback.mutationId || p.evidenceId !== s.lifecycle.latestReadback.receiptKey)
+                return reject("INVALID_SUCCESSOR_INITIAL");
+        }
+        if (hash(i.before.observation.tariff) !== (i.ownershipBefore?.evidence.readbackFingerprint ?? i.originalFingerprint))
+            return reject("CURRENT_TARIFF_OWNERSHIP_CONFLICT");
+        if (!a || !keys(a, "approvalId,approvedAt,fingerprint,mutationId,operationId,version")) return reject("INVALID_OPERATION_APPROVAL");
+        const { approvalId, ...approved } = a;
+        if (a.version !== 2 || a.operationId !== i.operationId || a.mutationId !== i.mutationId
+            || a.fingerprint !== representationKey(i) || approvalId !== hash(approved)) return reject("APPROVAL_NOT_BOUND");
+        if (![i.preparedAt, i.validFrom, i.expiresAt, a.approvedAt].every(validOwnershipTimestamp)
+            || Date.parse(i.before.observation.source.observedAt) > Date.parse(i.preparedAt)
+            || Date.parse(i.preparedAt) > Date.parse(a.approvedAt) || Date.parse(i.validFrom) < Date.parse(i.preparedAt)
+            || Date.parse(a.approvedAt) < Date.parse(i.validFrom) || Date.parse(a.approvedAt) >= Date.parse(i.expiresAt)
+            || Date.parse(a.approvedAt) - Date.parse(i.before.observation.source.observedAt) > CAPTURE_TTL_MS)
+            return reject("INVALID_OPERATION_TIME");
+        const payload = JSON.parse(i.payloadJson);
+        if (!payload || !keys(payload, "tou_settings") || !payload.tou_settings || !keys(payload.tou_settings, "tariff_content_v2")
+            || i.payloadJson !== representationKey(payload) || i.payloadFingerprint !== hash(payload)
+            || !same(validateTeslaInspectionEvidence({ ...i.before.observation, tariff: payload.tou_settings.tariff_content_v2 }),
+                { ...i.before.observation, tariff: payload.tou_settings.tariff_content_v2 })
+            || i.kind === "restore" && !same(payload.tou_settings.tariff_content_v2, i.original.tariff)) return reject("INVALID_OPERATION_PAYLOAD");
+        return freeze({ status: "validated" as const, record, ...noAuthority });
+    } catch { return reject("MALFORMED_OPERATION_INITIAL"); }
+}
+
+export function validateOperationCompletionRecord(value: unknown, initial: SmartOperationInitialRecord) {
+    const reject = (code: string) => freeze({ status: "rejected" as const, code, ...noAuthority });
+    try {
+        if (validateOperationInitialRecord(initial).status !== "validated" || !validJournalEvidenceJson(value)) return reject("INVALID_OPERATION_INITIAL");
+        const record = structuredClone(value) as SmartOperationCompletionRecord, i = initial.intent;
+        const { completionRecordId, ...body } = record;
+        if (!keys(record, "apiWrite,completedAt,completionRecordId,energySiteId,finalTariffFingerprint,initialRecordId,journalCompletedAt,journalSchemaVersion,mutationId,operationId,outcome,ownershipAfterGeneration,phase,readback,submittedAt,timeZone")
+            || record.journalSchemaVersion !== 2 || record.phase !== "confirmed-operation" || completionRecordId !== hash(body)
+            || record.initialRecordId !== initial.initialRecordId || record.operationId !== i.operationId || record.mutationId !== i.mutationId
+            || record.energySiteId !== i.energySiteId || record.timeZone !== i.timeZone || record.ownershipAfterGeneration !== i.ownershipAfterGeneration
+            || record.outcome !== ({ apply: "applied", update: "updated", restore: "restored" } as const)[i.kind]) return reject("OPERATION_COMPLETION_CONFLICT");
+        const o = record.readback;
+        if (!o || !keys(o, "observation,observationId") || !id(o.observationId) || o.observationId === i.before.observationId
+            || !same(validateTeslaInspectionEvidence(o.observation), o.observation) || !validOwnershipTimestamp(o.observation.source.observedAt))
+            return reject("INVALID_OPERATION_READBACK");
+        const api = record.apiWrite;
+        if (!api || !keys(api, "httpStatus,status") || api.status !== "accepted" || !Number.isInteger(api.httpStatus)
+            || api.httpStatus! < 200 || api.httpStatus! > 299) return reject("EXECUTION_NOT_ACCEPTED");
+        const submit = Date.parse(record.submittedAt), complete = Date.parse(record.completedAt), observed = Date.parse(o.observation.source.observedAt);
+        if (![record.submittedAt, record.completedAt, record.journalCompletedAt].every(validOwnershipTimestamp)
+            || submit < Date.parse(initial.approval.approvedAt) || submit - Date.parse(initial.approval.approvedAt) > APPROVAL_TTL_MS
+            || submit < Date.parse(i.validFrom) || submit >= Date.parse(i.expiresAt)
+            || submit - Date.parse(i.before.observation.source.observedAt) > CAPTURE_TTL_MS
+            || observed > complete || complete - observed > CAPTURE_TTL_MS || complete > Date.parse(record.journalCompletedAt)) return reject("INVALID_OPERATION_TIME");
+        const date = new Intl.DateTimeFormat("en-CA", { timeZone: i.timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(submit));
+        const intended = { ...i.before.observation, tariff: JSON.parse(i.payloadJson).tou_settings.tariff_content_v2 };
+        const match = compareObservedTariffReadBack({ intended, readBack: o.observation, after: record.submittedAt, dates: [date] });
+        if (match.outcome !== "exact-observed-match" || !match.timelineScope.complete || record.finalTariffFingerprint !== hash(o.observation.tariff))
+            return reject("READBACK_NOT_EXACT");
+        return freeze({ status: "validated" as const, record, ...noAuthority });
+    } catch { return reject("MALFORMED_OPERATION_COMPLETION"); }
+}
 
 /** Pure documentary validation, never an authentication, durability, approval or
  * capability issuer. Context MUST come independently from trusted server readers
@@ -216,6 +304,12 @@ export function validateConfirmedOperationEvidence(supplied: unknown, trusted: C
         if (context.ownershipBefore === null && (context.retainedOriginal.currentGeneration !== intent.ownershipAfterGeneration
             || !same(context.retainedOriginal.latestReadback, { mutationId: intent.mutationId, receiptKey: evidence.evidenceId,
                 fingerprint: evidence.completion.finalTariffFingerprint }))) return reject("OWNERSHIP_RESULT_CONFLICT");
+        for (const r of all) {
+            const initial = validateOperationInitialRecord(r.initial);
+            if (initial.status === "rejected") return reject(initial.code);
+            const completion = validateOperationCompletionRecord(r.completion, r.initial);
+            if (completion.status === "rejected") return reject(completion.code);
+        }
         return freeze({ status: "validated" as const, evidence, ...noAuthority });
     } catch { return reject("MALFORMED_OPERATION_EVIDENCE"); }
 }

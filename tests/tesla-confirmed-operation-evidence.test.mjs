@@ -307,7 +307,7 @@ test('ambiguous approval or authenticated acquisition identities and external cu
 });
 
 test('validation exports no capability, persistence, approval issuer or successor claim; recovery alone is insufficient', () => {
-  assert.deepEqual(Object.keys(api), ['validateConfirmedOperationEvidence']);
+  assert.deepEqual(Object.keys(api), ['validateOperationInitialRecord', 'validateOperationCompletionRecord', 'validateConfirmedOperationEvidence']);
   const f = fixture('update'); f.context.approvals = []; f.context.authenticatedObservations = []; f.context.durableJournal = [];
   rejects(f);
   const good = fixture('update'), result = validate(good.record, good.context);

@@ -1,3 +1,4 @@
+import { validJournalEvidenceJson } from "./journal-evidence-json";
 import type { PreparedMutationContext } from "./prepared-mutation-context";
 import type { PreparedExperiment, Consent, WriteResult } from "./supervised-experiment";
 import { classifyExperimentResult, APPROVAL_TTL_MS, MIN_WRITE_REMAINING_MS } from "./supervised-experiment";
@@ -40,32 +41,13 @@ export type LinkedClassifiedRecord = ClassifiedExperimentEvidence & {
 const same = (a: unknown, b: unknown) => representationKey(a) === representationKey(b);
 const id = (value: unknown): value is string => typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.exec(value)?.[0] === value;
 const keys = (value: object, expected: string[]) => Object.keys(value).sort().join() === expected.sort().join();
-// Validate before cloning/canonicalisation: JSON.stringify otherwise maps NaN to
-// null and drops unsupported values. Cross-realm plain objects remain supported.
-function jsonSafe(value: unknown, ancestors = new Set<object>()): boolean {
-    if (value === null || typeof value === "string" || typeof value === "boolean") return true;
-    if (typeof value === "number") return Number.isFinite(value);
-    if (typeof value !== "object" || ancestors.has(value)) return false;
-    const proto = Object.getPrototypeOf(value);
-    if (Array.isArray(value) && (!proto || Function.prototype.toString.call(proto.constructor) !== Function.prototype.toString.call(Array))) return false;
-    if (!Array.isArray(value) && proto !== null && !(Object.getPrototypeOf(proto) === null
-        && Object.getOwnPropertyDescriptor(proto, "constructor")?.value
-        && Function.prototype.toString.call(proto.constructor) === Function.prototype.toString.call(Object))) return false;
-    const own = Reflect.ownKeys(value);
-    if (Array.isArray(value) && (own.length !== value.length + 1
-        || Array.from({ length: value.length }, (_, i) => String(i)).some(k => !Object.hasOwn(value, k)))) return false;
-    ancestors.add(value);
-    const valid = own.every(k => {
-        if (Array.isArray(value) && k === "length") return true;
-        const d = Object.getOwnPropertyDescriptor(value, k)!;
-        return typeof k === "string" && d.enumerable && "value" in d && jsonSafe(d.value, ancestors);
-    });
-    ancestors.delete(value);
-    return valid;
-}
-// Shared documentary validation only; this does not establish journal durability
-// or membership in the runtime completion-capability registry.
-export { jsonSafe as validJournalEvidenceJson };
+// Retain the validator binding locally, as the original private implementation
+// did. Re-exporting documentary helpers cannot replace the V1 runtime check.
+const jsonSafe = validJournalEvidenceJson;
+export { validJournalEvidenceJson };
+export { validateOperationInitialRecord, validateOperationCompletionRecord } from "./confirmed-operation-evidence";
+export type { SmartOperationInitialRecord as LinkedOperationInitialRecord,
+    SmartOperationCompletionRecord as LinkedOperationCompletionRecord } from "./confirmed-operation-evidence";
 function validSource(source: ObservedTariff["source"]) {
     return keys(source, ["kind", "energySiteId", "observedAt", "timeZone"])
         && ["tesla-site-info", "simulation"].includes(source.kind)

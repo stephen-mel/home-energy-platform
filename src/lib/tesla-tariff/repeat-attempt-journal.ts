@@ -6,6 +6,14 @@ import { ownershipFingerprint } from "./ownership-transition";
 import type { OwnershipRead, OwnershipSnapshot } from "./ownership-store";
 import { validSmartRehearsalRecords, type ApplyReview, type RestoreReview, type RehearsalApproval,
     type AttemptResult, type LifecycleRecords } from "./smart-lifecycle-rehearsal";
+import { prepareOperationMutationContext, recheckPreparedOperation, validPreparedOperationContext,
+    operationCommitPreconditionMatches, type OfflineOperationRequest, type OfflineOperationPreparationPorts,
+    type PreparedOperationContext, type OfflineOperationHistory } from "./prepared-mutation-context";
+import { validateConfirmedOperationEvidence, validateOperationInitialRecord, validateOperationCompletionRecord,
+    type SmartOperationInitialRecord, type SmartOperationCompletionRecord, type ConfirmedOperationEvidence,
+    type ConfirmedOperationValidationContext } from "./confirmed-operation-evidence";
+import { validJournalEvidenceJson } from "./journal-evidence-json";
+import { EVIDENCE_TTL_MS } from "./smart-evidence";
 
 type CompletedAttempt = {
     version: 1; site: string; attemptId: string; mutationId: string;
@@ -247,6 +255,200 @@ export async function claimRepeatAttempt(directory: string, site: string, record
         await rename(activePath, path.join(directory, completeName(site, initial.mutationId)));
         const parent = await open(directory, "r"); try { await parent.sync(); } finally { await parent.close(); }
         return Object.freeze({ status: "classified" as const, attemptId: complete.attemptId, mutationId: complete.mutationId });
+    } };
+}
+
+type OfflineCompletionAdmission = Pick<SmartOperationCompletionRecord, "apiWrite" | "readback" | "submittedAt" | "completedAt">;
+export type OfflineOperationJournalPorts = Omit<OfflineOperationPreparationPorts, "readConfirmedHistory"> & {
+    /** Read already-obtained OFFLINE execution/readback evidence. No command or
+     * transport is invoked by the journal, and no production adapter is provided. */
+    readCompletionEvidence(initial: SmartOperationInitialRecord): Promise<OfflineCompletionAdmission>;
+};
+type OfflineOperationMarker = {
+    version: 2; mode: "offline-context"; site: string; prepared: PreparedOperationContext;
+    admission: OfflineCompletionAdmission | null; completionRecordId: string | null; evidenceId: string | null; checksum: string;
+};
+const documentaryOnly = { writeReady: false, executionReady: false, rollbackProven: false, restorationProven: false,
+    grantsRepeatAuthority: false, grantsSuccessorAuthority: false, resolvesHistoricalJournal: false } as const;
+type OperationHistoryRead = ({ status: "empty" } | { status: "available"; history: OfflineOperationHistory }
+    | { status: "legacy"; records: Array<{ initial: LinkedInitialRecord; classified: LinkedClassifiedRecord }> }
+    | { status: "blocked"; code: string }) & typeof documentaryOnly;
+function operationMarker(body: Omit<OfflineOperationMarker, "checksum">): OfflineOperationMarker {
+    return { ...body, checksum: ownershipFingerprint(body) };
+}
+function operationCompletionDiagnostic(prepared: PreparedOperationContext, completion: SmartOperationCompletionRecord): string | null {
+    const checked = validateOperationCompletionRecord(completion, prepared.initial);
+    if (checked.status === "rejected") return checked.code;
+    const submit = Date.parse(completion.submittedAt), k = prepared.capture.kraken;
+    return [k.lastSuccessfulUpdate, k.importTariff!.observedAt].every(time => Date.parse(time) <= submit
+        && submit - Date.parse(time) <= EVIDENCE_TTL_MS) ? null : "STALE_KRAKEN_EVIDENCE";
+}
+async function physicalJournalText(file: string) {
+    const stat = await lstat(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || await realpath(file) !== file || stat.size > 8_000_000) throw Error("OPERATION_JOURNAL_INVALID");
+    const text = await readFile(file, "utf8");
+    if (!text.endsWith("\n")) throw Error("OPERATION_JOURNAL_INCOMPLETE");
+    return text;
+}
+function operationContext(record: ConfirmedOperationEvidence, prepared: PreparedOperationContext, admission: OfflineCompletionAdmission,
+    previous: OfflineOperationHistory): ConfirmedOperationValidationContext {
+    const i = record.initial.intent, c = record.completion, last = previous.contexts.at(-1);
+    // A documentary retained-original reference for evidence validation, not a V3
+    // snapshot, runtime receipt issuance or ownership finalisation. The opaque
+    // issuance reference must have come from the independent preparation port.
+    const retainedOriginal = i.ownershipBefore?.lifecycle ?? {
+        version: 1 as const, energySiteId: i.energySiteId, timeZone: i.timeZone, original: i.original, originalFingerprint: i.originalFingerprint,
+        origin: { mutationId: i.mutationId, initialRecordId: record.initial.initialRecordId, classifiedRecordId: c.completionRecordId,
+            receiptKey: record.evidenceId, issuanceKey: prepared.originIssuanceReference, journal: "attempt" as const },
+        restorationObligation: "required" as const, currentGeneration: i.ownershipAfterGeneration,
+        latestReadback: { mutationId: i.mutationId, receiptKey: record.evidenceId, fingerprint: c.finalTariffFingerprint },
+    };
+    return { energySiteId: i.energySiteId, timeZone: i.timeZone, ownershipBefore: i.ownershipBefore, ownershipAfterGeneration: i.ownershipAfterGeneration,
+        retainedOriginal, confirmedHistory: previous.records,
+        approvals: [...(last?.approvals ?? []), prepared.initial.approval],
+        authenticatedObservations: [...(last?.authenticatedObservations ?? []),
+            { ...prepared.initial.intent.before, operationId: i.operationId, mutationId: i.mutationId, phase: "before" as const },
+            { ...admission.readback, operationId: i.operationId, mutationId: i.mutationId, phase: "readback" as const }],
+        durableJournal: [...(last?.durableJournal ?? []), { initialRecordId: record.initial.initialRecordId, completionRecordId: c.completionRecordId }] };
+}
+async function operationHistory(directory: string, site: string, durableRoot: string, ignoreActive = false): Promise<OperationHistoryRead> {
+    const blocked = (code: string): OperationHistoryRead => ({ status: "blocked", code, ...documentaryOnly });
+    try {
+        if (!/^\d+$/.test(site) || !path.isAbsolute(directory) || !path.isAbsolute(durableRoot)
+            || path.resolve(directory) !== directory || path.resolve(durableRoot) !== durableRoot
+            || path.relative(durableRoot, directory).startsWith("..") || path.isAbsolute(path.relative(durableRoot, directory)))
+            return blocked("INVALID_DURABLE_ROOT");
+        await assertPhysicalChain(durableRoot, durableRoot);
+        let names: string[];
+        try { names = await readdir(directory); }
+        catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return { status: "empty", ...documentaryOnly }; throw e; }
+        await assertPhysicalChain(directory, durableRoot);
+        if (!ignoreActive && names.includes(activeName(site))) return blocked("ATTEMPT_IN_PROGRESS");
+        const prefix = `site-${site}-attempt-`, journals = names.filter(n => n.startsWith(prefix) && n.endsWith(".jsonl"));
+        const markers = names.filter(n => n.startsWith(prefix) && n.endsWith(".complete"));
+        const raw = await Promise.all(markers.map(async name => ({ name, marker: JSON.parse(await physicalJournalText(path.join(directory, name))) as Omit<OfflineOperationMarker, "version"> & { version: number } })));
+        if (names.includes(legacyName(site)) || raw.some(r => r.marker.version === 1)) {
+            if (raw.some(r => r.marker.version !== 1)) return blocked("MIXED_OPERATION_HISTORY");
+            const legacy = await history(directory, site, ignoreActive);
+            if (legacy.active) return blocked("ATTEMPT_IN_PROGRESS");
+            const files = [...(names.includes(legacyName(site)) ? [legacyName(site)] : []), ...journals];
+            for (const name of files) await physicalJournalText(path.join(directory, name));
+            return { status: "legacy", records: await Promise.all(files.map(name => pair(path.join(directory, name), site))), ...documentaryOnly };
+        }
+        if (names.some(n => (n.startsWith(`site-${site}-`) || n.startsWith(`site-${site}.`))
+            && n !== activeName(site) && !journals.includes(n) && !markers.includes(n))) return blocked("UNRECOGNISED_OPERATION_EVIDENCE");
+        if (journals.length !== markers.length) return blocked("OPERATION_JOURNAL_INCOMPLETE");
+        if (!raw.length) return { status: "empty", ...documentaryOnly };
+        const remaining = new Set(raw), result: OfflineOperationHistory = { records: [], contexts: [] };
+        let previous: string | null = null;
+        while (remaining.size) {
+            const candidates = [...remaining].filter(r => (r.marker.prepared?.initial?.intent?.predecessor?.evidenceId ?? null) === previous);
+            if (candidates.length !== 1) return blocked("OPERATION_HISTORY_CONFLICT");
+            const next = candidates[0], m = next.marker;
+            if (!validJournalEvidenceJson(m) || !sameKeys(m, ["version", "mode", "site", "prepared", "admission", "completionRecordId", "evidenceId", "checksum"])) return blocked("OPERATION_MARKER_INVALID");
+            const { checksum, ...body } = m;
+            if (m.version !== 2 || m.mode !== "offline-context" || m.site !== site || checksum !== ownershipFingerprint(body)
+                || !validPreparedOperationContext(m.prepared) || !m.admission) return blocked("OPERATION_MARKER_INVALID");
+            const i = m.prepared.initial.intent;
+            if (i.energySiteId !== site || next.name !== completeName(site, i.mutationId)) return blocked("OPERATION_MARKER_INVALID");
+            const text = await physicalJournalText(path.join(directory, journalName(site, i.mutationId)));
+            const records = text.slice(0, -1).split("\n").map(line => JSON.parse(line));
+            if (records.length !== 2 || validateOperationInitialRecord(records[0]).status !== "validated"
+                || operationCompletionDiagnostic(m.prepared, records[1]) !== null
+                || ownershipFingerprint(records[0]) !== ownershipFingerprint(m.prepared.initial)) return blocked("OPERATION_RECORD_CONFLICT");
+            const envelope = { version: 2 as const, initial: records[0] as SmartOperationInitialRecord, completion: records[1] as SmartOperationCompletionRecord };
+            const record = { ...envelope, evidenceId: ownershipFingerprint(envelope) };
+            if (m.evidenceId !== record.evidenceId || m.completionRecordId !== record.completion.completionRecordId
+                || !sameKeys(m.admission, ["apiWrite", "readback", "submittedAt", "completedAt"])
+                || ownershipFingerprint(m.admission) !== ownershipFingerprint({ apiWrite: record.completion.apiWrite,
+                    readback: record.completion.readback, submittedAt: record.completion.submittedAt, completedAt: record.completion.completedAt }))
+                return blocked("OPERATION_ADMISSION_CONFLICT");
+            const context = operationContext(record, m.prepared, m.admission, structuredClone(result));
+            const checked = validateConfirmedOperationEvidence(record, context);
+            if (checked.status !== "validated") return blocked(checked.code);
+            result.records.push(record); result.contexts.push(context); remaining.delete(next); previous = record.evidenceId;
+        }
+        return { status: "available", history: result, ...documentaryOnly };
+    } catch { return blocked("OPERATION_JOURNAL_INVALID"); }
+}
+
+/** Offline documentary admission into the EXISTING per-operation journal layout.
+ * No executor, runtime registry registration, eligibility/permission result or
+ * successor claim is exposed. Production V1 readers deliberately block on V2
+ * markers. Configured paths/ports are trusted server composition, never JSON.
+ * Restart trusts only this physical server-owned directory and validated admission
+ * markers, not arbitrary envelopes. As with the existing local journal, a party
+ * controlling every file is outside this integrity (not cryptographic) boundary. */
+export function offlineOperationJournal(config: { mode: "offline"; directory: string; site: string; durableRoot: string }, ports: OfflineOperationJournalPorts) {
+    const { directory, site, durableRoot } = config;
+    if (config.mode !== "offline" || !/^\d+$/.test(site)) throw Error("OFFLINE_OPERATION_JOURNAL_REQUIRED");
+    const readHistory = () => operationHistory(directory, site, durableRoot);
+    return { readHistory, async recordInitial(request: OfflineOperationRequest) {
+        if (request.energySiteId !== site) throw Error("OPERATION_SITE_MISMATCH");
+        await ensureDurableDirectory(directory, durableRoot);
+        const before = await readHistory();
+        if (before.status !== "available" && before.status !== "empty") throw Error(before.status === "blocked" ? before.code : "LEGACY_OPERATION_HISTORY");
+        const known = before.status === "available" ? before.history : { records: [], contexts: [] };
+        const prepared = await prepareOperationMutationContext(request, { ...ports, readConfirmedHistory: async () => structuredClone(known) });
+        await assertPhysicalChain(directory, durableRoot);
+        const activePath = path.join(directory, activeName(site)), lock = await open(activePath, "wx", 0o600);
+        const pending = operationMarker({ version: 2, mode: "offline-context", site, prepared, admission: null, completionRecordId: null, evidenceId: null });
+        try {
+            const locked = await operationHistory(directory, site, durableRoot, true);
+            const lockedHistory = locked.status === "empty" ? { records: [], contexts: [] } : locked.status === "available" ? locked.history : null;
+            if (!lockedHistory || ownershipFingerprint(lockedHistory) !== ownershipFingerprint(known)) throw Error("OPERATION_HISTORY_CHANGED");
+            await recheckPreparedOperation(prepared, ports);
+            await lock.writeFile(JSON.stringify(pending) + "\n", "utf8"); await lock.sync();
+            const journal = await open(path.join(directory, journalName(site, prepared.initial.intent.mutationId)), "wx", 0o600);
+            try { await journal.writeFile(JSON.stringify(prepared.initial) + "\n", "utf8"); await journal.sync(); }
+            finally { await journal.close(); }
+        } finally { await lock.close(); }
+        await syncDirectory(directory);
+        let finished = false;
+        return { status: "pending" as const, prepared: structuredClone(prepared), ...documentaryOnly, async recordCompletion() {
+            if (finished) throw Error("RESULT_ALREADY_RECORDED");
+            finished = true;
+            const current = await ports.readOwnership(site), i = prepared.initial.intent;
+            if (!operationCommitPreconditionMatches(prepared, current, i.ownershipAfterGeneration)) throw Error("OPERATION_OWNERSHIP_STALE");
+            const admission = structuredClone(await ports.readCompletionEvidence(structuredClone(prepared.initial)));
+            if (!validJournalEvidenceJson(admission) || !sameKeys(admission, ["apiWrite", "readback", "submittedAt", "completedAt"])) throw Error("OPERATION_ADMISSION_INVALID");
+            const completionBody = { journalSchemaVersion: 2 as const, phase: "confirmed-operation" as const,
+                operationId: i.operationId, mutationId: i.mutationId, energySiteId: site, timeZone: i.timeZone,
+                initialRecordId: prepared.initial.initialRecordId, ownershipAfterGeneration: i.ownershipAfterGeneration,
+                ...admission, journalCompletedAt: ports.now(), finalTariffFingerprint: ownershipFingerprint(admission.readback?.observation?.tariff),
+                outcome: ({ apply: "applied", update: "updated", restore: "restored" } as const)[i.kind] };
+            const completion = { ...completionBody, completionRecordId: ownershipFingerprint(completionBody) };
+            const diagnostic = operationCompletionDiagnostic(prepared, completion);
+            if (diagnostic) throw Error(diagnostic); // Active marker stays consumed on uncertainty.
+            const initialText = await physicalJournalText(path.join(directory, journalName(site, i.mutationId)));
+            if (initialText !== JSON.stringify(prepared.initial) + "\n" || await physicalJournalText(activePath) !== JSON.stringify(pending) + "\n") throw Error("OPERATION_HISTORY_CHANGED");
+            const append = await open(path.join(directory, journalName(site, i.mutationId)), "a");
+            try { await append.writeFile(JSON.stringify(completion) + "\n", "utf8"); await append.sync(); }
+            finally { await append.close(); }
+            const envelope = { version: 2 as const, initial: prepared.initial, completion }, evidenceId = ownershipFingerprint(envelope);
+            const complete = operationMarker({ version: 2, mode: "offline-context", site, prepared, admission,
+                completionRecordId: completion.completionRecordId, evidenceId });
+            const marker = await open(activePath, "w", 0o600);
+            try { await marker.writeFile(JSON.stringify(complete) + "\n", "utf8"); await marker.sync(); }
+            finally { await marker.close(); }
+            try {
+                await rename(activePath, path.join(directory, completeName(site, i.mutationId))); await syncDirectory(directory);
+            } catch (error) {
+                // A failed final directory sync must not look like a newly
+                // available operation to the next reader. Never erase evidence;
+                // retain/recreate the consumed marker on uncertain completion.
+                try {
+                    const uncertain = await open(activePath, "wx", 0o600);
+                    try { await uncertain.writeFile(JSON.stringify(pending) + "\n", "utf8"); await uncertain.sync(); }
+                    finally { await uncertain.close(); }
+                    await syncDirectory(directory);
+                } catch { /* An existing active marker also blocks. Unwritable storage needs manual recovery. */ }
+                throw error;
+            }
+            const read = await readHistory();
+            if (read.status !== "available" || read.history.records.at(-1)?.evidenceId !== evidenceId) throw Error("OPERATION_HISTORY_INVALID");
+            return { status: "recorded" as const, evidence: { ...envelope, evidenceId }, ...documentaryOnly };
+        } };
     } };
 }
 
