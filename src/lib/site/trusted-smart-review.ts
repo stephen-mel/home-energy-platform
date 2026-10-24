@@ -13,6 +13,7 @@ import { deriveSmartTariffDesiredState } from "../tesla-tariff/smart-desired-sta
 import { representationKey } from "../tesla-tariff/rollback-evidence";
 import { smartEvidenceKey } from "../tesla-tariff/smart-evidence";
 import { validOwnership } from "../tesla-tariff/ownership-evidence";
+import { validLifecycleOwnershipSnapshot } from "../tesla-tariff/retained-original";
 import { ownershipFingerprint } from "../tesla-tariff/ownership-transition";
 
 const digest = (value: unknown) => createHash("sha256").update(representationKey(value)).digest("hex");
@@ -39,10 +40,12 @@ function validatedOwnershipRead(value: unknown): OwnershipRead | null {
         return (exact(detached, ["status"]) || exact(detached, ["status", "code"])
             && typeof detached.code === "string" && detached.code.length > 0) ? detached as OwnershipRead : null;
     if (detached.status !== "available" || !exact(detached, ["status", "snapshot"])
-        || !object(detached.snapshot) || !exact(detached.snapshot,
-            ["version", "generation", "evidence", "checksum", "historyDigest"])) return null;
+        || !object(detached.snapshot)) return null;
     const snapshot = detached.snapshot;
-    if (snapshot.version !== 2 || typeof snapshot.generation !== "string" || !validOwnership(snapshot.evidence)
+    if (snapshot.version === 3) return validLifecycleOwnershipSnapshot(snapshot,
+        typeof snapshot.evidence === "object" && snapshot.evidence !== null
+            ? (snapshot.evidence as { energySiteId: string }).energySiteId : "") ? detached as OwnershipRead : null;
+    if (!exact(snapshot, ["version", "generation", "evidence", "checksum", "historyDigest"]) || snapshot.version !== 2 || typeof snapshot.generation !== "string" || !validOwnership(snapshot.evidence)
         || typeof snapshot.checksum !== "string" || typeof snapshot.historyDigest !== "string"
         || snapshot.checksum !== ownershipFingerprint({ generation: snapshot.generation, evidence: snapshot.evidence })
         || !/^[a-f0-9]{64}$/.test(snapshot.historyDigest)) return null;
@@ -105,8 +108,10 @@ export function reviewTrustedSmartSync(input: {
         return blocked("IMPORT_ACCOUNT_OR_TARIFF_IDENTITY_MISMATCH", { exportEvidence: exportPolicy });
     if (ownership.status === "invalid" || ownership.status === "unavailable")
         return blocked(ownership.code ?? "OWNERSHIP_STORE_UNAVAILABLE", { exportEvidence: exportPolicy });
-    // The v2 ownership ledger contains fingerprints, not the immutable baseline
-    // representation. Until the durable Stage 3 record exists, never reconstruct it.
+    let restorationBaseline = observation;
+    // Production acquisition below uses the store, which validates the v3 journal
+    // and complete history before exposing this documentary snapshot. Pure caller
+    // input is not a substitute for trusted acquisition or execution authority.
     if (ownership.status === "available") {
         const snapshot = ownership.snapshot;
         if (snapshot.evidence.energySiteId !== observation.source.energySiteId
@@ -115,8 +120,9 @@ export function reviewTrustedSmartSync(input: {
         if (snapshot.evidence.readbackFingerprint !== ownershipFingerprint(observation.tariff))
             return blocked("CURRENT_TARIFF_OWNERSHIP_CONFLICT", { exportEvidence: exportPolicy,
                 ownership: { status: "available", generation: snapshot.generation } });
-        return blocked("RESTORATION_BASELINE_UNAVAILABLE", { exportEvidence: exportPolicy,
-            ownership: { status: "available", generation: ownership.snapshot.generation } });
+        if (snapshot.version === 2) return blocked("RESTORATION_BASELINE_UNAVAILABLE", { exportEvidence: exportPolicy,
+            ownership: { status: "available", generation: snapshot.generation } });
+        restorationBaseline = snapshot.lifecycle.original;
     }
     const domain = domainFor(kraken, input.assessedAt);
     if (domain.status !== "available") return blocked(domain.code, { exportEvidence: exportPolicy });
@@ -124,9 +130,10 @@ export function reviewTrustedSmartSync(input: {
     // export identity contracts remain untouched in every other workflow.
     const site = structuredClone(input.site);
     delete site.integrations.kraken.exportTariffIdentity;
-    const desired = deriveSmartTariffDesiredState({ restorationBaseline: observation, current: {
+    const desired = deriveSmartTariffDesiredState({ restorationBaseline, current: {
         site, energySiteId: observation.source.energySiteId, kraken,
         observation, now: input.assessedAt, comparisonDomain: domain.domain,
+        ...(ownership.status === "available" ? { managedImport: ownership.snapshot.evidence } : {}),
     } });
     const desiredExport = desired.desiredTariff?.sell_tariff ?? null;
     const exportPreserved = !!desiredExport
@@ -163,7 +170,9 @@ export function reviewTrustedSmartSync(input: {
         exportEvidence: exportPolicy,
         exportPreserved,
         blockers: [...blockers].sort(),
-        ownership: { status: "missing" as const },
+        ownership: ownership.status === "available"
+            ? { status: "available" as const, generation: ownership.snapshot.generation }
+            : { status: "missing" as const },
         ...authority,
     });
 }

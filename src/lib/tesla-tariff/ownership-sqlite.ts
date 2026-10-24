@@ -9,6 +9,9 @@ import type { LinkedInitialRecord, LinkedClassifiedRecord } from "./linked-exper
 import { issueConfirmedSmartReceipt } from "./confirmed-smart-receipt-issuer";
 import { finaliseConfirmedSmartOwnership } from "./ownership-finalisation";
 
+import { validLifecycleOwnershipSnapshot, validRetainedOriginal, retainedOriginKey, type RetainedOriginal, type RetentionInput } from "./retained-original";
+import { validateRetainedJournal } from "./retained-original-journal";
+
 const hash = (v: unknown) => createHash("sha256").update(representationKey(v)).digest("hex");
 const digest = (v: unknown): v is string => typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
 const siteId = (v: unknown): v is string => typeof v === "string" && /^\d+$/.test(v);
@@ -26,33 +29,46 @@ function legacy(file: string, site: string) {
 function validSnapshot(v: unknown, site: string): v is OwnershipSnapshot {
     if (!v || typeof v !== "object") return false;
     const s = v as OwnershipSnapshot;
-    return Object.keys(s).sort().join() === "checksum,evidence,generation,historyDigest,version" && s.version === 2
-        && digest(s.historyDigest)
+    const common = digest(s.historyDigest)
         && typeof s.generation === "string" && /^[a-f0-9-]{36}$/.test(s.generation)
-        && validOwnership(s.evidence) && s.evidence.energySiteId === site
+        && validOwnership(s.evidence) && s.evidence.energySiteId === site;
+    if (!common) return false;
+    if (s.version === 2) return Object.keys(s).sort().join() === "checksum,evidence,generation,historyDigest,version"
         && s.checksum === hash({ generation: s.generation, evidence: s.evidence });
+    return validLifecycleOwnershipSnapshot(s, site);
 }
 type Precondition = { status: "missing" } | { status: "available"; snapshot: OwnershipSnapshot };
 type Identity = { status: "missing"; site: string } | {
-    status: "available"; site: string; version: 1; generation: string; checksum: string; evidenceKey: string;
+    status: "available"; site: string; version: 1 | 2; generation: string; checksum: string; evidenceKey: string; lifecycleKey?: string;
 };
 function identity(site: string, expected: Precondition): Identity {
     if (expected.status === "missing" && Object.keys(expected).join() === "status") return { status: "missing", site };
     if (expected.status !== "available" || Object.keys(expected).sort().join() !== "snapshot,status"
         || !validSnapshot(expected.snapshot, site)) throw Error("OWNERSHIP_PRECONDITION_INVALID");
     const s = expected.snapshot;
-    return { status: "available", site, version: 1, generation: s.generation, checksum: s.checksum, evidenceKey: hash(s.evidence) };
+    return { status: "available", site, version: s.version === 3 ? 2 : 1, generation: s.generation,
+        checksum: s.checksum, evidenceKey: hash(s.evidence),
+        ...(s.version === 3 ? { lifecycleKey: hash(s.lifecycle) } : {}) };
 }
 function validIdentity(v: Identity, site: string) {
     return v && v.site === site && (v.status === "missing" ? Object.keys(v).sort().join() === "site,status"
-        : v.status === "available" && Object.keys(v).sort().join() === "checksum,evidenceKey,generation,site,status,version"
-        && v.version === 1 && typeof v.generation === "string" && /^[a-f0-9-]{36}$/.test(v.generation)
+        : v.status === "available" && (v.version === 1 ? Object.keys(v).sort().join() === "checksum,evidenceKey,generation,site,status,version"
+            : v.version === 2 && Object.keys(v).sort().join() === "checksum,evidenceKey,generation,lifecycleKey,site,status,version"
+                && digest(v.lifecycleKey)) && typeof v.generation === "string" && /^[a-f0-9-]{36}$/.test(v.generation)
         && digest(v.checksum) && digest(v.evidenceKey));
 }
 type Application = { site: string; mutationId: string; issuanceKey: string; receiptKey: string;
-    prior: Identity; priorHistoryDigest: string | null; result: Identity; checksum: string };
+    prior: Identity; priorHistoryDigest: string | null; result: Identity; checksum: string; lifecycle?: RetainedOriginal };
 function validApplication(a: Application, site: string) {
-    if (!a || Object.keys(a).sort().join() !== "checksum,issuanceKey,mutationId,prior,priorHistoryDigest,receiptKey,result,site") return false;
+    if (!a || Object.keys(a).sort().join() !== (a.lifecycle
+        ? "checksum,issuanceKey,lifecycle,mutationId,prior,priorHistoryDigest,receiptKey,result,site"
+        : "checksum,issuanceKey,mutationId,prior,priorHistoryDigest,receiptKey,result,site")) return false;
+    if (a.result?.status === "available" && a.result.version === 2) {
+        if (!validRetainedOriginal(a.lifecycle) || a.lifecycle.energySiteId !== site
+            || a.lifecycle.currentGeneration !== a.result.generation || hash(a.lifecycle) !== a.result.lifecycleKey
+            || a.lifecycle.latestReadback.mutationId !== a.mutationId
+            || a.lifecycle.latestReadback.receiptKey !== a.receiptKey) return false;
+    } else if (a.lifecycle !== undefined) return false;
     const { checksum, ...bound } = a;
     return a.site === site && typeof a.mutationId === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(a.mutationId)
         && digest(a.issuanceKey) && digest(a.receiptKey) && validIdentity(a.prior, site)
@@ -87,7 +103,7 @@ function schema(db: DatabaseSync, initialise: boolean) {
         if (db.prepare("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").all().length) throw Error("OWNERSHIP_STORE_INVALID");
         db.exec(`${ownershipDDL}; ${appliedDDL}; PRAGMA user_version=2;`);
     } else if (version !== 2) throw Error("OWNERSHIP_STORE_INVALID");
-    // This isolated v2 store accepts only its exact schema, not arbitrary SQL
+    // The v2 database schema stores explicit v2/v3 snapshots; accept only its exact schema, not arbitrary SQL
     // claiming user_version=2. No triggers, views or replacement indexes allowed.
     const normalise = (sql: unknown) => typeof sql === "string" ? sql.replace(/\s+/g, " ").trim() : sql;
     const objects = db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY name").all();
@@ -164,6 +180,17 @@ function validateHistory(site: string, current: Precondition, applications: Appl
         throw Error("OWNERSHIP_STORE_INVALID");
     if (current.status === "available" && current.snapshot.historyDigest !== historyDigest(site, ordered))
         throw Error("OWNERSHIP_STORE_INVALID");
+    const retained = ordered.filter(a => a.lifecycle !== undefined);
+    if (retained.length) {
+        // No v2 migration, missing links, obligation discharge, or baseline substitution.
+        if (retained.length !== ordered.length || new Set(retained.map(a => a.receiptKey)).size !== retained.length)
+            throw Error("OWNERSHIP_RETENTION_HISTORY_CONFLICT");
+        const root = ordered[0], original = root.lifecycle!;
+        if (original.origin.mutationId !== root.mutationId || original.origin.issuanceKey !== root.issuanceKey
+            || original.origin.receiptKey !== root.receiptKey
+            || retained.some(a => retainedOriginKey(a.lifecycle!) !== retainedOriginKey(original)))
+            throw Error("OWNERSHIP_RETENTION_HISTORY_CONFLICT");
+    }
     return ordered;
 }
 /** Canonical ordered records, including each complete identity and prior anchor.
@@ -199,6 +226,12 @@ function state(db: DatabaseSync, site: string) {
     const ordered = validateHistory(site, current, applications);
     return { current, applications: ordered };
 }
+function validateRetentionJournal(file: string, retained: RetainedOriginal, applications: Application[]) {
+    const { classified } = validateRetainedJournal(file, retained);
+    const root = applications[0]?.lifecycle;
+    if (!root || root.latestReadback.fingerprint !== hash(classified.apiTariffReadBack.observation?.tariff))
+        throw Error("OWNERSHIP_ORIGINAL_JOURNAL_CONFLICT");
+}
 function code(error: unknown) {
     const message = error instanceof Error ? error.message : "";
     if (/^OWNERSHIP_[A-Z0-9_]+$/.test(message)) return message;
@@ -212,7 +245,9 @@ export function readOwnership(databasePath: string, site: string): OwnershipRead
         const file = path.resolve(databasePath); legacy(file, site);
         if (!exists(file)) return { status: "missing" };
         db = connect(file, false).db; db.exec("BEGIN"); schema(db, false);
-        const { current } = state(db, site);
+        const { current, applications } = state(db, site);
+        if (current.status === "available" && current.snapshot.version === 3)
+            validateRetentionJournal(file, current.snapshot.lifecycle, applications);
         db.exec("COMMIT"); db.close(); db = undefined;
         return structuredClone(current);
     } catch (error) {
@@ -225,18 +260,21 @@ export function readOwnership(databasePath: string, site: string): OwnershipRead
 /** PRIVATE transaction primitive. Only the trusted three-input orchestration
  * below can call it in production; no raw evidence/precondition write API. */
 type CommitInput = { site: string; expected: Precondition; evidence: ManagedImportEvidence;
-    mutationId: string; issuanceKey: string; receiptKey: string };
+    mutationId: string; issuanceKey: string; receiptKey: string; retention?: RetentionInput };
 type CommitResult = { status: "persisted" | "already-persisted"; snapshot: OwnershipSnapshot }
     | { status: "conflict" | "store-failed" | "indeterminate"; code: string };
 function commitOwnership(databasePath: string, input: CommitInput): CommitResult {
     let db: DatabaseSync | undefined, inTransaction = false, commitAttempted = false;
     try {
         guard();
-        const value = structuredClone(input), { site, expected, evidence, mutationId, issuanceKey, receiptKey } = value;
+        const value = structuredClone(input), { site, expected, evidence, mutationId, issuanceKey, receiptKey, retention } = value;
         if (!siteId(site) || typeof mutationId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(mutationId)
             || !digest(issuanceKey) || !digest(receiptKey) || !validOwnership(evidence) || evidence.energySiteId !== site)
             throw Error("OWNERSHIP_INPUT_INVALID");
         const prior = identity(site, expected), file = path.resolve(databasePath);
+        if (expected.status === "available" && ((expected.snapshot.version === 3) !== !!retention))
+            throw Error("OWNERSHIP_RETENTION_VERSION_CONFLICT");
+        if (retention && Object.keys(retention).sort().join() !== "origin,original") throw Error("OWNERSHIP_RETENTION_INVALID");
         const priorHistoryDigest = expected.status === "missing" ? null : expected.snapshot.historyDigest;
         legacy(file, site); const connection = connect(file, true); db = connection.db;
         db.exec("BEGIN IMMEDIATE"); inTransaction = true;
@@ -251,24 +289,48 @@ function commitOwnership(databasePath: string, input: CommitInput): CommitResult
             if (current.status !== "available" || representationKey(applied.result) !== representationKey(identity(site, current)))
                 throw Error("OWNERSHIP_GENERATION_CHANGED");
             if (representationKey(evidence) !== representationKey(current.snapshot.evidence)) throw Error("OWNERSHIP_MUTATION_CONFLICT");
+            if (!!retention !== (current.snapshot.version === 3)
+                || retention && current.snapshot.version === 3
+                    && (hash(retention.original) !== hash(current.snapshot.lifecycle.original)
+                        || hash(retention.origin) !== hash(current.snapshot.lifecycle.origin)))
+                throw Error("OWNERSHIP_MUTATION_CONFLICT");
             snapshot = current.snapshot; status = "already-persisted";
         } else {
-            if (applications.some(a => a.issuanceKey === issuanceKey)) throw Error("OWNERSHIP_MUTATION_CONFLICT");
+            if (applications.some(a => a.issuanceKey === issuanceKey || retention && a.receiptKey === receiptKey))
+                throw Error("OWNERSHIP_MUTATION_CONFLICT");
             if (representationKey(current) !== representationKey(expected)) throw Error("OWNERSHIP_GENERATION_CHANGED");
             const generation = randomUUID();
-            const result: Identity = { status: "available", site, version: 1, generation,
-                checksum: hash({ generation, evidence }), evidenceKey: hash(evidence) };
-            const bound = { site, mutationId, issuanceKey, receiptKey, prior, priorHistoryDigest, result };
+            let lifecycle: RetainedOriginal | undefined;
+            if (retention) {
+                lifecycle = { version: 1, original: retention.original, origin: retention.origin,
+                    originalFingerprint: hash(retention.original.tariff), energySiteId: site, timeZone: evidence.timeZone,
+                    restorationObligation: "required", currentGeneration: generation,
+                    latestReadback: { mutationId, receiptKey, fingerprint: evidence.readbackFingerprint } };
+                if (!validRetainedOriginal(lifecycle)
+                    || expected.status === "available" && expected.snapshot.version === 3
+                        && retainedOriginKey(lifecycle) !== retainedOriginKey(expected.snapshot.lifecycle))
+                    throw Error("OWNERSHIP_RETENTION_INVALID");
+            }
+            const checksum = lifecycle ? hash({ version: 3, generation, evidence, lifecycle }) : hash({ generation, evidence });
+            const result: Identity = { status: "available", site, version: lifecycle ? 2 : 1, generation,
+                checksum, evidenceKey: hash(evidence), ...(lifecycle ? { lifecycleKey: hash(lifecycle) } : {}) };
+            const bound = { site, mutationId, issuanceKey, receiptKey, prior, priorHistoryDigest, result,
+                ...(lifecycle ? { lifecycle } : {}) };
             const application: Application = { ...bound, checksum: hash(bound) };
-            snapshot = { version: 2, generation, evidence, checksum: result.checksum,
-                historyDigest: historyDigest(site, [...applications, application]) };
+            const common = { generation, evidence, checksum, historyDigest: historyDigest(site, [...applications, application]) };
+            snapshot = lifecycle ? { ...common, version: 3, lifecycle } : { ...common, version: 2 };
+            if (!validSnapshot(snapshot, site)) throw Error("OWNERSHIP_RETENTION_INVALID");
             db.prepare("INSERT INTO ownership(site,snapshot) VALUES(?,?) ON CONFLICT(site) DO UPDATE SET snapshot=excluded.snapshot")
                 .run(site, JSON.stringify(snapshot));
             db.prepare("INSERT INTO applied(site,mutation,issuance,record) VALUES(?,?,?,?)")
                 .run(site, mutationId, issuanceKey, JSON.stringify(application));
             status = "persisted";
         }
-        const intended = { site, mutationId, issuanceKey, receiptKey, prior, priorHistoryDigest, result: identity(site, { status: "available", snapshot }) };
+        const intended = { site, mutationId, issuanceKey, receiptKey, prior, priorHistoryDigest,
+            result: identity(site, { status: "available", snapshot }),
+            ...(snapshot.version === 3 ? { lifecycle: snapshot.lifecycle } : {}) };
+        if (snapshot.version === 3) validateRetentionJournal(file, snapshot.lifecycle,
+            status === "persisted" ? [...applications, { ...intended, checksum: hash(intended) }] : applications);
         const intendedApplication = { ...intended, checksum: hash(intended) };
         verifyIntendedPair(db, snapshot, intendedApplication);
         verifyHistoryAppend(db, site, applications, intendedApplication, snapshot, status === "persisted");

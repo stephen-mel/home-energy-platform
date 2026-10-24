@@ -180,3 +180,19 @@ test('valid SMART and BOOST dispatches retain apply and in-sync decisions',()=>{
   noAuthority(r);
  }
 });
+
+test('trusted v3 snapshot supplies its original to read-only review; v2 still has no baseline',()=>{
+ const original=observation(),generation='11111111-1111-1111-1111-111111111111';
+ const evidence={version:1,energySiteId:'123',timeZone:'Europe/London',createdAt:now,updatedAt:now,
+  validUntil:'2026-10-24T23:00:00Z',basis:'confirmed-write-readback',baselineFingerprint:ownershipFingerprint(original.tariff),
+  readbackFingerprint:ownershipFingerprint(original.tariff),proposalFingerprint:'c'.repeat(64),smartEvidenceFingerprint:'d'.repeat(64),intervals:[]};
+ const lifecycle={version:1,energySiteId:'123',timeZone:'Europe/London',original,originalFingerprint:evidence.baselineFingerprint,
+  origin:{mutationId:'original',initialRecordId:'a'.repeat(64),classifiedRecordId:'b'.repeat(64),issuanceKey:'c'.repeat(64),receiptKey:'d'.repeat(64),journal:'legacy'},
+  restorationObligation:'required',currentGeneration:generation,latestReadback:{mutationId:'original',receiptKey:'d'.repeat(64),fingerprint:evidence.readbackFingerprint}};
+ const snapshot={version:3,generation,evidence,lifecycle,historyDigest:'e'.repeat(64),checksum:ownershipFingerprint({version:3,generation,evidence,lifecycle})};
+ const result=review({ownership:{status:'available',snapshot}});
+ assert.equal(result.status,'reviewed');assert.deepEqual(structuredClone(result.restorationCandidate),original.tariff);
+ assert.equal(result.ownership.generation,generation);noAuthority(result);
+ const bad=structuredClone(snapshot);bad.lifecycle.original.tariff.name='corrupt';
+ assert.equal(review({ownership:{status:'available',snapshot:bad}}).blockers.join(),'OWNERSHIP_EVIDENCE_MALFORMED');
+});

@@ -1,6 +1,12 @@
 import path from "node:path";
 import type { ManagedImportEvidence } from "./ownership-evidence";
-export type OwnershipSnapshot = { version: 2; generation: string; evidence: ManagedImportEvidence; checksum: string; historyDigest: string };
+import type { RetainedOriginal } from "./retained-original";
+export type LegacyOwnershipSnapshot = { version: 2; generation: string; evidence: ManagedImportEvidence; checksum: string; historyDigest: string };
+export type LifecycleOwnershipSnapshot = Omit<LegacyOwnershipSnapshot, "version"> & {
+    version: 3;
+    lifecycle: RetainedOriginal;
+};
+export type OwnershipSnapshot = LegacyOwnershipSnapshot | LifecycleOwnershipSnapshot;
 export type OwnershipRead = { status: "available"; snapshot: OwnershipSnapshot }
     | { status: "missing" } | { status: "invalid" | "unavailable"; code?: string };
 
