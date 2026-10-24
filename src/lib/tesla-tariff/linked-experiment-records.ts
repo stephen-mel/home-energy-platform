@@ -63,6 +63,9 @@ function jsonSafe(value: unknown, ancestors = new Set<object>()): boolean {
     ancestors.delete(value);
     return valid;
 }
+// Shared documentary validation only; this does not establish journal durability
+// or membership in the runtime completion-capability registry.
+export { jsonSafe as validJournalEvidenceJson };
 function validSource(source: ObservedTariff["source"]) {
     return keys(source, ["kind", "energySiteId", "observedAt", "timeZone"])
         && ["tesla-site-info", "simulation"].includes(source.kind)
