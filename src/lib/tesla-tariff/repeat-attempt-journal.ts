@@ -1,3 +1,4 @@
+import { validateOwnershipAttribution } from "./ownership-attribution";
 import { lstat, mkdir, open, readFile, readdir, realpath, rename } from "node:fs/promises";
 import path from "node:path";
 import { validLinkedInitialRecord, validLinkedClassifiedRecord, type LinkedInitialRecord, type LinkedClassifiedRecord } from "./linked-experiment-records";
@@ -309,9 +310,14 @@ function operationContext(record: ConfirmedOperationEvidence, prepared: Prepared
         authenticatedObservations: [...(last?.authenticatedObservations ?? []),
             { ...prepared.initial.intent.before, operationId: i.operationId, mutationId: i.mutationId, phase: "before" as const },
             { ...admission.readback, operationId: i.operationId, mutationId: i.mutationId, phase: "readback" as const }],
-        durableJournal: [...(last?.durableJournal ?? []), { initialRecordId: record.initial.initialRecordId, completionRecordId: c.completionRecordId }] };
+        durableJournal: [...(last?.durableJournal ?? []), { initialRecordId: record.initial.initialRecordId, completionRecordId: c.completionRecordId }],
+        ...(i.ownershipAttribution ? { ownershipAttributions: [...(last?.ownershipAttributions ?? []), {
+            operationId: i.operationId, capture: prepared.capture, admission: i.ownershipAttribution.admission,
+            originIssuanceReference: prepared.originIssuanceReference,
+        }] } : {}) };
 }
-async function operationHistory(directory: string, site: string, durableRoot: string, ignoreActive = false): Promise<OperationHistoryRead> {
+async function operationHistory(directory: string, site: string, durableRoot: string, ignoreActive = false,
+    readAdmission?: OfflineOperationPreparationPorts["readOwnershipAttributionAdmission"]): Promise<OperationHistoryRead> {
     const blocked = (code: string): OperationHistoryRead => ({ status: "blocked", code, ...documentaryOnly });
     try {
         if (!/^\d+$/.test(site) || !path.isAbsolute(directory) || !path.isAbsolute(durableRoot)
@@ -350,6 +356,12 @@ async function operationHistory(directory: string, site: string, durableRoot: st
             if (m.version !== 2 || m.mode !== "offline-context" || m.site !== site || checksum !== ownershipFingerprint(body)
                 || !validPreparedOperationContext(m.prepared) || !m.admission) return blocked("OPERATION_MARKER_INVALID");
             const i = m.prepared.initial.intent;
+            if (i.ownershipAttribution) {
+                if (!readAdmission) return blocked("TRUSTED_ATTRIBUTION_ADMISSION_REQUIRED");
+                const trusted = await readAdmission(site, i.operationId, i.mutationId);
+                if (validateOwnershipAttribution(i.ownershipAttribution, i, m.prepared.capture, trusted,
+                    m.prepared.originIssuanceReference).status !== "validated") return blocked("OWNERSHIP_ATTRIBUTION_CONFLICT");
+            }
             if (i.energySiteId !== site || next.name !== completeName(site, i.mutationId)) return blocked("OPERATION_MARKER_INVALID");
             const text = await physicalJournalText(path.join(directory, journalName(site, i.mutationId)));
             const records = text.slice(0, -1).split("\n").map(line => JSON.parse(line));
@@ -382,7 +394,7 @@ async function operationHistory(directory: string, site: string, durableRoot: st
 export function offlineOperationJournal(config: { mode: "offline"; directory: string; site: string; durableRoot: string }, ports: OfflineOperationJournalPorts) {
     const { directory, site, durableRoot } = config;
     if (config.mode !== "offline" || !/^\d+$/.test(site)) throw Error("OFFLINE_OPERATION_JOURNAL_REQUIRED");
-    const readHistory = () => operationHistory(directory, site, durableRoot);
+    const readHistory = () => operationHistory(directory, site, durableRoot, false, ports.readOwnershipAttributionAdmission);
     return { readHistory, async recordInitial(request: OfflineOperationRequest) {
         if (request.energySiteId !== site) throw Error("OPERATION_SITE_MISMATCH");
         await ensureDurableDirectory(directory, durableRoot);
@@ -394,7 +406,7 @@ export function offlineOperationJournal(config: { mode: "offline"; directory: st
         const activePath = path.join(directory, activeName(site)), lock = await open(activePath, "wx", 0o600);
         const pending = operationMarker({ version: 2, mode: "offline-context", site, prepared, admission: null, completionRecordId: null, evidenceId: null });
         try {
-            const locked = await operationHistory(directory, site, durableRoot, true);
+            const locked = await operationHistory(directory, site, durableRoot, true, ports.readOwnershipAttributionAdmission);
             const lockedHistory = locked.status === "empty" ? { records: [], contexts: [] } : locked.status === "available" ? locked.history : null;
             if (!lockedHistory || ownershipFingerprint(lockedHistory) !== ownershipFingerprint(known)) throw Error("OPERATION_HISTORY_CHANGED");
             await recheckPreparedOperation(prepared, ports);

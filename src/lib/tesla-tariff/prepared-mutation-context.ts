@@ -1,3 +1,4 @@
+import { projectAttributedIntervals, operationCaptureIdentity, buildOwnershipAttribution, validateOwnershipAttribution, type OwnershipAttributionAdmission } from "./ownership-attribution";
 import type { Site } from "../site/types";
 import type { OwnershipRead, LifecycleOwnershipSnapshot } from "./ownership-store";
 import { assertOwnership, validOwnership, validOwnershipTimestamp } from "./ownership-evidence";
@@ -88,6 +89,7 @@ export type OfflineOperationCapture = {
 export type OfflineOperationRequest = {
     kind: SmartOperationKind; operationId: string; mutationId: string; energySiteId: string; timeZone: string;
     expectedOwnershipKey: string; payloadJson: string; validFrom: string; expiresAt: string;
+    ownershipAttributionVersion?: 1;
 };
 /** Trusted composition boundary, not browser/deserialized data. These ports have
  * no write/execute method and no default production adapters. Tests inject offline
@@ -99,6 +101,9 @@ export type OfflineOperationPreparationPorts = {
     capture(site: string): Promise<OfflineOperationCapture>;
     approve(intent: SmartOperationIntent): Promise<SmartOperationApprovalEvidence>;
     readOriginIssuanceReference(site: string): Promise<string>;
+    /** Independent authenticated coverage + explicit validity policy admission.
+     * Restart must reacquire the historical admission by operation identity. */
+    readOwnershipAttributionAdmission?(site: string, operationId: string, mutationId: string): Promise<OwnershipAttributionAdmission>;
     now(): string;
 };
 export type PreparedOperationContext = {
@@ -144,9 +149,6 @@ export function expectedOperationGeneration(site: string, operation: string, mut
     const h = ownershipFingerprint({ version: 2, purpose: "expected-operation-generation", site, operation, mutation, ownership });
     return `${h.slice(0, 8)}-${h.slice(8, 12)}-8${h.slice(13, 16)}-8${h.slice(17, 20)}-${h.slice(20, 32)}`;
 }
-function captureIdentity(capture: OfflineOperationCapture, originIssuanceReference: string) {
-    return ownershipFingerprint({ version: 2, purpose: "operation-capture", capture, originIssuanceReference });
-}
 function operationImportIdentity(capture: OfflineOperationCapture) {
     // Reacquisition refreshes provenance time, not the underlying agreement/rates.
     const { observedAt, ...facts } = capture.kraken.importTariff!;
@@ -170,8 +172,10 @@ export function validPreparedOperationContext(value: unknown): value is Prepared
         return fingerprint === ownershipFingerprint(bound) && p.ownershipKey === ownershipFingerprint(ownership)
             && i.ownershipAfterGeneration === expectedOperationGeneration(i.energySiteId, i.operationId, i.mutationId, ownership)
             && validOperationCapture(p.capture, i.energySiteId, i.timeZone, i.preparedAt)
-            && i.before.observationId === captureIdentity(p.capture, p.originIssuanceReference) && sameOperationValue(i.before.observation, p.capture.observation)
-            && (!i.ownershipBefore || p.originIssuanceReference === i.ownershipBefore.lifecycle.origin.issuanceKey);
+            && i.before.observationId === operationCaptureIdentity(p.capture, p.originIssuanceReference) && sameOperationValue(i.before.observation, p.capture.observation)
+            && (!i.ownershipBefore || p.originIssuanceReference === i.ownershipBefore.lifecycle.origin.issuanceKey)
+            && (!i.ownershipAttribution || validateOwnershipAttribution(i.ownershipAttribution, i, p.capture,
+                i.ownershipAttribution.admission, p.originIssuanceReference).status === "validated");
     } catch { return false; }
 }
 
@@ -188,7 +192,8 @@ export function operationCommitPreconditionMatches(prepared: PreparedOperationCo
 export async function prepareOperationMutationContext(request: OfflineOperationRequest, ports: OfflineOperationPreparationPorts): Promise<PreparedOperationContext> {
     if (!validJournalEvidenceJson(request)) throw Error("OPERATION_REQUEST_INVALID");
     const r = structuredClone(request);
-    if (!exactOperationKeys(r, "energySiteId,expectedOwnershipKey,expiresAt,kind,mutationId,operationId,payloadJson,timeZone,validFrom")
+    if (!(exactOperationKeys(r, "energySiteId,expectedOwnershipKey,expiresAt,kind,mutationId,operationId,payloadJson,timeZone,validFrom")
+        || r.ownershipAttributionVersion === 1 && exactOperationKeys(r, "energySiteId,expectedOwnershipKey,expiresAt,kind,mutationId,operationId,ownershipAttributionVersion,payloadJson,timeZone,validFrom"))
         || !["apply", "update", "restore"].includes(r.kind) || !operationId(r.operationId) || !operationId(r.mutationId)
         || typeof r.energySiteId !== "string" || !/^\d+$/.test(r.energySiteId)) throw Error("OPERATION_REQUEST_INVALID");
     const ownership = structuredClone(await ports.readOwnership(r.energySiteId));
@@ -210,6 +215,10 @@ export async function prepareOperationMutationContext(request: OfflineOperationR
         || previous.completion.finalTariffFingerprint !== beforeSnapshot?.evidence.readbackFingerprint
         || !beforeSnapshot || retainedOriginKey(beforeSnapshot.lifecycle) !== retainedOriginKey(history.contexts.at(-1)!.retainedOriginal))) throw Error("OPERATION_PREDECESSOR_CONFLICT");
     if (history.records.some(h => h.initial.intent.operationId === r.operationId || h.initial.intent.mutationId === r.mutationId)) throw Error("DUPLICATE_OPERATION_IDENTITY");
+    if (previous?.initial.intent.ownershipAttribution && r.ownershipAttributionVersion !== 1) throw Error("ATTRIBUTION_DOWNGRADE_FORBIDDEN");
+    const previousAttribution = previous?.initial.intent.ownershipAttribution;
+    if (previousAttribution && beforeSnapshot && (!sameOperationValue(projectAttributedIntervals(previous!.initial.intent, previous!.completion.submittedAt), beforeSnapshot.evidence.intervals)
+        || previousAttribution.admission.validity.end !== beforeSnapshot.evidence.validUntil)) throw Error("ATTRIBUTION_PREDECESSOR_CONFLICT");
     const capture = structuredClone(await ports.capture(r.energySiteId)), preparedAt = ports.now();
     if (!validJournalEvidenceJson(capture) || !validOperationCapture(capture, r.energySiteId, r.timeZone, preparedAt)) throw Error("OPERATION_CAPTURE_INVALID");
     const originIssuanceReference = beforeSnapshot?.lifecycle.origin.issuanceKey ?? await ports.readOriginIssuanceReference(r.energySiteId);
@@ -220,9 +229,16 @@ export async function prepareOperationMutationContext(request: OfflineOperationR
         ownershipBefore: beforeSnapshot, ownershipAfterGeneration: expectedOperationGeneration(r.energySiteId, r.operationId, r.mutationId, ownership),
         original: beforeSnapshot?.lifecycle.original ?? capture.observation,
         originalFingerprint: beforeSnapshot?.lifecycle.originalFingerprint ?? ownershipFingerprint(capture.observation.tariff),
-        origin: beforeSnapshot?.lifecycle.origin ?? null, before: { observationId: captureIdentity(capture, originIssuanceReference), observation: capture.observation },
+        origin: beforeSnapshot?.lifecycle.origin ?? null, before: { observationId: operationCaptureIdentity(capture, originIssuanceReference), observation: capture.observation },
         payloadJson: r.payloadJson, payloadFingerprint: ownershipFingerprint(JSON.parse(r.payloadJson)), preparedAt,
         validFrom: r.validFrom, expiresAt: r.expiresAt };
+    if (r.ownershipAttributionVersion === 1) {
+        if (!ports.readOwnershipAttributionAdmission) throw Error("TRUSTED_ATTRIBUTION_ADMISSION_REQUIRED");
+        if (previous && !previous.initial.intent.ownershipAttribution) throw Error("LEGACY_PREDECESSOR_HAS_NO_ATTRIBUTION");
+        const admission = await ports.readOwnershipAttributionAdmission(r.energySiteId, r.operationId, r.mutationId);
+        if (r.kind === "restore" && !sameOperationValue(admission.validity, previousAttribution!.admission.validity)) throw Error("RESTORE_ATTRIBUTION_HISTORY_CONFLICT");
+        intent.ownershipAttribution = buildOwnershipAttribution(intent, capture, admission, originIssuanceReference);
+    }
     const approval = structuredClone(await ports.approve(structuredClone(intent)));
     const initialBody = { journalSchemaVersion: 2 as const, phase: "approved-operation" as const, intent, approval };
     const initial = { ...initialBody, initialRecordId: ownershipFingerprint(initialBody) };
@@ -236,10 +252,16 @@ export async function prepareOperationMutationContext(request: OfflineOperationR
     return freeze(prepared) as PreparedOperationContext;
 }
 
-export async function recheckPreparedOperation(prepared: PreparedOperationContext, ports: Pick<OfflineOperationPreparationPorts, "readOwnership" | "capture" | "now">) {
+export async function recheckPreparedOperation(prepared: PreparedOperationContext, ports: Pick<OfflineOperationPreparationPorts, "readOwnership" | "capture" | "now" | "readOwnershipAttributionAdmission">) {
     if (!validPreparedOperationContext(prepared)) throw Error("OPERATION_CONTEXT_INVALID");
     const i = prepared.initial.intent, current = structuredClone(await ports.readOwnership(i.energySiteId));
     if (!operationCommitPreconditionMatches(prepared, current, i.ownershipAfterGeneration)) throw Error("OPERATION_OWNERSHIP_STALE");
+    if (i.ownershipAttribution) {
+        if (!ports.readOwnershipAttributionAdmission) throw Error("TRUSTED_ATTRIBUTION_ADMISSION_REQUIRED");
+        const admission = await ports.readOwnershipAttributionAdmission(i.energySiteId, i.operationId, i.mutationId);
+        if (validateOwnershipAttribution(i.ownershipAttribution, i, prepared.capture, admission, prepared.originIssuanceReference).status !== "validated")
+            throw Error("OWNERSHIP_ATTRIBUTION_CHANGED");
+    }
     const capture = structuredClone(await ports.capture(i.energySiteId)), now = ports.now();
     if (!validJournalEvidenceJson(capture) || !validOperationCapture(capture, i.energySiteId, i.timeZone, now)
         || !freshOperationTime(prepared.initial.approval.approvedAt, now, APPROVAL_TTL_MS) || Date.parse(now) >= Date.parse(i.expiresAt)

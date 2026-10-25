@@ -1,3 +1,6 @@
+import { EVIDENCE_TTL_MS } from "./smart-evidence";
+import { projectAttributedIntervals, validOwnershipAttributionShape, validateOwnershipAttribution, type OwnershipAttribution, type OwnershipAttributionAdmission } from "./ownership-attribution";
+import type { OfflineOperationCapture } from "./prepared-mutation-context";
 import type { ObservedTariff } from "./observed-tariff";
 import type { LifecycleOwnershipSnapshot } from "./ownership-store";
 import type { RetainedOriginal } from "./retained-original";
@@ -20,6 +23,8 @@ export type SmartOperationIntent = {
     original: ObservedTariff; originalFingerprint: string; origin: RetainedOriginal["origin"] | null;
     before: ObservationEvidence; payloadJson: string; payloadFingerprint: string;
     preparedAt: string; validFrom: string; expiresAt: string;
+    /** Explicit opt-in extension. Absence preserves the original documentary interpretation. */
+    ownershipAttribution?: OwnershipAttribution;
 };
 /** Versioned operation-specific approval evidence. Uses the existing canonical
  * fingerprint/approvedAt convention, but cannot be passed off as a v1 proposal
@@ -54,10 +59,13 @@ export type ConfirmedOperationValidationContext = {
         operationId: string; mutationId: string; phase: "before" | "readback";
     })[];
     durableJournal: readonly { initialRecordId: string; completionRecordId: string }[];
+    ownershipAttributions?: readonly { operationId: string; capture: OfflineOperationCapture; admission: OwnershipAttributionAdmission; originIssuanceReference: string }[];
 };
 
 const hash = ownershipFingerprint, same = (a: unknown, b: unknown) => representationKey(a) === representationKey(b);
 const keys = (v: object, names: string) => Object.keys(v).sort().join() === names;
+const operationIntentKeys = (i: SmartOperationIntent) => keys(i, "before,energySiteId,expiresAt,kind,mutationId,operationId,origin,original,originalFingerprint,ownershipAfterGeneration,ownershipBefore,payloadFingerprint,payloadJson,predecessor,preparedAt,timeZone,validFrom")
+    || keys(i, "before,energySiteId,expiresAt,kind,mutationId,operationId,origin,original,originalFingerprint,ownershipAfterGeneration,ownershipAttribution,ownershipBefore,payloadFingerprint,payloadJson,predecessor,preparedAt,timeZone,validFrom");
 const id = (v: unknown): v is string => typeof v === "string" && /^[A-Za-z0-9_-]{1,128}$/.exec(v)?.[0] === v;
 const generation = (v: unknown): v is string => typeof v === "string"
     && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.exec(v)?.[0] === v;
@@ -78,7 +86,7 @@ export function validateOperationInitialRecord(value: unknown) {
         const { initialRecordId, ...body } = record;
         if (!keys(record, "approval,initialRecordId,intent,journalSchemaVersion,phase") || record.journalSchemaVersion !== 2
             || record.phase !== "approved-operation" || initialRecordId !== hash(body) || !i
-            || !keys(i, "before,energySiteId,expiresAt,kind,mutationId,operationId,origin,original,originalFingerprint,ownershipAfterGeneration,ownershipBefore,payloadFingerprint,payloadJson,predecessor,preparedAt,timeZone,validFrom")
+            || !operationIntentKeys(i)
             || !id(i.operationId) || !id(i.mutationId) || !["apply", "update", "restore"].includes(i.kind)
             || !generation(i.ownershipAfterGeneration) || typeof i.energySiteId !== "string" || !/^\d+$/.test(i.energySiteId)) return reject("INVALID_OPERATION_INITIAL");
         if (!i.before || !keys(i.before, "observation,observationId") || !id(i.before.observationId)
@@ -119,6 +127,16 @@ export function validateOperationInitialRecord(value: unknown) {
             || !same(validateTeslaInspectionEvidence({ ...i.before.observation, tariff: payload.tou_settings.tariff_content_v2 }),
                 { ...i.before.observation, tariff: payload.tou_settings.tariff_content_v2 })
             || i.kind === "restore" && !same(payload.tou_settings.tariff_content_v2, i.original.tariff)) return reject("INVALID_OPERATION_PAYLOAD");
+        if ("ownershipAttribution" in i) {
+            const t = i.ownershipAttribution!;
+            if (!validOwnershipAttributionShape(t) || t.operationKind !== i.kind || t.operationId !== i.operationId
+                || t.mutationId !== i.mutationId || t.energySiteId !== i.energySiteId || t.timeZone !== i.timeZone
+                || t.beforeGeneration !== (i.ownershipBefore?.generation ?? null) || t.expectedAfterGeneration !== i.ownershipAfterGeneration
+                || t.payloadFingerprint !== i.payloadFingerprint || t.originalFingerprint !== i.originalFingerprint
+                || t.originalObservationFingerprint !== hash(i.original) || !same(t.predecessor, i.predecessor)
+                || t.retainedOriginKey !== (i.ownershipBefore ? retainedOriginKey(i.ownershipBefore.lifecycle) : null))
+                return reject("OWNERSHIP_ATTRIBUTION_CONFLICT");
+        }
         return freeze({ status: "validated" as const, record, ...noAuthority });
     } catch { return reject("MALFORMED_OPERATION_INITIAL"); }
 }
@@ -171,16 +189,41 @@ export function validateConfirmedOperationEvidence(supplied: unknown, trusted: C
         if (!validJournalEvidenceJson(supplied) || !validJournalEvidenceJson(trusted)) return reject("MALFORMED_OPERATION_EVIDENCE");
         const evidence = structuredClone(supplied) as ConfirmedOperationEvidence;
         const context = structuredClone(trusted);
-        if (!keys(context, "approvals,authenticatedObservations,confirmedHistory,durableJournal,energySiteId,ownershipAfterGeneration,ownershipBefore,retainedOriginal,timeZone")
+        if (!(keys(context, "approvals,authenticatedObservations,confirmedHistory,durableJournal,energySiteId,ownershipAfterGeneration,ownershipBefore,retainedOriginal,timeZone") || keys(context, "approvals,authenticatedObservations,confirmedHistory,durableJournal,energySiteId,ownershipAfterGeneration,ownershipAttributions,ownershipBefore,retainedOriginal,timeZone"))
             || typeof context.energySiteId !== "string" || !/^\d+$/.test(context.energySiteId)
             || typeof context.timeZone !== "string" || !generation(context.ownershipAfterGeneration)
             || !validRetainedOriginal(context.retainedOriginal)
             || context.retainedOriginal.energySiteId !== context.energySiteId || context.retainedOriginal.timeZone !== context.timeZone
             || !Array.isArray(context.confirmedHistory) || !Array.isArray(context.approvals)
-            || !Array.isArray(context.authenticatedObservations) || !Array.isArray(context.durableJournal)) return reject("INVALID_OPERATION_CONTEXT");
+            || !Array.isArray(context.authenticatedObservations) || !Array.isArray(context.durableJournal)
+            || "ownershipAttributions" in context && !Array.isArray(context.ownershipAttributions)) return reject("INVALID_OPERATION_CONTEXT");
         if (context.ownershipBefore !== null && (!validLifecycleOwnershipSnapshot(context.ownershipBefore, context.energySiteId)
             || !same(context.ownershipBefore.lifecycle, context.retainedOriginal))) return reject("INVALID_V3_OWNERSHIP");
         const all: readonly ConfirmedOperationEvidence[] = [...context.confirmedHistory, evidence];
+        for (let n = 1; n < all.length; n++) {
+            const prior = all[n - 1].initial?.intent?.ownershipAttribution, next = all[n].initial?.intent;
+            if (prior && (!next?.ownershipAttribution || !next.ownershipBefore
+                || !same(projectAttributedIntervals(all[n - 1].initial.intent, all[n - 1].completion.submittedAt), next.ownershipBefore.evidence.intervals)
+                || prior.admission.validity.end !== next.ownershipBefore.evidence.validUntil)) return reject("ATTRIBUTION_PREDECESSOR_CONFLICT");
+            if (next?.ownershipAttribution && !prior) return reject("LEGACY_PREDECESSOR_HAS_NO_ATTRIBUTION");
+            if (prior && next?.kind === "restore" && !same(next.ownershipAttribution?.admission.validity, prior.admission.validity))
+                return reject("RESTORE_ATTRIBUTION_HISTORY_CONFLICT");
+        }
+        const attributed = all.filter(r => r.initial?.intent?.ownershipAttribution);
+        if ((context.ownershipAttributions?.length ?? 0) !== attributed.length) return reject("ATTRIBUTION_CONTEXT_REQUIRED");
+        const seenAttributions = new Set<string>();
+        for (const record of attributed) {
+            const i = record.initial.intent, c = context.ownershipAttributions?.find(c => c.operationId === i.operationId);
+            if (!c || !keys(c, "admission,capture,operationId,originIssuanceReference") || seenAttributions.has(c.operationId)
+                || validateOwnershipAttribution(i.ownershipAttribution, i, c.capture, c.admission, c.originIssuanceReference).status !== "validated")
+                return reject("OWNERSHIP_ATTRIBUTION_CONFLICT");
+            const submitted = Date.parse(record.completion.submittedAt);
+            if (![c.capture.kraken.lastSuccessfulUpdate, c.capture.kraken.importTariff?.observedAt].every(time =>
+                validOwnershipTimestamp(time) && Date.parse(time) <= submitted && submitted - Date.parse(time) <= EVIDENCE_TTL_MS))
+                return reject("STALE_ATTRIBUTION_EVIDENCE");
+            projectAttributedIntervals(i, record.completion.submittedAt);
+            seenAttributions.add(c.operationId);
+        }
         if (context.durableJournal.length !== all.length) return reject("DURABLE_JOURNAL_HISTORY_CONFLICT");
         const seen = new Map<string, Set<string>>();
         const unique = (domain: string, value: string) => {
@@ -207,7 +250,7 @@ export function validateConfirmedOperationEvidence(supplied: unknown, trusted: C
             const { initial, completion } = record, { intent, approval } = initial;
             if (!keys(initial, "approval,initialRecordId,intent,journalSchemaVersion,phase")
                 || initial.journalSchemaVersion !== 2 || initial.phase !== "approved-operation"
-                || !intent || !keys(intent, "before,energySiteId,expiresAt,kind,mutationId,operationId,origin,original,originalFingerprint,ownershipAfterGeneration,ownershipBefore,payloadFingerprint,payloadJson,predecessor,preparedAt,timeZone,validFrom")
+                || !intent || !operationIntentKeys(intent)
                 || !id(intent.operationId) || !id(intent.mutationId) || !["apply", "update", "restore"].includes(intent.kind)
                 || !generation(intent.ownershipAfterGeneration) || intent.energySiteId !== context.energySiteId
                 || intent.timeZone !== context.timeZone) return reject("INVALID_INITIAL_OPERATION_RECORD");
