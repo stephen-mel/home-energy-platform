@@ -18,3 +18,9 @@ export function ownershipStore(directory = path.join(process.cwd(), ".cache/home
         return readOwnership(path.join(directory, "ownership.sqlite"), site);
     } };
 }
+
+/** F1 documentary representation is deliberately NOT part of OwnershipSnapshot
+ * or OwnershipRead. Existing persistence/readers and legacy validators retain
+ * their current contracts until a separately reviewed persistence increment. */
+export type { OwnershipLifecycleDocument, OwnershipLifecycleValidationContext,
+    OwnershipApplicationIdentity, RuntimeReceiptIdentityReference } from "./ownership-lifecycle";
