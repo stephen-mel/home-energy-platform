@@ -384,6 +384,15 @@ async function operationHistory(directory: string, site: string, durableRoot: st
     } catch { return blocked("OPERATION_JOURNAL_INVALID"); }
 }
 
+/** Read-only version-aware physical journal verification for persistence readers.
+ * Reuses the same marker, linkage, V1 and independent attribution checks as the
+ * offline journal. It neither claims an operation nor authenticates runtime
+ * receipt references. Server composition owns the paths and admission reader. */
+export function readOfflineOperationHistory(config: { directory: string; site: string; durableRoot: string },
+    readAdmission?: OfflineOperationPreparationPorts["readOwnershipAttributionAdmission"]) {
+    return operationHistory(config.directory, config.site, config.durableRoot, false, readAdmission);
+}
+
 /** Offline documentary admission into the EXISTING per-operation journal layout.
  * No executor, runtime registry registration, eligibility/permission result or
  * successor claim is exposed. Production V1 readers deliberately block on V2

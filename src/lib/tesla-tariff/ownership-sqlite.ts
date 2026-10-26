@@ -11,6 +11,9 @@ import { finaliseConfirmedSmartOwnership } from "./ownership-finalisation";
 
 import { validLifecycleOwnershipSnapshot, validRetainedOriginal, retainedOriginKey, type RetainedOriginal, type RetentionInput } from "./retained-original";
 import { validateRetainedJournal } from "./retained-original-journal";
+import { validatePersistedOwnershipHistory, persistenceOnly } from "./ownership-persistence";
+import { readOfflineOperationHistory } from "./repeat-attempt-journal";
+import type { OfflineOperationPreparationPorts } from "./prepared-mutation-context";
 
 const hash = (v: unknown) => createHash("sha256").update(representationKey(v)).digest("hex");
 const digest = (v: unknown): v is string => typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
@@ -255,6 +258,58 @@ export function readOwnership(databasePath: string, site: string): OwnershipRead
         const reason = code(error);
         return { status: reason === "OWNERSHIP_STORE_INVALID" ? "invalid" : "unavailable", code: reason };
     }
+}
+
+/** F4a storage-consistency readback ONLY. There is intentionally no V3 write
+ * boundary before F2 provides an internally verified confirmation capability.
+ * A verified-storage result is not authenticated completion, admission or a
+ * trusted predecessor capability. Runtime reference provenance is unverified.
+ * Both tables are read in one read-only SQLite transaction; matching V2 journal
+ * history is read twice to reject changes during the observation. No files,
+ * ownership, journals, latches or runtime registries are created or modified. */
+export async function readPersistedOwnershipLifecycle(databasePath: string, site: string, timeZone: string,
+    readAdmission?: OfflineOperationPreparationPorts["readOwnershipAttributionAdmission"]) {
+    let db: DatabaseSync | undefined;
+    const blocked = (code: string) => ({ status: "blocked" as const, code, ...persistenceOnly });
+    try {
+        guard(); if (!siteId(site)) return blocked("OWNERSHIP_SITE_INVALID");
+        const file = path.resolve(databasePath); legacy(file, site);
+        if (!exists(file)) return { status: "missing" as const, ...persistenceOnly };
+        db = connect(file, false).db; db.exec("BEGIN"); schema(db, false);
+        const row = db.prepare("SELECT snapshot FROM ownership WHERE site=?").get(site);
+        const rows = db.prepare("SELECT mutation,issuance,record FROM applied WHERE site=?").all(site);
+        if (!row) {
+            if (rows.length) return blocked("V3_PERSISTENCE_HISTORY_INCOMPLETE");
+            return { status: "missing" as const, ...persistenceOnly };
+        }
+        const current = JSON.parse(row.snapshot as string);
+        if (current?.kind !== "v3-ownership-persistence") {
+            const legacyState = state(db, site);
+            if (legacyState.current.status === "available" && legacyState.current.snapshot.version === 3)
+                validateRetentionJournal(file, legacyState.current.snapshot.lifecycle, legacyState.applications);
+            return { status: "legacy" as const, ownership: structuredClone(legacyState.current), ...persistenceOnly };
+        }
+        const records = rows.map(row => {
+            const record = JSON.parse(row.record as string), app = record?.lifecycle?.applications?.at(-1);
+            if (!app || row.mutation !== app.mutationId || row.issuance !== app.runtime?.issuanceKey)
+                throw Error("V3_PERSISTENCE_COLUMN_CONFLICT");
+            return record;
+        });
+        const durableRoot = path.resolve(path.dirname(file), ".."), directory = path.join(durableRoot, "tesla-experiments");
+        const config = { directory, durableRoot, site };
+        const journal = await readOfflineOperationHistory(config, readAdmission);
+        if (journal.status !== "available") return blocked(journal.status === "blocked" ? journal.code : "V3_PERSISTENCE_JOURNAL_MISSING");
+        const checked = validatePersistedOwnershipHistory(current, records, site, timeZone, journal.history);
+        if (checked.status !== "validated") return blocked(checked.code);
+        const again = await readOfflineOperationHistory(config, readAdmission);
+        if (representationKey(journal) !== representationKey(again)) return blocked("V3_PERSISTENCE_JOURNAL_CHANGED");
+        db.exec("COMMIT");
+        db.close(); db = undefined;
+        return { ...checked, status: "verified-storage" as const };
+    } catch (error) {
+        return blocked(error instanceof Error && /^V3_PERSISTENCE_[A-Z0-9_]+$/.test(error.message) ? error.message : code(error));
+    }
+    finally { try { db?.close(); } catch { /* No authority, including on close failure. */ } }
 }
 
 /** PRIVATE transaction primitive. Only the trusted three-input orchestration
