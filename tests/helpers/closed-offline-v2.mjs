@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
+import { randomUUID } from 'node:crypto';
 import { loadStore } from './ownership-sqlite-harness.mjs';
 import { fixture, hash, key } from './ownership-lifecycle.mjs';
 import { persistenceFixture, seedDatabase, seedJournal } from './ownership-persistence.mjs';
@@ -12,7 +13,9 @@ const scenarios = new Set(['valid', 'stale-tesla', 'stale-kraken', 'conflicting-
   'missing-coverage', 'missing-validity', 'approval-mismatch', 'payload-mismatch', 'generation-substitution',
   'validity-substitution', 'attribution-substitution', 'existing-ownership', 'prior-history', 'pending',
   'ambiguous', 'historical-latch', 'export-mismatch', 'buy-below-sell', 'interrupted-before-write',
-  'interrupted-after-write', 'ambiguous-write', 'mismatched-readback', 'forged-completion', 'stale-before-execution']);
+  'interrupted-after-write', 'ambiguous-write', 'mismatched-readback', 'forged-completion', 'stale-before-execution',
+  'receipt-copy', 'receipt-forged', 'receipt-substitution', 'receipt-replay', 'receipt-recovered',
+  'receipt-payload', 'receipt-generation', 'receipt-approval', 'receipt-validity', 'receipt-site']);
 const flags = Object.freeze({ mode: 'offline-test-only', authentication: 'fixtures-only', writeReady: false,
   executionReady: false, grantsAdmissionAuthority: false, grantsSuccessorAuthority: false,
   grantsRepeatAuthority: false, grantsRestorationAuthority: false, runtimeConfirmationVerified: false });
@@ -90,6 +93,9 @@ export async function closedOfflineV2(...args) {
     const simulatedAdmissions = new WeakMap();
     const findSimulatedAdmission = simulatedAdmissions.get.bind(simulatedAdmissions);
     const registerSimulatedAdmission = simulatedAdmissions.set.bind(simulatedAdmissions);
+    const offlineCompletions = new WeakMap();
+    const completionFor = offlineCompletions.get.bind(offlineCompletions);
+    const registerCompletion = offlineCompletions.set.bind(offlineCompletions);
     const preparation = load('src/lib/tesla-tariff/prepared-mutation-context.ts');
     const ports = {
       now: () => clock,
@@ -213,6 +219,32 @@ export async function closedOfflineV2(...args) {
         completedAt: new Date(Date.parse(submittedAt) + 2000).toISOString(), readback };
       clock = new Date(Date.parse(submittedAt) + 3000).toISOString();
     };
+    // Private C3 test binding only. A document hash is a binding, not membership.
+    // No token or issuer escapes this closure, and recovery never registers one.
+    const bindOfflineReceipt = (capability, evidence) => {
+      const bound = capability && completionFor(capability);
+      if (!bound || bound.used) throw Error('C3_LIVE_COMPLETION_REQUIRED');
+      bound.used = true; // All issuance outcomes consume before any other work.
+      if (closed || recovered || bound.admission !== liveAdmission
+        || !findSimulatedAdmission(liveAdmission)?.used || simulatedWrites !== 1
+        || key(evidence) !== bound.evidenceKey
+        || key(evidence.initial) !== key(pendingOperation.prepared.initial)
+        || key(evidence.completion.readback.observation.tariff) !== key(teslaState))
+        throw Error('C3_COMPLETION_BINDING_MISMATCH');
+      const body = { ...flags, version: 1, kind: 'offline-v2-confirmation-receipt',
+        provenance: 'closed-harness-simulation-not-runtime-authentication',
+        // An offline reference to this private issuance, not a capability. Even
+        // two identical fixture runs have distinct issuance/receipt identities.
+        offlineIssuanceId: bound.issuanceId,
+        preparedFingerprint: pendingOperation.prepared.fingerprint,
+        // Full validated E/J/D evidence retains exact approval, payload, site,
+        // generation, explicit validity, initial/completion and readback binding.
+        operation: structuredClone(evidence) };
+      const receiptKey = hash({ purpose: 'offline-c3-receipt-v1', ...body });
+      return freeze({ ...body, receiptKey,
+        issuanceKey: hash({ purpose: 'offline-c3-issuance-v1', receiptKey,
+          evidenceId: evidence.evidenceId, preparedFingerprint: body.preparedFingerprint }) });
+    };
     return Object.freeze({
       ...flags,
       async prepare(...args) {
@@ -237,7 +269,43 @@ export async function closedOfflineV2(...args) {
           .issueConfirmedSmartReceipt(liveAdmission, recorded.evidence.initial, recorded.evidence.completion);
         if (receipt.status !== 'rejected' || receipt.code !== 'JOURNAL_COMPLETION_NOT_BOUND')
           throw Error('C2_UNEXPECTED_PRODUCTION_AUTHORITY');
+        if (closed || recovered || history.history.records.length !== 1
+          || key(history.history.records[0]) !== key(checked.evidence))
+          throw Error('C3_LIVE_COMPLETION_REQUIRED');
+        const completionIdentity = Object.freeze(Object.create(null));
+        registerCompletion(completionIdentity, { admission: liveAdmission, evidenceKey: key(checked.evidence),
+          issuanceId: `offline-c3-${randomUUID()}`, used: false });
+        const candidate = structuredClone(checked.evidence);
+        const alterations = {
+          'receipt-substitution': () => { candidate.completion.readback.observationId = 'substituted'; },
+          'receipt-payload': () => { candidate.initial.intent.payloadJson = '{}'; },
+          'receipt-generation': () => { candidate.initial.intent.ownershipAfterGeneration = '00000000-0000-8000-8000-000000000000'; },
+          'receipt-approval': () => { candidate.initial.approval.approvedAt = '2026-10-24T12:00:02.030Z'; },
+          'receipt-validity': () => { candidate.initial.intent.ownershipAttribution.admission.validity.end = '2026-10-24T17:00:00Z'; },
+          'receipt-site': () => { candidate.initial.intent.energySiteId = '54321'; },
+        };
+        if (Object.hasOwn(alterations, scenario)) {
+          alterations[scenario]();
+          // Fully refresh the linked content identities. Binding rejection must
+          // come from the live completion membership/snapshot, not old checksums.
+          const rehash = (value, field) => { const body = { ...value }; delete body[field]; value[field] = hash(body); };
+          const intent = candidate.initial.intent;
+          intent.payloadFingerprint = hash(JSON.parse(intent.payloadJson));
+          rehash(intent.ownershipAttribution, 'attributionId');
+          candidate.initial.approval.fingerprint = key(intent);
+          rehash(candidate.initial.approval, 'approvalId');
+          rehash(candidate.initial, 'initialRecordId');
+          candidate.completion.initialRecordId = candidate.initial.initialRecordId;
+          rehash(candidate.completion, 'completionRecordId');
+          candidate.evidenceId = hash({ version: 2, initial: candidate.initial, completion: candidate.completion });
+        }
+        if (scenario === 'receipt-recovered') recovered = true;
+        const suppliedCompletion = scenario === 'receipt-copy' ? structuredClone(completionIdentity)
+          : scenario === 'receipt-forged' ? { version: 2, evidenceId: candidate.evidenceId, authenticated: true } : completionIdentity;
+        const offlineReceipt = bindOfflineReceipt(suppliedCompletion, candidate);
+        if (scenario === 'receipt-replay') bindOfflineReceipt(completionIdentity, candidate);
         return freeze({ ...flags, status: 'rehearsed-offline', furthestCompletedStep: 5,
+          offlineReceipt,
           evidenceProvenance: 'simulated-offline-tesla-state-not-authenticated', evidence: structuredClone(checked.evidence),
           receiptBoundary: { status: 'blocked', code: receipt.code, required: 'trusted-V2-runtime-completion-capability' },
           ownershipFinalisation: 'not-attempted', storage: await inspect() });

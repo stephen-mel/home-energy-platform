@@ -1,7 +1,7 @@
 # Stage 3B2-C2: closed offline first-apply rehearsal
 
 C2 extends the existing C1 test helper only. It is NOT runtime admission, a
-production executor, an authentication adapter, a completion issuer or an ownership
+production executor, an authentication adapter, a production completion issuer or an ownership
 writer. No application source, V1 operational path or September evidence changes.
 
 ## Sequence and private identity
@@ -45,7 +45,9 @@ records. The production registry correctly rejects it with
 `JOURNAL_COMPLETION_NOT_BOUND`: `JournalCompletionEvidence`,
 `journalCompletionForRecords()` and `issueConfirmedSmartReceipt()` currently support
 V1 completion, not trusted V2 completion. This is the first missing boundary.
-No V1 receipt is manufactured. Ownership finalisation is not attempted. The existing
+No V1 receipt is manufactured. C3 adds a separate private, explicitly offline
+receipt binding (see `tesla-closed-offline-receipt-stage-3b2c3.md`); this does not
+change the production rejection. Ownership finalisation is not attempted. The existing
 `ConfirmedSmartReceipt` / `finaliseConfirmedSmartOwnership()` paths also remain V1;
 a future versioned integration must explicitly preserve D validity and F1 lineage.
 No SQLite V3 ownership commit is attempted.
