@@ -11,7 +11,8 @@ import { persistenceFixture, seedDatabase, seedJournal } from './ownership-persi
 const scenarios = new Set(['valid', 'stale-tesla', 'stale-kraken', 'conflicting-observation', 'missing-observation',
   'missing-coverage', 'missing-validity', 'approval-mismatch', 'payload-mismatch', 'generation-substitution',
   'validity-substitution', 'attribution-substitution', 'existing-ownership', 'prior-history', 'pending',
-  'ambiguous', 'historical-latch', 'export-mismatch', 'buy-below-sell']);
+  'ambiguous', 'historical-latch', 'export-mismatch', 'buy-below-sell', 'interrupted-before-write',
+  'interrupted-after-write', 'ambiguous-write', 'mismatched-readback', 'forged-completion', 'stale-before-execution']);
 const flags = Object.freeze({ mode: 'offline-test-only', authentication: 'fixtures-only', writeReady: false,
   executionReady: false, grantsAdmissionAuthority: false, grantsSuccessorAuthority: false,
   grantsRepeatAuthority: false, grantsRestorationAuthority: false, runtimeConfirmationVerified: false });
@@ -81,6 +82,14 @@ export async function closedOfflineV2(...args) {
     const request = { kind: 'apply', operationId: i.operationId, mutationId: i.mutationId, energySiteId: '12345', timeZone: 'Europe/London',
       expectedOwnershipKey: hash({ status: 'missing' }), payloadJson, validFrom: i.validFrom, expiresAt: i.expiresAt, ownershipAttributionVersion: 1 };
     let clock = i.preparedAt, captureReads = 0, attributionReads = 0, closed = false;
+    let pendingOperation = null, liveAdmission = null, completionEvidence = null;
+    let rehearsalStarted = false, recovered = false, simulatedWrites = 0;
+    let teslaState = structuredClone(source.observation.tariff);
+    // TEST-ONLY identity membership. Never exported, persisted, registered in
+    // the production completion registry, or restored from a document.
+    const simulatedAdmissions = new WeakMap();
+    const findSimulatedAdmission = simulatedAdmissions.get.bind(simulatedAdmissions);
+    const registerSimulatedAdmission = simulatedAdmissions.set.bind(simulatedAdmissions);
     const preparation = load('src/lib/tesla-tariff/prepared-mutation-context.ts');
     const ports = {
       now: () => clock,
@@ -118,12 +127,25 @@ export async function closedOfflineV2(...args) {
         if (scenario === 'generation-substitution') bound.fingerprint = key({ ...intent, ownershipAfterGeneration: '00000000-0000-8000-8000-000000000000' });
         return { ...bound, approvalId: hash(bound) };
       },
-      readCompletionEvidence: async () => { throw Error('C1_COMPLETION_DISABLED'); },
+      readCompletionEvidence: async initial => {
+        if (!completionEvidence || !pendingOperation || !rehearsalStarted
+          || key(initial) !== key(pendingOperation.prepared.initial)
+          || key(completionEvidence.readback.observation.tariff) !== key(teslaState)
+          || simulatedWrites !== 1) throw Error('C2_COMPLETION_NOT_FROM_SIMULATION');
+        return structuredClone(completionEvidence);
+      },
     };
     const journalApi = load('src/lib/tesla-tariff/repeat-attempt-journal.ts');
     const config = { mode: 'offline', directory, durableRoot: root, site: '12345' };
     const journal = journalApi.offlineOperationJournal(config, ports);
     const ensureOpen = () => { if (closed) throw Error('C1_CLOSED'); };
+    const initialFile = path.join(directory, `site-12345-attempt-${i.mutationId}.jsonl`);
+    const activeFile = path.join(directory, 'site-12345-attempt.active');
+    const durableText = async file => {
+      const stat = await fs.lstat(file);
+      if (!stat.isFile() || stat.isSymbolicLink() || await fs.realpath(file) !== file) throw Error('C2_DURABLE_INITIAL_CHANGED');
+      return fs.readFile(file, 'utf8');
+    };
     const inspect = async () => {
       const names = (await fs.readdir(directory)).sort(), db = new DatabaseSync(file, { readOnly: true });
       let ownershipRows, applicationRows;
@@ -131,16 +153,16 @@ export async function closedOfflineV2(...args) {
         ownershipRows = db.prepare('SELECT count(*) AS n FROM ownership').get().n;
         applicationRows = db.prepare('SELECT count(*) AS n FROM applied').get().n;
       } finally { db.close(); }
-      return freeze({ ...flags, ownershipRows, applicationRows, databaseFingerprint: hash([...await fs.readFile(file)]),
+      return freeze({ ...flags, ownershipRows, applicationRows, simulatedWrites,
+        simulatedTariffFingerprint: hash(teslaState), databaseFingerprint: hash([...await fs.readFile(file)]),
         files: await Promise.all(names.map(async name => ({ name, fingerprint: hash([...await fs.readFile(path.join(directory, name))]) }))) });
     };
-    return Object.freeze({
-      ...flags,
-      async prepare(...args) {
-        noArguments(args); ensureOpen();
+    const prepareFirstApply = async () => {
+        ensureOpen();
         const ownership = store.readOwnership(file, '12345'), history = await journal.readHistory();
         if (ownership.status !== 'missing') throw Error('C1_FIRST_APPLY_OWNERSHIP_NOT_EMPTY');
         if (history.status !== 'empty') throw Error('C1_FIRST_APPLY_HISTORY_NOT_EMPTY');
+        if (recovered) throw Error('C2_LIVE_ADMISSION_REQUIRED');
         // Preserve existing export validation and BUY_BELOW_SELL diagnostics.
         const exportPolicy = load('src/lib/tesla-tariff/fixed-export-policy.ts').validateFixedExportPolicy({
           observation: source.observation, assessedAt: clock,
@@ -150,19 +172,87 @@ export async function closedOfflineV2(...args) {
         const dryRun = load('src/lib/tesla-tariff/dry-run.ts').dryRunTeslaTariff(economic({ ...source.observation, tariff: proposed }, admission.domain).signal, { timeZone: 'Europe/London' });
         if (dryRun.diagnostics.some(d => d.code === 'BUY_BELOW_SELL')) throw Error('BUY_BELOW_SELL');
         // recordInitial internally invokes preparation, attribution building and
-        // fresh rechecks under the existing exclusive durable claim. Deliberately
-        // discard the completion handle; return only detached documentary data.
+        // fresh rechecks under the existing exclusive durable claim. Keep the
+        // handle PRIVATE for C2; prepare still returns only documentary data.
         const pending = await journal.recordInitial(structuredClone(request));
+        const initialText = await durableText(initialFile), activeText = await durableText(activeFile);
+        if (initialText !== JSON.stringify(pending.prepared.initial) + '\n') throw Error('C2_DURABLE_INITIAL_CHANGED');
+        const capability = Object.freeze(Object.create(null));
+        registerSimulatedAdmission(capability, { preparedKey: key(pending.prepared), initialText, activeText, used: false });
+        pendingOperation = pending; liveAdmission = capability;
         return freeze({ ...flags, status: 'prepared-offline', prepared: structuredClone(pending.prepared),
           baselineFingerprint: hash(source.observation.tariff), approvedValidity: structuredClone(policy) });
+    };
+    const simulateOnce = async capability => {
+      const admitted = capability && findSimulatedAdmission(capability);
+      if (!admitted || admitted.used || !pendingOperation || key(pendingOperation.prepared) !== admitted.preparedKey)
+        throw Error('C2_LIVE_ADMISSION_REQUIRED');
+      admitted.used = true; // Consume before any await, including a failed recheck.
+      if (closed || recovered) throw Error('C2_LIVE_ADMISSION_REQUIRED');
+      if (await durableText(initialFile) !== admitted.initialText || await durableText(activeFile) !== admitted.activeText)
+        throw Error('C2_DURABLE_INITIAL_CHANGED');
+      if (scenario === 'stale-before-execution') clock = '2026-10-24T12:20:00Z';
+      await preparation.recheckPreparedOperation(pendingOperation.prepared, ports);
+      if (closed || recovered) throw Error('C2_LIVE_ADMISSION_REQUIRED');
+      if (scenario === 'interrupted-before-write') throw Error('C2_INTERRUPTED_BEFORE_WRITE');
+      const submittedAt = new Date(Date.parse(clock) + 1000).toISOString();
+      // This is only private in-memory Tesla state, NEVER a transport/POST.
+      if (scenario !== 'forged-completion') {
+        teslaState = structuredClone(JSON.parse(pendingOperation.prepared.initial.intent.payloadJson).tou_settings.tariff_content_v2);
+        simulatedWrites++;
+      }
+      if (scenario === 'ambiguous-write') throw Error('C2_SIMULATED_WRITE_AMBIGUOUS');
+      if (scenario === 'interrupted-after-write') throw Error('C2_INTERRUPTED_AFTER_WRITE');
+      if (scenario === 'mismatched-readback') teslaState.name = 'Simulated unexpected external change';
+      const readback = { observationId: 'simulated-c2-readback-not-tesla-authentication', observation: {
+        ...structuredClone(source.observation), source: { ...source.observation.source,
+          observedAt: new Date(Date.parse(submittedAt) + 1000).toISOString() },
+        tariff: structuredClone(scenario === 'forged-completion' ? proposed : teslaState),
+      } };
+      completionEvidence = { apiWrite: { status: 'accepted', httpStatus: 200 }, submittedAt,
+        completedAt: new Date(Date.parse(submittedAt) + 2000).toISOString(), readback };
+      clock = new Date(Date.parse(submittedAt) + 3000).toISOString();
+    };
+    return Object.freeze({
+      ...flags,
+      async prepare(...args) {
+        noArguments(args); ensureOpen(); return prepareFirstApply();
+      },
+      async rehearse(...args) {
+        noArguments(args); ensureOpen();
+        if (rehearsalStarted || recovered) throw Error('C2_REHEARSAL_ALREADY_CONSUMED');
+        rehearsalStarted = true; // All outcomes consume this test-only attempt.
+        if (!pendingOperation) await prepareFirstApply();
+        await simulateOnce(liveAdmission);
+        const recorded = await pendingOperation.recordCompletion();
+        completionEvidence = null;
+        const history = await journal.readHistory();
+        if (history.status !== 'available') throw Error('C2_DURABLE_CONFIRMATION_UNAVAILABLE');
+        const checked = load('src/lib/tesla-tariff/confirmed-operation-evidence.ts')
+          .validateConfirmedOperationEvidence(recorded.evidence, history.history.contexts.at(-1));
+        if (checked.status !== 'validated') throw Error(checked.code);
+        // STOP at the existing private V1 runtime completion/receipt boundary.
+        // This private C2 simulation identity must NOT satisfy that registry.
+        const receipt = load('src/lib/tesla-tariff/confirmed-smart-receipt-issuer.ts')
+          .issueConfirmedSmartReceipt(liveAdmission, recorded.evidence.initial, recorded.evidence.completion);
+        if (receipt.status !== 'rejected' || receipt.code !== 'JOURNAL_COMPLETION_NOT_BOUND')
+          throw Error('C2_UNEXPECTED_PRODUCTION_AUTHORITY');
+        return freeze({ ...flags, status: 'rehearsed-offline', furthestCompletedStep: 5,
+          evidenceProvenance: 'simulated-offline-tesla-state-not-authenticated', evidence: structuredClone(checked.evidence),
+          receiptBoundary: { status: 'blocked', code: receipt.code, required: 'trusted-V2-runtime-completion-capability' },
+          ownershipFinalisation: 'not-attempted', storage: await inspect() });
       },
       async inspect(...args) { noArguments(args); ensureOpen(); return inspect(); },
       async reopen(...args) {
         noArguments(args); ensureOpen();
+        recovered = true; liveAdmission = null; completionEvidence = null;
         const reopened = loadStore().load('src/lib/tesla-tariff/repeat-attempt-journal.ts').offlineOperationJournal(config, ports);
         return freeze({ ...flags, history: structuredClone(await reopened.readHistory()), storage: await inspect() });
       },
-      async close(...args) { noArguments(args); if (!closed) { closed = true; await fs.rm(root, { recursive: true, force: true }); } },
+      async close(...args) { noArguments(args); if (!closed) {
+        closed = true; liveAdmission = null; completionEvidence = null;
+        await fs.rm(root, { recursive: true, force: true });
+      } },
     });
   } catch (error) { await fs.rm(root, { recursive: true, force: true }); throw error; }
 }

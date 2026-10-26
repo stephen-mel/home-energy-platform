@@ -1,7 +1,7 @@
 # Stage 3B2-C1: closed offline V2 fixture composition
 
 This is a **test-only integration foundation**, located entirely under `tests/`.
-It installs no production composition, authentication provider, admission registry,
+It installs no production composition, authentication provider, production admission registry,
 executor, completion issuer, ownership finaliser or SQLite ownership writer.
 No runtime trust anchor is established by C1.
 
@@ -13,7 +13,8 @@ fixed internal fixture or fault. It accepts no provider callbacks, paths, docume
 approval data, policy data, authentication switches or hooks. Methods accept no
 arguments. No acquisition, approval, attribution or persistence ports are returned.
 
-The returned methods are `prepare`, `inspect`, `reopen` and `close`. Every result
+The C1 methods are `prepare`, `inspect`, `reopen` and `close`. C2 adds a
+separately tested `rehearse` method; see `tesla-closed-offline-rehearsal-stage-3b2c2.md`. Every result
 is explicitly marked `offline-test-only` / `fixtures-only`, with authority flags
 false. Prepared documentary snapshots are detached and recursively frozen. They
 are not registered as runtime capabilities. Closing deletes only the harness's
@@ -35,9 +36,10 @@ The journal uses existing durable initial-record and exclusive-claim mechanics.
 Preparation requires missing ownership and entirely empty site history. Any prior
 valid V2 journal, pending/ambiguous claim, legacy latch or ownership row blocks it.
 
-The private completion handle is deliberately discarded. No completion recording,
-Tesla write, receipt issuance, generation reservation or ownership commit occurs.
-Successful preparation leaves the initial journal and active marker pending. A
+Preparation exposes no completion handle. C2 retains it privately for its test-only
+rehearsal; C1 `prepare()` alone performs no completion recording, Tesla write, receipt
+issuance, generation reservation or ownership commit. Successful preparation leaves
+the initial journal and active marker pending. A
 freshly loaded journal reader sees that blocking marker; it cannot resume execution
 or recover authority. Repeating or concurrently racing preparation cannot create
 two successful claims. SQLite rows and database bytes remain unchanged by preparation.
