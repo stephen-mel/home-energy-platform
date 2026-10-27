@@ -15,7 +15,9 @@ const scenarios = new Set(['valid', 'stale-tesla', 'stale-kraken', 'conflicting-
   'ambiguous', 'historical-latch', 'export-mismatch', 'buy-below-sell', 'interrupted-before-write',
   'interrupted-after-write', 'ambiguous-write', 'mismatched-readback', 'forged-completion', 'stale-before-execution',
   'receipt-copy', 'receipt-forged', 'receipt-substitution', 'receipt-replay', 'receipt-recovered',
-  'receipt-payload', 'receipt-generation', 'receipt-approval', 'receipt-validity', 'receipt-site']);
+  'receipt-payload', 'receipt-generation', 'receipt-approval', 'receipt-validity', 'receipt-site',
+  'projection-copy', 'projection-payload', 'projection-generation', 'projection-validity',
+  'projection-original', 'projection-terminal', 'projection-conflict', 'projection-replay', 'projection-validity-beyond-domain']);
 const flags = Object.freeze({ mode: 'offline-test-only', authentication: 'fixtures-only', writeReady: false,
   executionReady: false, grantsAdmissionAuthority: false, grantsSuccessorAuthority: false,
   grantsRepeatAuthority: false, grantsRestorationAuthority: false, runtimeConfirmationVerified: false });
@@ -56,6 +58,7 @@ export async function closedOfflineV2(...args) {
     const base = fixture('apply').context.operations[0], i = base.evidence.initial.intent;
     const source = structuredClone(base.context.ownershipAttributions[0].capture);
     const admission = structuredClone(i.ownershipAttribution.admission);
+    if (scenario === 'projection-validity-beyond-domain') admission.validity.end = '2026-10-24T17:00:00Z';
     // An independently stated, fixed test policy, preserved from the fixture;
     // never calculated from dispatch length, comparison domain or approval TTL.
     const policy = structuredClone(admission.validity);
@@ -87,6 +90,7 @@ export async function closedOfflineV2(...args) {
     let clock = i.preparedAt, captureReads = 0, attributionReads = 0, closed = false;
     let pendingOperation = null, liveAdmission = null, completionEvidence = null;
     let rehearsalStarted = false, recovered = false, simulatedWrites = 0;
+    let liveCompletion = null, issuedReceipt = null, projectionStarted = false;
     let teslaState = structuredClone(source.observation.tariff);
     // TEST-ONLY identity membership. Never exported, persisted, registered in
     // the production completion registry, or restored from a document.
@@ -241,17 +245,14 @@ export async function closedOfflineV2(...args) {
         // generation, explicit validity, initial/completion and readback binding.
         operation: structuredClone(evidence) };
       const receiptKey = hash({ purpose: 'offline-c3-receipt-v1', ...body });
-      return freeze({ ...body, receiptKey,
+      const receipt = freeze({ ...body, receiptKey,
         issuanceKey: hash({ purpose: 'offline-c3-issuance-v1', receiptKey,
           evidenceId: evidence.evidenceId, preparedFingerprint: body.preparedFingerprint }) });
+      bound.receipt = receipt; bound.receiptKey = key(receipt); bound.projected = false;
+      return receipt;
     };
-    return Object.freeze({
-      ...flags,
-      async prepare(...args) {
-        noArguments(args); ensureOpen(); return prepareFirstApply();
-      },
-      async rehearse(...args) {
-        noArguments(args); ensureOpen();
+    const rehearseOnce = async () => {
+        ensureOpen();
         if (rehearsalStarted || recovered) throw Error('C2_REHEARSAL_ALREADY_CONSUMED');
         rehearsalStarted = true; // All outcomes consume this test-only attempt.
         if (!pendingOperation) await prepareFirstApply();
@@ -304,21 +305,110 @@ export async function closedOfflineV2(...args) {
           : scenario === 'receipt-forged' ? { version: 2, evidenceId: candidate.evidenceId, authenticated: true } : completionIdentity;
         const offlineReceipt = bindOfflineReceipt(suppliedCompletion, candidate);
         if (scenario === 'receipt-replay') bindOfflineReceipt(completionIdentity, candidate);
+        const storage = await inspect();
+        if (closed || recovered) throw Error('C3_LIVE_COMPLETION_REQUIRED');
+        liveCompletion = completionIdentity; issuedReceipt = offlineReceipt;
         return freeze({ ...flags, status: 'rehearsed-offline', furthestCompletedStep: 5,
           offlineReceipt,
           evidenceProvenance: 'simulated-offline-tesla-state-not-authenticated', evidence: structuredClone(checked.evidence),
           receiptBoundary: { status: 'blocked', code: receipt.code, required: 'trusted-V2-runtime-completion-capability' },
-          ownershipFinalisation: 'not-attempted', storage: await inspect() });
+          ownershipFinalisation: 'not-attempted', storage });
+    };
+    // Private C4 glue around the EXISTING pure ownership kernel. Exact object
+    // identity is required; no caller JSON, registration or production finaliser.
+    const projectIssuedReceipt = async (capability, receipt) => {
+      const bound = capability && completionFor(capability);
+      if (!bound || !bound.used || bound.projected || bound.receipt !== receipt)
+        throw Error('C4_ISSUED_RECEIPT_REQUIRED');
+      bound.projected = true; // Failed projection attempts also consume once.
+      if (closed || recovered || bound.admission !== liveAdmission || key(receipt) !== bound.receiptKey
+        || key(receipt.operation) !== bound.evidenceKey || simulatedWrites !== 1)
+        throw Error('C4_RECEIPT_BINDING_MISMATCH');
+      const history = await journal.readHistory();
+      if (closed || recovered || history.status !== 'available' || history.history.records.length !== 1
+        || key(history.history.records[0]) !== bound.evidenceKey) throw Error('C4_DURABLE_CONFIRMATION_REQUIRED');
+      const e = receipt.operation, intent = e.initial.intent, completion = e.completion;
+      const ownership = store.readOwnership(file, intent.energySiteId);
+      if (ownership.status !== 'missing' || intent.kind !== 'apply' || intent.ownershipBefore !== null
+        || intent.predecessor !== null || intent.origin !== null
+        || !preparation.operationCommitPreconditionMatches(pendingOperation.prepared, ownership, intent.ownershipAfterGeneration))
+        throw Error('C4_FIRST_APPLY_OWNERSHIP_CONFLICT');
+      const context = history.history.contexts[0];
+      const checked = load('src/lib/tesla-tariff/confirmed-operation-evidence.ts').validateConfirmedOperationEvidence(e, context);
+      if (checked.status !== 'validated') throw Error(checked.code);
+      const retained = structuredClone(context.retainedOriginal);
+      const retention = load('src/lib/tesla-tariff/retained-original.ts');
+      const validity = structuredClone(intent.ownershipAttribution.admission.validity);
+      if (!retention.validRetainedOriginal(retained) || key(validity) !== key(policy)
+        || key(retained.original) !== key(intent.original) || retained.originalFingerprint !== intent.originalFingerprint
+        || retained.origin.initialRecordId !== e.initial.initialRecordId || retained.origin.classifiedRecordId !== completion.completionRecordId
+        || retained.origin.receiptKey !== e.evidenceId || retained.origin.issuanceKey !== intent.ownershipAttribution.originIssuanceReference
+        || retained.currentGeneration !== intent.ownershipAfterGeneration || retained.latestReadback.mutationId !== intent.mutationId
+        || retained.latestReadback.receiptKey !== e.evidenceId || retained.latestReadback.fingerprint !== completion.finalTariffFingerprint)
+        throw Error('C4_ORIGINAL_OR_VALIDITY_CONFLICT');
+      const intervals = load('src/lib/tesla-tariff/ownership-attribution.ts').projectAttributedIntervals(intent, completion.submittedAt);
+      const ledger = { version: 1, energySiteId: intent.energySiteId, timeZone: intent.timeZone,
+        createdAt: completion.completedAt, updatedAt: completion.completedAt, validUntil: validity.end,
+        basis: 'confirmed-write-readback', baselineFingerprint: retained.originalFingerprint,
+        readbackFingerprint: completion.finalTariffFingerprint, proposalFingerprint: hash(intent),
+        smartEvidenceFingerprint: hash(pendingOperation.prepared.capture.kraken), intervals };
+      if (!load('src/lib/tesla-tariff/ownership-evidence.ts').validOwnership(ledger)
+        || intervals.some(w => w.restoreBaselineFingerprint !== retained.originalFingerprint)) throw Error('C4_INVALID_OWNERSHIP_PROJECTION');
+      // F1's structural original/active-obligation rules apply. Its complete
+      // lifecycle document needs runtime identities and committed history that
+      // do not exist here; never fabricate those or relabel offline references.
+      const body = { ...flags, version: 2, kind: 'offline-v2-ownership-projection',
+        provenance: 'private-offline-receipt-not-committed-ownership', state: 'active', restorationObligation: 'required',
+        operationId: intent.operationId, mutationId: intent.mutationId, energySiteId: intent.energySiteId, timeZone: intent.timeZone,
+        generation: { expectedBefore: null, expectedAfter: intent.ownershipAfterGeneration },
+        offlineReceipt: { receiptKey: receipt.receiptKey, issuanceKey: receipt.issuanceKey, offlineIssuanceId: receipt.offlineIssuanceId },
+        journal: { version: 2, initialRecordId: e.initial.initialRecordId, completionRecordId: completion.completionRecordId, evidenceId: e.evidenceId },
+        preparedFingerprint: receipt.preparedFingerprint, payloadFingerprint: intent.payloadFingerprint,
+        approvalId: e.initial.approval.approvalId, attributionId: intent.ownershipAttribution.attributionId,
+        comparisonDomain: structuredClone(intent.ownershipAttribution.admission.domain), approvedValidity: validity,
+        retainedOriginal: retained, retainedOriginKey: retention.retainedOriginKey(retained),
+        comparisonBaseline: structuredClone(intent.before), comparisonBaselineFingerprint: hash(intent.before.observation),
+        ownershipEvidence: ledger };
+      return freeze({ ...body, projectionKey: hash({ purpose: 'offline-c4-ownership-projection-v2', ...body }) });
+    };
+    return Object.freeze({
+      ...flags,
+      async prepare(...args) { noArguments(args); ensureOpen(); return prepareFirstApply(); },
+      async rehearse(...args) { noArguments(args); ensureOpen(); return rehearseOnce(); },
+      async projectOwnership(...args) {
+        noArguments(args); ensureOpen();
+        if (projectionStarted || recovered) throw Error('C4_PROJECTION_ALREADY_CONSUMED');
+        projectionStarted = true;
+        if (!issuedReceipt) await rehearseOnce();
+        let candidate = issuedReceipt;
+        if (['projection-copy','projection-payload','projection-generation','projection-validity','projection-original',
+          'projection-terminal','projection-conflict'].includes(scenario)) {
+          candidate = structuredClone(issuedReceipt);
+          const intent = candidate.operation.initial.intent;
+          if (scenario === 'projection-payload') intent.payloadJson = '{}';
+          if (scenario === 'projection-generation') intent.ownershipAfterGeneration = '00000000-0000-8000-8000-000000000000';
+          if (scenario === 'projection-validity') intent.ownershipAttribution.admission.validity.end = 'not-a-date';
+          if (scenario === 'projection-original') intent.original.tariff.name = 'Substituted original';
+          if (scenario === 'projection-terminal') intent.ownershipBefore = fixture('restored').value;
+          if (scenario === 'projection-conflict') intent.ownershipBefore = fixture('apply').value.historicalOwnership;
+          const { receiptKey: _r, issuanceKey: _i, ...body } = candidate; void _r; void _i;
+          candidate.receiptKey = hash({ purpose: 'offline-c3-receipt-v1', ...body });
+          candidate.issuanceKey = hash({ purpose: 'offline-c3-issuance-v1', receiptKey: candidate.receiptKey,
+            evidenceId: candidate.operation.evidenceId, preparedFingerprint: candidate.preparedFingerprint });
+        }
+        const projection = await projectIssuedReceipt(liveCompletion, candidate);
+        if (scenario === 'projection-replay') await projectIssuedReceipt(liveCompletion, candidate);
+        return freeze({ ...flags, status: 'ownership-projected-offline', projection, offlineReceipt: issuedReceipt, storage: await inspect() });
       },
       async inspect(...args) { noArguments(args); ensureOpen(); return inspect(); },
       async reopen(...args) {
         noArguments(args); ensureOpen();
-        recovered = true; liveAdmission = null; completionEvidence = null;
+        recovered = true; liveAdmission = null; completionEvidence = null; liveCompletion = null; issuedReceipt = null;
         const reopened = loadStore().load('src/lib/tesla-tariff/repeat-attempt-journal.ts').offlineOperationJournal(config, ports);
         return freeze({ ...flags, history: structuredClone(await reopened.readHistory()), storage: await inspect() });
       },
       async close(...args) { noArguments(args); if (!closed) {
-        closed = true; liveAdmission = null; completionEvidence = null;
+        closed = true; liveAdmission = null; completionEvidence = null; liveCompletion = null; issuedReceipt = null;
         await fs.rm(root, { recursive: true, force: true });
       } },
     });

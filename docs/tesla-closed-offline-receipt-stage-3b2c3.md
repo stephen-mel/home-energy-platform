@@ -69,12 +69,14 @@ cannot currently consume this receipt: `ConfirmedSmartReceipt`,
 support the V1 proposal/prior/execution contract. F1 validates supplied lifecycle
 documents but does not derive ownership from this offline receipt.
 
-The next missing offline interface is an explicitly versioned test-only finalisation
+At the C3 checkpoint, the next missing offline interface was a versioned test-only finalisation
 consumer for this representation and independently checked E/J/D context, preserving
 explicit D validity and immutable original lineage. C3 does not implement that
 consumer, cast this wrapper to V1, create runtime identity references or commit V3
-ownership. Production V2 confirmation/receipt authority remains a separate missing
-trusted-runtime integration.
+ownership. C4 now adds a closed, non-authoritative first-apply projection consumer;
+see `tesla-closed-offline-ownership-stage-3b2c4.md`. It does not change the V1 finaliser
+or supply F1 runtime references or committed history. Production V2 confirmation/receipt
+authority remains a separate missing trusted-runtime integration.
 
 ## Validation scope
 
