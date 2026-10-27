@@ -318,7 +318,20 @@ type CommitInput = { site: string; expected: Precondition; evidence: ManagedImpo
     mutationId: string; issuanceKey: string; receiptKey: string; retention?: RetentionInput };
 type CommitResult = { status: "persisted" | "already-persisted"; snapshot: OwnershipSnapshot }
     | { status: "conflict" | "store-failed" | "indeterminate"; code: string };
+// Generation policy is private transaction input, never an authority token or
+// a field accepted by the public guarded writer. No V3 caller is connected.
+type ExactGeneration = { version: 1; expectedBefore: string | null; expectedAfter: string };
 function commitOwnership(databasePath: string, input: CommitInput): CommitResult {
+    return ownershipTransaction(databasePath, input);
+}
+// Deliberately disconnected until a guarded authority-bearing caller exists.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function commitOwnershipExact(databasePath: string, input: CommitInput, generation: ExactGeneration): CommitResult {
+    if (!generation || typeof generation !== "object")
+        return { status: "conflict", code: "OWNERSHIP_GENERATION_CHANGED" };
+    return ownershipTransaction(databasePath, input, generation);
+}
+function ownershipTransaction(databasePath: string, input: CommitInput, exact?: ExactGeneration): CommitResult {
     let db: DatabaseSync | undefined, inTransaction = false, commitAttempted = false;
     try {
         guard();
@@ -327,6 +340,12 @@ function commitOwnership(databasePath: string, input: CommitInput): CommitResult
             || !digest(issuanceKey) || !digest(receiptKey) || !validOwnership(evidence) || evidence.energySiteId !== site)
             throw Error("OWNERSHIP_INPUT_INVALID");
         const prior = identity(site, expected), file = path.resolve(databasePath);
+        const approved = exact === undefined ? undefined : structuredClone(exact);
+        if (approved && (Object.keys(approved).sort().join() !== "expectedAfter,expectedBefore,version"
+            || approved.version !== 1 || typeof approved.expectedAfter !== "string"
+            || !/^[a-f0-9-]{36}$/.test(approved.expectedAfter)
+            || approved.expectedBefore !== (expected.status === "missing" ? null : expected.snapshot.generation)
+            || approved.expectedAfter === approved.expectedBefore)) throw Error("OWNERSHIP_GENERATION_CHANGED");
         if (expected.status === "available" && ((expected.snapshot.version === 3) !== !!retention))
             throw Error("OWNERSHIP_RETENTION_VERSION_CONFLICT");
         if (retention && Object.keys(retention).sort().join() !== "origin,original") throw Error("OWNERSHIP_RETENTION_INVALID");
@@ -337,6 +356,12 @@ function commitOwnership(databasePath: string, input: CommitInput): CommitResult
         const { current, applications } = state(db, site);
         const applied = applications.find(a => a.mutationId === mutationId);
         let snapshot: OwnershipSnapshot, status: "persisted" | "already-persisted";
+        if (approved) {
+            if (representationKey(current) !== representationKey(expected)) throw Error("OWNERSHIP_GENERATION_CHANGED");
+            if (applied || applications.some(a => a.result.status === "available"
+                && a.result.generation === approved.expectedAfter || a.receiptKey === receiptKey))
+                throw Error("OWNERSHIP_MUTATION_CONFLICT");
+        }
         if (applied) {
             if (applied.issuanceKey !== issuanceKey || applied.receiptKey !== receiptKey
                 || applied.priorHistoryDigest !== priorHistoryDigest
@@ -354,7 +379,7 @@ function commitOwnership(databasePath: string, input: CommitInput): CommitResult
             if (applications.some(a => a.issuanceKey === issuanceKey || retention && a.receiptKey === receiptKey))
                 throw Error("OWNERSHIP_MUTATION_CONFLICT");
             if (representationKey(current) !== representationKey(expected)) throw Error("OWNERSHIP_GENERATION_CHANGED");
-            const generation = randomUUID();
+            const generation = approved ? approved.expectedAfter : randomUUID();
             let lifecycle: RetainedOriginal | undefined;
             if (retention) {
                 lifecycle = { version: 1, original: retention.original, origin: retention.origin,

@@ -23,7 +23,7 @@ export function loadStore(hooks = {}, version = process.versions.node) {
   function load(file) {
     file=path.resolve(file); if(cache.has(file))return cache.get(file);
     let source=fs.readFileSync(file,'utf8');
-    if(file.endsWith('/ownership-sqlite.ts'))source+='\nexport { commitOwnership as testCommit };';
+    if(file.endsWith('/ownership-sqlite.ts'))source+='\nexport { commitOwnership as testCommit, commitOwnershipExact as testCommitExact };';
     const exports={}; cache.set(file,exports);
     vm.runInNewContext(ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,
       {exports,Error,structuredClone,Date,process:{versions:{node:version},cwd:()=>hooks.cwd ?? process.cwd(),getBuiltinModule(name){
