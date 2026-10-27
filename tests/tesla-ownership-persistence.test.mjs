@@ -22,11 +22,11 @@ async function sandbox(fn, state = 'restored') {
   try { await fn({ root, file, directory, f, admission, store, read }); } finally { await fs.rm(root, { recursive: true, force: true }); }
 }
 for (const state of ['apply', 'update', 'restored']) test(`V3 ${state} schema validates exact generations and documentary identities`, () => {
-  const f = persistenceFixture(state), result = check(f); assert.equal(result.status, 'validated', result.code); noAuthority(result);
+  const f = persistenceFixture(state), result = check(f); assert.equal(result.status, 'consistent-only', result.code); noAuthority(result);
   assert.equal(key(result.current), key(f.current));
 });
 test('terminal restore preserves expired historical validity and immutable original exactly', () => {
-  const f = persistenceFixture(), result = check(f); assert.equal(result.status, 'validated', result.code);
+  const f = persistenceFixture(), result = check(f); assert.equal(result.status, 'consistent-only', result.code);
   const before = f.records[1].lifecycle.historicalOwnership, terminal = result.current.lifecycle;
   assert.equal(key(terminal.historicalOwnership), key(before));
   assert.ok(Date.parse(terminal.restoration.readback.observedAt) > Date.parse(before.evidence.validUntil));
@@ -46,9 +46,9 @@ for (const [name, change] of [
 ]) test(`fails closed: ${name}`, () => { const f = persistenceFixture(); change(f); const result = check(f); assert.equal(result.status, 'rejected'); noAuthority(result); });
 test('real SQLite close/reopen verifies both tables and V2 physical journals without writes', () => sandbox(async f => {
   const before = await fs.readFile(f.file), result = await f.read();
-  assert.equal(result.status, 'verified-storage', result.code); noAuthority(result);
+  assert.equal(result.status, 'consistent-storage', result.code); noAuthority(result);
   assert.equal(key(result.current), key(f.f.current)); assert.deepEqual(await fs.readFile(f.file), before);
-  assert.equal((await f.read()).status, 'verified-storage');
+  assert.equal((await f.read()).status, 'consistent-storage');
   assert.equal(f.store.readOwnership(f.file, '12345').status, 'invalid', 'Legacy reader cannot promote the new representation');
 }));
 test('separate-process verified readback remains documentary only', () => sandbox(async f => {
@@ -59,7 +59,7 @@ test('separate-process verified readback remains documentary only', () => sandbo
     console.log(JSON.stringify(r));`;
   const admissions = f.f.journal.contexts.map(c => c.ownershipAttributions.at(-1).admission);
   const result = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', script, f.file, JSON.stringify(admissions)], { encoding: 'utf8' }));
-  assert.equal(result.status, 'verified-storage', result.code); noAuthority(result);
+  assert.equal(result.status, 'consistent-storage', result.code); noAuthority(result);
 }));
 for (const [name, change] of [
   ['missing completion', f => fs.unlink(path.join(f.directory, 'site-12345-attempt-mutation-3.complete'))],
@@ -80,7 +80,7 @@ test('read-only failure rolls back/closes SQLite and does not change bytes', () 
   const store = loadStore({ beforeStatement(sql) { if (sql.startsWith('SELECT mutation')) throw Error('INJECTED_READ_FAILURE'); } });
   assert.equal((await store.readPersistedOwnershipLifecycle(f.file, '12345', 'Europe/London', f.admission)).status, 'blocked');
   assert.deepEqual(await fs.readFile(f.file), before);
-  assert.equal((await f.read()).status, 'verified-storage');
+  assert.equal((await f.read()).status, 'consistent-storage');
 }));
 test('existing SQLite transaction exclusion/rollback protects records; no V3 CAS writer is exposed', () => sandbox(async f => {
   const before = await fs.readFile(f.file), first = new DatabaseSync(f.file), second = new DatabaseSync(f.file, { timeout: 0 });
@@ -89,7 +89,7 @@ test('existing SQLite transaction exclusion/rollback protects records; no V3 CAS
   first.prepare('UPDATE ownership SET snapshot=? WHERE site=?').run('{}', '12345');
   first.exec('ROLLBACK'); first.close(); second.close();
   assert.deepEqual(await fs.readFile(f.file), before);
-  assert.equal((await f.read()).status, 'verified-storage');
+  assert.equal((await f.read()).status, 'consistent-storage');
   assert.equal(typeof f.store.commitOwnership, 'undefined');
   assert.equal(typeof f.store.persistOwnershipLifecycle, 'undefined');
 }));
@@ -103,7 +103,7 @@ test('legacy V2 remains readable without new authority', async () => {
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 test('validated and recovered documents cannot mint runtime completion or receipts', () => sandbox(async f => {
-  const result = await f.read(); assert.equal(result.status, 'verified-storage', result.code);
+  const result = await f.read(); assert.equal(result.status, 'consistent-storage', result.code);
   const issuer = f.store.load('src/lib/tesla-tariff/confirmed-smart-receipt-issuer.ts');
   const registry = f.store.load('src/lib/tesla-tariff/supervised-journal.ts');
   const last = f.f.journal.records.at(-1);

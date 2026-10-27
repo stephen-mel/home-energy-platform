@@ -262,7 +262,7 @@ export function readOwnership(databasePath: string, site: string): OwnershipRead
 
 /** F4a storage-consistency readback ONLY. There is intentionally no V3 write
  * boundary before F2 provides an internally verified confirmation capability.
- * A verified-storage result is not authenticated completion, admission or a
+ * A consistent-storage result is not authenticated completion, admission or a
  * trusted predecessor capability. Runtime reference provenance is unverified.
  * Both tables are read in one read-only SQLite transaction; matching V2 journal
  * history is read twice to reject changes during the observation. No files,
@@ -300,12 +300,12 @@ export async function readPersistedOwnershipLifecycle(databasePath: string, site
         const journal = await readOfflineOperationHistory(config, readAdmission);
         if (journal.status !== "available") return blocked(journal.status === "blocked" ? journal.code : "V3_PERSISTENCE_JOURNAL_MISSING");
         const checked = validatePersistedOwnershipHistory(current, records, site, timeZone, journal.history);
-        if (checked.status !== "validated") return blocked(checked.code);
+        if (checked.status !== "consistent-only") return blocked("code" in checked ? checked.code : "V3_PERSISTENCE_RUNTIME_PROVENANCE_UNAVAILABLE");
         const again = await readOfflineOperationHistory(config, readAdmission);
         if (representationKey(journal) !== representationKey(again)) return blocked("V3_PERSISTENCE_JOURNAL_CHANGED");
         db.exec("COMMIT");
         db.close(); db = undefined;
-        return { ...checked, status: "verified-storage" as const };
+        return { ...checked, status: "consistent-storage" as const };
     } catch (error) {
         return blocked(error instanceof Error && /^V3_PERSISTENCE_[A-Z0-9_]+$/.test(error.message) ? error.message : code(error));
     }

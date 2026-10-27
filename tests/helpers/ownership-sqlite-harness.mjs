@@ -24,6 +24,12 @@ export function loadStore(hooks = {}, version = process.versions.node) {
     file=path.resolve(file); if(cache.has(file))return cache.get(file);
     let source=fs.readFileSync(file,'utf8');
     if(file.endsWith('/ownership-sqlite.ts'))source+='\nexport { commitOwnership as testCommit, commitOwnershipExact as testCommitExact };';
+    // Test-realm-only entry points. Application exports remain unchanged.
+    if(file.endsWith('/ownership-lifecycle.ts'))source+='\nexport { validateOfflineOwnershipLifecycleDocument as testValidateOfflineLifecycle };';
+    if(file.endsWith('/ownership-persistence.ts'))source+=`\nexport function testValidateOfflinePersistence(current, records, site, zone, journal, context) {
+      return validatePersistenceHistory(current, records, site, zone, journal,
+        require('./ownership-lifecycle').testValidateOfflineLifecycle, context ?? { runtimeIdentities: [] });
+    }`;
     const exports={}; cache.set(file,exports);
     vm.runInNewContext(ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,
       {exports,Error,structuredClone,Date,process:{versions:{node:version},cwd:()=>hooks.cwd ?? process.cwd(),getBuiltinModule(name){

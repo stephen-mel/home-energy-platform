@@ -6,7 +6,7 @@ import os from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import { loadStore } from './ownership-sqlite-harness.mjs';
-import { fixture, hash, key } from './ownership-lifecycle.mjs';
+import { fixture, hash, key, mapIdentity, document } from './ownership-lifecycle.mjs';
 import { persistenceFixture, seedDatabase, seedJournal } from './ownership-persistence.mjs';
 
 const scenarios = new Set(['valid', 'stale-tesla', 'stale-kraken', 'conflicting-observation', 'missing-observation',
@@ -188,7 +188,7 @@ export async function closedOfflineV2(...args) {
         const initialText = await durableText(initialFile), activeText = await durableText(activeFile);
         if (initialText !== JSON.stringify(pending.prepared.initial) + '\n') throw Error('C2_DURABLE_INITIAL_CHANGED');
         const capability = Object.freeze(Object.create(null));
-        registerSimulatedAdmission(capability, { preparedKey: key(pending.prepared), initialText, activeText, used: false });
+        registerSimulatedAdmission(capability, { preparedKey: key(pending.prepared), initialText, activeText, admissionKey: hash({ purpose: 'offline-admission-reference-v1', id: randomUUID() }), used: false });
         pendingOperation = pending; liveAdmission = capability;
         return freeze({ ...flags, status: 'prepared-offline', prepared: structuredClone(pending.prepared),
           baselineFingerprint: hash(source.observation.tariff), approvedValidity: structuredClone(policy) });
@@ -371,11 +371,7 @@ export async function closedOfflineV2(...args) {
         ownershipEvidence: ledger };
       return freeze({ ...body, projectionKey: hash({ purpose: 'offline-c4-ownership-projection-v2', ...body }) });
     };
-    return Object.freeze({
-      ...flags,
-      async prepare(...args) { noArguments(args); ensureOpen(); return prepareFirstApply(); },
-      async rehearse(...args) { noArguments(args); ensureOpen(); return rehearseOnce(); },
-      async projectOwnership(...args) {
+    const projectOwnershipOnce = async (...args) => {
         noArguments(args); ensureOpen();
         if (projectionStarted || recovered) throw Error('C4_PROJECTION_ALREADY_CONSUMED');
         projectionStarted = true;
@@ -399,6 +395,54 @@ export async function closedOfflineV2(...args) {
         const projection = await projectIssuedReceipt(liveCompletion, candidate);
         if (scenario === 'projection-replay') await projectIssuedReceipt(liveCompletion, candidate);
         return freeze({ ...flags, status: 'ownership-projected-offline', projection, offlineReceipt: issuedReceipt, storage: await inspect() });
+    };
+    return Object.freeze({
+      ...flags,
+      async prepare(...args) { noArguments(args); ensureOpen(); return prepareFirstApply(); },
+      async rehearse(...args) { noArguments(args); ensureOpen(); return rehearseOnce(); },
+      async projectOwnership(...args) { return projectOwnershipOnce(...args); },
+      async mapLifecycle(...args) {
+        noArguments(args); ensureOpen();
+        // projectOwnershipOnce consumes the exact privately issued receipt;
+        // documents, copies, recovery and repeated calls cannot enter mapping.
+        const result = await projectOwnershipOnce();
+        const p = result.projection, receipt = result.offlineReceipt;
+        const bound = completionFor(liveCompletion), admitted = findSimulatedAdmission(liveAdmission);
+        if (!bound || bound.receipt !== receipt || !bound.projected || !admitted?.used || recovered)
+          throw Error('C5A_PRIVATE_RECEIPT_REQUIRED');
+        const history = await journal.readHistory();
+        if (closed || recovered || history.status !== 'available' || history.history.records.length !== 1
+          || key(history.history.records[0]) !== bound.evidenceKey) throw Error('C5A_DURABLE_CONFIRMATION_REQUIRED');
+        const e = receipt.operation;
+        const reference = { version: 1, namespace: 'offline-simulated-operation', receiptVersion: 1,
+          operationId: p.operationId, mutationId: p.mutationId, receiptKey: receipt.receiptKey, issuanceKey: receipt.issuanceKey,
+          admissionKey: admitted.admissionKey,
+          simulatedCompletionKey: hash({ purpose: 'offline-simulated-completion-reference-v1',
+            offlineIssuanceId: bound.issuanceId, evidenceId: e.evidenceId }) };
+        const snapshotBody = { version: 3, generation: p.generation.expectedAfter,
+          evidence: p.ownershipEvidence, lifecycle: p.retainedOriginal };
+        const snapshot = { ...snapshotBody, checksum: hash(snapshotBody),
+          // Documentary proposed-history identity, explicitly NOT committed rows.
+          historyDigest: hash({ purpose: 'offline-proposed-ownership-history-v1', projectionKey: p.projectionKey }) };
+        const mapping = mapIdentity(e, reference, p.retainedOriginKey, null);
+        const lifecycle = document(snapshot, [mapping]);
+        const context = { version: 1, energySiteId: p.energySiteId, timeZone: p.timeZone,
+          historicalOwnership: snapshot, operations: [{ evidence: e, context: history.history.contexts[0] }],
+          runtimeIdentities: [reference], previousLifecycle: null };
+        const lifecycleContract = load('src/lib/tesla-tariff/ownership-lifecycle.ts');
+        const checked = lifecycleContract.testValidateOfflineLifecycle(lifecycle, context);
+        if (checked.status !== 'validated') throw Error(checked.code);
+        const body = { version: 1, kind: 'offline-v2-ownership-persistence', lifecycle,
+          approvedValidity: p.approvedValidity, previousRecordId: null };
+        const record = { ...body, recordId: hash({ purpose: 'smart-ownership-persistence-v1', ...body }) };
+        const persistence = load('src/lib/tesla-tariff/ownership-persistence.ts');
+        const validated = persistence.testValidateOfflinePersistence(record, [record], p.energySiteId, p.timeZone, history.history, context);
+        if (validated.status !== 'validated') throw Error(validated.code);
+        if (lifecycleContract.validateOwnershipLifecycleDocument(lifecycle, context).status !== 'rejected'
+          || persistence.validatePersistedOwnershipHistory(record, [record], p.energySiteId, p.timeZone, history.history).status !== 'rejected')
+          throw Error('C5A_PRODUCTION_ISOLATION_FAILED');
+        return freeze({ ...flags, status: 'lifecycle-mapped-offline', projection: p, lifecycle, context, record,
+          journal: history.history, storage: await inspect() });
       },
       async inspect(...args) { noArguments(args); ensureOpen(); return inspect(); },
       async reopen(...args) {

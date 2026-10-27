@@ -13,11 +13,19 @@ export type RuntimeReceiptIdentityReference = {
     version: 1; namespace: "runtime-confirmed-operation"; receiptVersion: 2;
     operationId: string; mutationId: string; receiptKey: string; issuanceKey: string;
 };
+/** Simulation references only. Accepted exclusively by the private test path;
+ * never runtime registry membership, receipt issuance or committed ownership. */
+type OfflineReceiptIdentityReference = {
+    version: 1; namespace: "offline-simulated-operation"; receiptVersion: 1;
+    operationId: string; mutationId: string; receiptKey: string; issuanceKey: string;
+    admissionKey: string; simulatedCompletionKey: string;
+};
+type ReceiptIdentityReference = RuntimeReceiptIdentityReference | OfflineReceiptIdentityReference;
 export type OwnershipApplicationIdentity = {
     version: 2; operationId: string; mutationId: string; kind: "apply" | "update" | "restore";
     energySiteId: string; timeZone: string;
     documentary: { version: 2; evidenceId: string };
-    runtime: RuntimeReceiptIdentityReference;
+    runtime: ReceiptIdentityReference;
     journal: { version: 2; initialRecordId: string; completionRecordId: string };
     retainedOriginKey: string;
     ownership: { beforeGeneration: string | null; afterGeneration: string; priorHistoryDigest: string | null };
@@ -52,7 +60,7 @@ export type OwnershipLifecycleValidationContext = {
     version: 1; energySiteId: string; timeZone: string;
     historicalOwnership: LifecycleOwnershipSnapshot;
     operations: readonly { evidence: ConfirmedOperationEvidence; context: ConfirmedOperationValidationContext }[];
-    runtimeIdentities: readonly RuntimeReceiptIdentityReference[];
+    runtimeIdentities: readonly ReceiptIdentityReference[];
     previousLifecycle: OwnershipLifecycleDocument | null;
 };
 const same = (a: unknown, b: unknown) => representationKey(a) === representationKey(b);
@@ -63,7 +71,7 @@ function freeze<T>(v: T): T {
     if (v && typeof v === "object") { Object.values(v).forEach(freeze); Object.freeze(v); }
     return v;
 }
-function application(record: ConfirmedOperationEvidence, runtime: RuntimeReceiptIdentityReference, origin: string,
+function application(record: ConfirmedOperationEvidence, runtime: ReceiptIdentityReference, origin: string,
     previous: OwnershipApplicationIdentity | null): OwnershipApplicationIdentity {
     const i = record.initial.intent;
     const body = { version: 2 as const, operationId: i.operationId, mutationId: i.mutationId, kind: i.kind,
@@ -97,7 +105,18 @@ function document(snapshot: LifecycleOwnershipSnapshot, applications: OwnershipA
  * store. Here duplicates/history conflicts and any transition after a supplied
  * terminal predecessor fail closed. No persistence or capability code is called. */
 export function validateOwnershipLifecycleDocument(value: unknown, suppliedContext: OwnershipLifecycleValidationContext) {
-    const reject = (code: string) => freeze({ status: "rejected" as const, code, ...flags });
+    return validateLifecycleDocument(value, suppliedContext, "production");
+}
+// Private test seam only. No application export/caller can select offline mode.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function validateOfflineOwnershipLifecycleDocument(value: unknown, suppliedContext: OwnershipLifecycleValidationContext) {
+    return validateLifecycleDocument(value, suppliedContext, "offline-test-only");
+}
+function validateLifecycleDocument(value: unknown, suppliedContext: OwnershipLifecycleValidationContext,
+    mode: "production" | "offline-test-only") {
+    const validationFlags = mode === "offline-test-only" ? { ...flags, mode: "offline-test-only" as const,
+        authentication: "fixtures-only" as const, runtimeConfirmationVerified: false as const, grantsAdmissionAuthority: false as const } : flags;
+    const reject = (code: string) => freeze({ status: "rejected" as const, code, ...validationFlags });
     try {
         if (!validJournalEvidenceJson(value) || !validJournalEvidenceJson(suppliedContext)) return reject("MALFORMED_OWNERSHIP_LIFECYCLE");
         const candidate = structuredClone(value) as OwnershipLifecycleDocument, c = structuredClone(suppliedContext);
@@ -108,6 +127,9 @@ export function validateOwnershipLifecycleDocument(value: unknown, suppliedConte
         if (!candidate || !keys(candidate, "applications,energySiteId,generation,historicalOwnership,historyId,kind,lifecycleId,restoration,restorationObligation,state,timeZone,version")
             || candidate.version !== 2 || candidate.kind !== "ownership-lifecycle-document" || !["active", "restored"].includes(candidate.state))
             return reject("UNSUPPORTED_OWNERSHIP_LIFECYCLE");
+        if (mode === "offline-test-only" && (c.operations.length !== 1 || c.previousLifecycle !== null
+            || candidate.state !== "active" || c.operations[0]?.evidence?.initial?.intent?.kind !== "apply"))
+            return reject("OFFLINE_FIRST_APPLY_ONLY");
         if (c.previousLifecycle?.state === "restored") return reject("LIFECYCLE_ALREADY_TERMINAL");
         const records: ConfirmedOperationEvidence[] = [], applications: OwnershipApplicationIdentity[] = [];
         const retained = c.historicalOwnership.lifecycle, origin = retainedOriginKey(retained);
@@ -135,14 +157,20 @@ export function validateOwnershipLifecycleDocument(value: unknown, suppliedConte
             if (checked.status !== "validated") return reject(checked.code);
             const record = checked.evidence, i = record.initial.intent;
             if (i.kind === "restore" && n !== c.operations.length - 1) return reject("LIFECYCLE_ALREADY_TERMINAL");
-            if (!runtime || !keys(runtime, "issuanceKey,mutationId,namespace,operationId,receiptKey,receiptVersion,version")
-                || runtime.version !== 1 || runtime.receiptVersion !== 2 || runtime.namespace !== "runtime-confirmed-operation"
+            const offline = mode === "offline-test-only";
+            if (!runtime || !keys(runtime, offline
+                ? "admissionKey,issuanceKey,mutationId,namespace,operationId,receiptKey,receiptVersion,simulatedCompletionKey,version"
+                : "issuanceKey,mutationId,namespace,operationId,receiptKey,receiptVersion,version")
+                || runtime.version !== 1 || runtime.receiptVersion !== (offline ? 1 : 2)
+                || runtime.namespace !== (offline ? "offline-simulated-operation" : "runtime-confirmed-operation")
                 || runtime.operationId !== i.operationId || runtime.mutationId !== i.mutationId) return reject("RUNTIME_IDENTITY_REFERENCE_INVALID");
+            const simulationIds = runtime.namespace === "offline-simulated-operation"
+                ? [runtime.admissionKey, runtime.simulatedCompletionKey] : [];
             // Cross-role uniqueness prevents documentary or journal identifiers
             // from masquerading as runtime receipt/issuance or application IDs.
-            if ([runtime.receiptKey, runtime.issuanceKey].some(value => historyIds.has(value))
+            if ([runtime.receiptKey, runtime.issuanceKey, ...simulationIds].some(value => historyIds.has(value))
                 || ![record.evidenceId, record.initial.initialRecordId, record.completion.completionRecordId,
-                    runtime.receiptKey, runtime.issuanceKey].every(unique)) return reject("OPERATION_IDENTITY_ALIAS_OR_REPLAY");
+                    runtime.receiptKey, runtime.issuanceKey, ...simulationIds].every(unique)) return reject("OPERATION_IDENTITY_ALIAS_OR_REPLAY");
             const mapped = application(record, runtime, origin, applications.at(-1) ?? null);
             if (!unique(mapped.applicationId)) return reject("APPLICATION_IDENTITY_CONFLICT");
             applications.push(mapped); records.push(record);
@@ -165,6 +193,6 @@ export function validateOwnershipLifecycleDocument(value: unknown, suppliedConte
             return reject("LIFECYCLE_PREDECESSOR_CONFLICT");
         const expected = document(c.historicalOwnership, applications, restoring ? last : null);
         if (!same(candidate, expected)) return reject("OWNERSHIP_LIFECYCLE_CONFLICT");
-        return freeze({ status: "validated" as const, document: candidate, ...flags });
+        return freeze({ status: "validated" as const, document: candidate, ...validationFlags });
     } catch { return reject("MALFORMED_OWNERSHIP_LIFECYCLE"); }
 }
