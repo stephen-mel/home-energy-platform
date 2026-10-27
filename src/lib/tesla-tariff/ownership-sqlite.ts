@@ -321,6 +321,13 @@ type CommitResult = { status: "persisted" | "already-persisted"; snapshot: Owner
 // Generation policy is private transaction input, never an authority token or
 // a field accepted by the public guarded writer. No V3 caller is connected.
 type ExactGeneration = { version: 1; expectedBefore: string | null; expectedAfter: string };
+function validateExactOwnershipGeneration(approved: ExactGeneration, before: string | null) {
+    if (!approved || Object.keys(approved).sort().join() !== "expectedAfter,expectedBefore,version"
+        || approved.version !== 1 || typeof approved.expectedAfter !== "string"
+        || !/^[a-f0-9-]{36}$/.test(approved.expectedAfter)
+        || approved.expectedBefore !== before || approved.expectedAfter === before)
+        throw Error("OWNERSHIP_GENERATION_CHANGED");
+}
 function commitOwnership(databasePath: string, input: CommitInput): CommitResult {
     return ownershipTransaction(databasePath, input);
 }
@@ -331,8 +338,48 @@ function commitOwnershipExact(databasePath: string, input: CommitInput, generati
         return { status: "conflict", code: "OWNERSHIP_GENERATION_CHANGED" };
     return ownershipTransaction(databasePath, input, generation);
 }
-function ownershipTransaction(databasePath: string, input: CommitInput, exact?: ExactGeneration): CommitResult {
+type TransactionFailure = Extract<CommitResult, { code: string }>;
+function ownershipTransactionFailure(error: unknown, uncertain: boolean): TransactionFailure {
+    const reason = code(error);
+    return { status: uncertain ? "indeterminate" : ["OWNERSHIP_GENERATION_CHANGED", "OWNERSHIP_MUTATION_CONFLICT"].includes(reason)
+        ? "conflict" : "store-failed", code: uncertain ? "OWNERSHIP_PERSISTENCE_INDETERMINATE" : reason };
+}
+/** Private shared SQLite mechanics. A callback is NOT authority; only internal
+ * guarded callers select work. Offline format handling exists in test VM code
+ * only, never in application exports or a production caller-selectable profile. */
+function ownershipDatabaseTransaction<T>(file: string, site: string, work: (db: DatabaseSync) => Promise<T>): Promise<T | TransactionFailure>;
+function ownershipDatabaseTransaction<T>(file: string, site: string, work: (db: DatabaseSync) => T): T | TransactionFailure;
+function ownershipDatabaseTransaction<T>(file: string, site: string, work: (db: DatabaseSync) => T | Promise<T>): T | TransactionFailure | Promise<T | TransactionFailure> {
     let db: DatabaseSync | undefined, inTransaction = false, commitAttempted = false;
+    const failed = (error: unknown): TransactionFailure => {
+        let uncertain = commitAttempted;
+        if (inTransaction) { try { db?.exec("ROLLBACK"); inTransaction = false; } catch { uncertain = true; } }
+        try { db?.close(); db = undefined; } catch { uncertain = true; }
+        return ownershipTransactionFailure(error, uncertain);
+    };
+    const finished = (result: T): T | TransactionFailure => {
+        try {
+            commitAttempted = true; db!.exec("COMMIT"); inTransaction = false;
+            db!.close(); db = undefined;
+            return result;
+        } catch (error) { return failed(error); }
+    };
+    try {
+        guard(); legacy(file, site);
+        const connection = connect(file, true); db = connection.db;
+        db.exec("BEGIN IMMEDIATE"); inTransaction = true;
+        schema(db, connection.created); legacy(file, site);
+        const result = work(db);
+        return result instanceof Promise ? result.then(finished, failed) : finished(result);
+    } catch (error) { return failed(error); }
+}
+function writeOwnershipPair(db: DatabaseSync, site: string, mutation: string, issuance: string, snapshot: unknown, application: unknown) {
+    db.prepare("INSERT INTO ownership(site,snapshot) VALUES(?,?) ON CONFLICT(site) DO UPDATE SET snapshot=excluded.snapshot")
+        .run(site, JSON.stringify(snapshot));
+    db.prepare("INSERT INTO applied(site,mutation,issuance,record) VALUES(?,?,?,?)")
+        .run(site, mutation, issuance, JSON.stringify(application));
+}
+function ownershipTransaction(databasePath: string, input: CommitInput, exact?: ExactGeneration): CommitResult {
     try {
         guard();
         const value = structuredClone(input), { site, expected, evidence, mutationId, issuanceKey, receiptKey, retention } = value;
@@ -341,18 +388,12 @@ function ownershipTransaction(databasePath: string, input: CommitInput, exact?: 
             throw Error("OWNERSHIP_INPUT_INVALID");
         const prior = identity(site, expected), file = path.resolve(databasePath);
         const approved = exact === undefined ? undefined : structuredClone(exact);
-        if (approved && (Object.keys(approved).sort().join() !== "expectedAfter,expectedBefore,version"
-            || approved.version !== 1 || typeof approved.expectedAfter !== "string"
-            || !/^[a-f0-9-]{36}$/.test(approved.expectedAfter)
-            || approved.expectedBefore !== (expected.status === "missing" ? null : expected.snapshot.generation)
-            || approved.expectedAfter === approved.expectedBefore)) throw Error("OWNERSHIP_GENERATION_CHANGED");
+        if (approved) validateExactOwnershipGeneration(approved, expected.status === "missing" ? null : expected.snapshot.generation);
         if (expected.status === "available" && ((expected.snapshot.version === 3) !== !!retention))
             throw Error("OWNERSHIP_RETENTION_VERSION_CONFLICT");
         if (retention && Object.keys(retention).sort().join() !== "origin,original") throw Error("OWNERSHIP_RETENTION_INVALID");
         const priorHistoryDigest = expected.status === "missing" ? null : expected.snapshot.historyDigest;
-        legacy(file, site); const connection = connect(file, true); db = connection.db;
-        db.exec("BEGIN IMMEDIATE"); inTransaction = true;
-        schema(db, connection.created); legacy(file, site);
+        return ownershipDatabaseTransaction(file, site, db => {
         const { current, applications } = state(db, site);
         const applied = applications.find(a => a.mutationId === mutationId);
         let snapshot: OwnershipSnapshot, status: "persisted" | "already-persisted";
@@ -400,10 +441,7 @@ function ownershipTransaction(databasePath: string, input: CommitInput, exact?: 
             const common = { generation, evidence, checksum, historyDigest: historyDigest(site, [...applications, application]) };
             snapshot = lifecycle ? { ...common, version: 3, lifecycle } : { ...common, version: 2 };
             if (!validSnapshot(snapshot, site)) throw Error("OWNERSHIP_RETENTION_INVALID");
-            db.prepare("INSERT INTO ownership(site,snapshot) VALUES(?,?) ON CONFLICT(site) DO UPDATE SET snapshot=excluded.snapshot")
-                .run(site, JSON.stringify(snapshot));
-            db.prepare("INSERT INTO applied(site,mutation,issuance,record) VALUES(?,?,?,?)")
-                .run(site, mutationId, issuanceKey, JSON.stringify(application));
+            writeOwnershipPair(db, site, mutationId, issuanceKey, snapshot, application);
             status = "persisted";
         }
         const intended = { site, mutationId, issuanceKey, receiptKey, prior, priorHistoryDigest,
@@ -414,18 +452,11 @@ function ownershipTransaction(databasePath: string, input: CommitInput, exact?: 
         const intendedApplication = { ...intended, checksum: hash(intended) };
         verifyIntendedPair(db, snapshot, intendedApplication);
         verifyHistoryAppend(db, site, applications, intendedApplication, snapshot, status === "persisted");
-        commitAttempted = true; db.exec("COMMIT"); inTransaction = false;
-        db.close(); db = undefined;
         return { status, snapshot: structuredClone(snapshot) };
-    } catch (error) {
-        let uncertain = commitAttempted;
-        if (inTransaction) { try { db?.exec("ROLLBACK"); } catch { uncertain = true; } }
-        try { db?.close(); } catch { uncertain = true; }
-        const reason = code(error);
-        return { status: uncertain ? "indeterminate" : ["OWNERSHIP_GENERATION_CHANGED", "OWNERSHIP_MUTATION_CONFLICT"].includes(reason)
-            ? "conflict" : "store-failed", code: uncertain ? "OWNERSHIP_PERSISTENCE_INDETERMINATE" : reason };
-    }
+        });
+    } catch (error) { return ownershipTransactionFailure(error, false); }
 }
+
 function freeze<T>(value: T): Readonly<T> {
     if (value && typeof value === "object") { Object.values(value).forEach(freeze); Object.freeze(value); }
     return value;
