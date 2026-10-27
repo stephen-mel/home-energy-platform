@@ -7,7 +7,7 @@ import vm from 'node:vm';
 import * as crypto from 'node:crypto';
 import ts from 'typescript';
 import assert from 'node:assert/strict';
-import { offlineTransactionSource } from './offline-ownership-transaction.mjs';
+import { offlineTransactionSource, offlineRecoverySource } from './offline-ownership-transaction.mjs';
 if(process.versions.node!=='26.8.2')throw Error('OWNERSHIP_NODE_26_8_2_REQUIRED');
 const sqlite=await import('node:sqlite');
 export function loadStore(hooks = {}, version = process.versions.node) {
@@ -24,7 +24,7 @@ export function loadStore(hooks = {}, version = process.versions.node) {
   function load(file) {
     file=path.resolve(file); if(cache.has(file))return cache.get(file);
     let source=fs.readFileSync(file,'utf8');
-    if(file.endsWith('/ownership-sqlite.ts'))source+='\nexport { commitOwnership as testCommit, commitOwnershipExact as testCommitExact };' + offlineTransactionSource;
+    if(file.endsWith('/ownership-sqlite.ts'))source+='\nexport { commitOwnership as testCommit, commitOwnershipExact as testCommitExact };' + offlineTransactionSource + offlineRecoverySource;
     // Test-realm-only entry points. Application exports remain unchanged.
     if(file.endsWith('/ownership-lifecycle.ts'))source+='\nexport { validateOfflineOwnershipLifecycleDocument as testValidateOfflineLifecycle };';
     if(file.endsWith('/ownership-persistence.ts'))source+=`\nexport function testValidateOfflinePersistence(current, records, site, zone, journal, context) {

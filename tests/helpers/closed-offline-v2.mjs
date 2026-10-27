@@ -17,7 +17,10 @@ const scenarios = new Set(['valid', 'stale-tesla', 'stale-kraken', 'conflicting-
   'receipt-copy', 'receipt-forged', 'receipt-substitution', 'receipt-replay', 'receipt-recovered',
   'receipt-payload', 'receipt-generation', 'receipt-approval', 'receipt-validity', 'receipt-site',
   'projection-copy', 'projection-payload', 'projection-generation', 'projection-validity',
-  'projection-original', 'projection-terminal', 'projection-conflict', 'projection-replay', 'projection-validity-beyond-domain']);
+  'projection-original', 'projection-terminal', 'projection-conflict', 'projection-replay', 'projection-validity-beyond-domain',
+  'persist-stale-generation', 'persist-predecessor', 'persist-duplicate', 'persist-partial-failure',
+  'recover-missing-journal', 'recover-substituted-journal', 'recover-original', 'recover-generation',
+  'recover-production-relabel', 'recover-offline-receipt', 'recover-missing-history', 'recover-pending']);
 const flags = Object.freeze({ mode: 'offline-test-only', authentication: 'fixtures-only', writeReady: false,
   executionReady: false, grantsAdmissionAuthority: false, grantsSuccessorAuthority: false,
   grantsRepeatAuthority: false, grantsRestorationAuthority: false, runtimeConfirmationVerified: false });
@@ -91,15 +94,18 @@ export async function closedOfflineV2(...args) {
     let pendingOperation = null, liveAdmission = null, completionEvidence = null;
     let rehearsalStarted = false, recovered = false, simulatedWrites = 0;
     let liveCompletion = null, issuedReceipt = null, projectionStarted = false;
+    let persistenceStarted = false, recoveryCheckpoint = null;
     let teslaState = structuredClone(source.observation.tariff);
     // TEST-ONLY identity membership. Never exported, persisted, registered in
     // the production completion registry, or restored from a document.
     const simulatedAdmissions = new WeakMap();
     const findSimulatedAdmission = simulatedAdmissions.get.bind(simulatedAdmissions);
     const registerSimulatedAdmission = simulatedAdmissions.set.bind(simulatedAdmissions);
+    const forgetSimulatedAdmission = simulatedAdmissions.delete.bind(simulatedAdmissions);
     const offlineCompletions = new WeakMap();
     const completionFor = offlineCompletions.get.bind(offlineCompletions);
     const registerCompletion = offlineCompletions.set.bind(offlineCompletions);
+    const forgetCompletion = offlineCompletions.delete.bind(offlineCompletions);
     const preparation = load('src/lib/tesla-tariff/prepared-mutation-context.ts');
     const ports = {
       now: () => clock,
@@ -396,12 +402,7 @@ export async function closedOfflineV2(...args) {
         if (scenario === 'projection-replay') await projectIssuedReceipt(liveCompletion, candidate);
         return freeze({ ...flags, status: 'ownership-projected-offline', projection, offlineReceipt: issuedReceipt, storage: await inspect() });
     };
-    return Object.freeze({
-      ...flags,
-      async prepare(...args) { noArguments(args); ensureOpen(); return prepareFirstApply(); },
-      async rehearse(...args) { noArguments(args); ensureOpen(); return rehearseOnce(); },
-      async projectOwnership(...args) { return projectOwnershipOnce(...args); },
-      async mapLifecycle(...args) {
+    const mapLifecycleOnce = async (...args) => {
         noArguments(args); ensureOpen();
         // projectOwnershipOnce consumes the exact privately issued receipt;
         // documents, copies, recovery and repeated calls cannot enter mapping.
@@ -443,16 +444,119 @@ export async function closedOfflineV2(...args) {
           throw Error('C5A_PRODUCTION_ISOLATION_FAILED');
         return freeze({ ...flags, status: 'lifecycle-mapped-offline', projection: p, lifecycle, context, record,
           journal: history.history, storage: await inspect() });
+    };
+    const discardExecutionIdentities = () => {
+      if (liveAdmission) forgetSimulatedAdmission(liveAdmission);
+      if (liveCompletion) forgetCompletion(liveCompletion);
+      recovered = true; liveAdmission = null; liveCompletion = null;
+      issuedReceipt = null; pendingOperation = null; completionEvidence = null;
+    };
+    const readRecoveredOwnership = async () => {
+      // A fresh loader and database connection have no shared runtime registry
+      // membership. The only retained input is a documentary reference checkpoint.
+      return loadStore().testReadOfflineOwnership(file, recoveryCheckpoint);
+    };
+    const corruptRecoveryFixture = async () => {
+      // Fixed TEST fault injection only; never called on the valid write path.
+      if (scenario === 'recover-missing-journal') await fs.unlink(initialFile);
+      if (scenario === 'recover-substituted-journal') {
+        await fs.rm(directory, { recursive: true });
+        await seedJournal(directory, persistenceFixture('apply'));
+      }
+      if (scenario === 'recover-pending') await fs.writeFile(activeFile, 'ambiguous');
+      if (['recover-original', 'recover-generation', 'recover-production-relabel', 'recover-offline-receipt', 'recover-missing-history'].includes(scenario)) {
+        const db = new DatabaseSync(file);
+        try {
+          db.exec('BEGIN IMMEDIATE');
+          if (scenario === 'recover-missing-history') db.prepare('DELETE FROM applied WHERE site=?').run('12345');
+          else {
+            const record = JSON.parse(db.prepare('SELECT snapshot FROM ownership WHERE site=?').get('12345').snapshot);
+            const historical = record.lifecycle.historicalOwnership, app = record.lifecycle.applications[0];
+            if (scenario === 'recover-original') historical.lifecycle.original.tariff.name = 'Tampered immutable original';
+            if (scenario === 'recover-generation') {
+              historical.generation = '00000000-0000-8000-0000-000000000000';
+              historical.lifecycle.currentGeneration = historical.generation;
+            }
+            if (scenario === 'recover-offline-receipt') app.runtime.receiptKey = hash('substituted-offline-receipt');
+            if (scenario === 'recover-production-relabel') {
+              delete app.runtime.admissionKey; delete app.runtime.simulatedCompletionKey;
+              app.runtime.namespace = 'runtime-confirmed-operation'; app.runtime.receiptVersion = 2;
+              record.kind = 'v3-ownership-persistence';
+            }
+            const { checksum: _c, historyDigest: _h, ...historicalBody } = historical; void _c; void _h;
+            historical.checksum = hash(historicalBody);
+            const evidence = recoveryCheckpoint.operations[0].evidence;
+            record.lifecycle = document(historical, [mapIdentity(evidence, app.runtime, app.retainedOriginKey, null)]);
+            const { recordId: _r, ...recordBody } = record; void _r;
+            record.recordId = hash({ purpose: 'smart-ownership-persistence-v1', ...recordBody });
+            // Deliberate AFTER-commit corruption, not a persistence bypass.
+            db.prepare('UPDATE ownership SET snapshot=? WHERE site=?').run(JSON.stringify(record), '12345');
+            db.prepare('UPDATE applied SET record=? WHERE site=?').run(JSON.stringify(record), '12345');
+          }
+          db.exec('COMMIT');
+        } finally { db.close(); }
+      }
+    };
+    return Object.freeze({
+      ...flags,
+      async prepare(...args) { noArguments(args); ensureOpen(); return prepareFirstApply(); },
+      async rehearse(...args) { noArguments(args); ensureOpen(); return rehearseOnce(); },
+      async projectOwnership(...args) { return projectOwnershipOnce(...args); },
+      async mapLifecycle(...args) { return mapLifecycleOnce(...args); },
+      async persistAndRecover(...args) {
+        noArguments(args); ensureOpen();
+        if (persistenceStarted || recovered) throw Error('C5_PERSISTENCE_ALREADY_CONSUMED');
+        persistenceStarted = true; // Failed and interrupted attempts cannot retry.
+        let mapped;
+        try { mapped = await mapLifecycleOnce(); }
+        catch (error) { discardExecutionIdentities(); throw error; }
+        if (closed || recovered || !liveCompletion || completionFor(liveCompletion)?.receipt !== issuedReceipt) {
+          discardExecutionIdentities(); throw Error('C5_LIVE_MAPPING_REQUIRED');
+        }
+        // JSON checkpoint only. This is NOT a surviving completion, receipt or
+        // admission capability. It supplies independent expected references to
+        // recovery rather than deriving them from candidate SQLite rows.
+        recoveryCheckpoint = freeze(structuredClone(mapped.context));
+        const candidate = structuredClone(mapped.record), context = structuredClone(mapped.context);
+        const approved = { version: 1, expectedBefore: null, expectedAfter: mapped.projection.generation.expectedAfter };
+        if (scenario === 'persist-stale-generation') approved.expectedBefore = approved.expectedAfter;
+        if (scenario === 'persist-predecessor') context.previousLifecycle = fixture('apply').value;
+        const persistenceStore = scenario === 'persist-partial-failure' ? loadStore({
+          beforeStatement(sql, method) { if (sql.startsWith('INSERT INTO applied') && method === 'run') throw Error('C5_INJECTED_PARTIAL_FAILURE'); },
+        }) : store;
+        let committed, repeatAttempt = null;
+        try {
+          committed = await persistenceStore.testCommitOfflineOwnership(file, candidate, context, approved);
+          if (committed.status !== 'persisted-offline') throw Error(committed.code);
+          if (scenario === 'persist-duplicate') {
+            repeatAttempt = await persistenceStore.testCommitOfflineOwnership(file, candidate, context, approved);
+            if (repeatAttempt.status !== 'conflict') throw Error('C5_DUPLICATE_ACCEPTED');
+          }
+        } finally { discardExecutionIdentities(); }
+        await corruptRecoveryFixture();
+        const before = await inspect(), recovery = await readRecoveredOwnership(), after = await inspect();
+        if (before.databaseFingerprint !== after.databaseFingerprint || key(before.files) !== key(after.files))
+          throw Error('C5_RECOVERY_MUTATED_STORAGE');
+        return freeze({ ...flags, status: 'persistence-rehearsed-offline',
+          commit: { status: committed.status, generation: committed.snapshot.lifecycle.generation },
+          repeatAttempt, recovery, projection: mapped.projection,
+          executionIdentitiesDiscarded: !liveAdmission && !liveCompletion && !issuedReceipt && !pendingOperation,
+          storage: after });
+      },
+      async recoverOwnership(...args) {
+        noArguments(args); ensureOpen();
+        if (!recovered || !recoveryCheckpoint) throw Error('C5_RECOVERY_NOT_PREPARED');
+        return freeze(await readRecoveredOwnership());
       },
       async inspect(...args) { noArguments(args); ensureOpen(); return inspect(); },
       async reopen(...args) {
         noArguments(args); ensureOpen();
-        recovered = true; liveAdmission = null; completionEvidence = null; liveCompletion = null; issuedReceipt = null;
+        discardExecutionIdentities();
         const reopened = loadStore().load('src/lib/tesla-tariff/repeat-attempt-journal.ts').offlineOperationJournal(config, ports);
         return freeze({ ...flags, history: structuredClone(await reopened.readHistory()), storage: await inspect() });
       },
       async close(...args) { noArguments(args); if (!closed) {
-        closed = true; liveAdmission = null; completionEvidence = null; liveCompletion = null; issuedReceipt = null;
+        closed = true; discardExecutionIdentities();
         await fs.rm(root, { recursive: true, force: true });
       } },
     });

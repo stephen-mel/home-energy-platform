@@ -66,3 +66,55 @@ export async function testCommitOfflineOwnership(databasePath, suppliedRecord, s
   });
 }
 `;
+
+// TEST ONLY / read-only F4a-style inspection. The context is an independent
+// documentary checkpoint, not a recovered receipt, live token or authentication.
+export const offlineRecoverySource = `
+export async function testReadOfflineOwnership(databasePath, suppliedContext) {
+  let db;
+  const blocked = code => ({ status: 'blocked', code, ...persistenceOnly,
+    mode: 'offline-test-only', authentication: 'fixtures-only' });
+  try {
+    guard();
+    const context = structuredClone(suppliedContext);
+    if (!context || context.operations?.length !== 1 || context.previousLifecycle !== null)
+      return blocked('OWNERSHIP_OFFLINE_RECOVERY_CONTEXT_MISSING');
+    const site = context.energySiteId, zone = context.timeZone, file = path.resolve(databasePath);
+    if (!siteId(site)) return blocked('OWNERSHIP_SITE_INVALID');
+    legacy(file, site);
+    if (!exists(file)) return blocked('OWNERSHIP_OFFLINE_DATABASE_MISSING');
+    db = connect(file, false).db; db.exec('BEGIN'); schema(db, false);
+    const rows = db.prepare('SELECT snapshot FROM ownership WHERE site=?').all(site);
+    const applications = db.prepare('SELECT mutation,issuance,record FROM applied WHERE site=?').all(site);
+    if (rows.length !== 1 || applications.length !== 1) return blocked('OWNERSHIP_OFFLINE_HISTORY_INCOMPLETE');
+    const current = JSON.parse(rows[0].snapshot), records = applications.map(r => JSON.parse(r.record));
+    const app = records[0]?.lifecycle?.applications?.at(-1);
+    if (!app || applications[0].mutation !== app.mutationId || applications[0].issuance !== app.runtime?.issuanceKey)
+      return blocked('OWNERSHIP_OFFLINE_COLUMN_CONFLICT');
+    const entry = context.operations[0], intent = entry.evidence.initial.intent;
+    const admission = entry.context.ownershipAttributions?.[0]?.admission;
+    const fixtureAdmission = async (s, op, mutation) => {
+      if (s !== site || op !== intent.operationId || mutation !== intent.mutationId || !admission)
+        throw Error('OWNERSHIP_OFFLINE_ATTRIBUTION_MISSING');
+      return structuredClone(admission);
+    };
+    const directory = path.resolve(path.dirname(file), '../tesla-experiments');
+    const config = { directory, durableRoot: path.resolve(directory, '..'), site };
+    const journal = await readOfflineOperationHistory(config, fixtureAdmission);
+    if (journal.status !== 'available') return blocked('OWNERSHIP_OFFLINE_JOURNAL_UNAVAILABLE');
+    const contract = require('./ownership-persistence');
+    const checked = contract.testValidateOfflinePersistence(current, records, site, zone, journal.history, context);
+    if (checked.status !== 'validated') return blocked(checked.code);
+    // Independent reference checkpoint + physical rows/journal establish only
+    // offline documentary consistency. Never hydrate a runtime registry.
+    if (contract.validatePersistedOwnershipHistory(current, records, site, zone, journal.history).status !== 'rejected')
+      return blocked('OWNERSHIP_OFFLINE_PRODUCTION_ISOLATION_FAILED');
+    const again = await readOfflineOperationHistory(config, fixtureAdmission);
+    if (representationKey(again) !== representationKey(journal)) return blocked('OWNERSHIP_OFFLINE_JOURNAL_CHANGED');
+    db.exec('COMMIT'); db.close(); db = undefined;
+    return { status: 'consistent-offline-storage', current: structuredClone(current), records: structuredClone(records),
+      ...persistenceOnly, mode: 'offline-test-only', authentication: 'fixtures-only' };
+  } catch { return blocked('OWNERSHIP_OFFLINE_RECOVERY_INVALID'); }
+  finally { if (db) { try { db.exec('ROLLBACK'); } catch {} try { db.close(); } catch {} } }
+}
+`;
