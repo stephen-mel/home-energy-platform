@@ -2,13 +2,20 @@
 /* Local-only bootstrap: no app route or background registration. */
 import fs from 'node:fs';
 import ts from 'typescript';
-import { createRequire } from 'node:module';
+import Module, { createRequire } from 'node:module';
 const localRequire = createRequire(import.meta.url);
 localRequire.extensions['.ts'] = (module, filename) => {
   const compiled = ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true },
   }).outputText;
   module._compile(compiled, filename);
+};
+// Match the existing inspection CLI: this local Node process is the server
+// boundary for validated acquisition, which retains its Next server-only marker.
+const originalLoad = Module._load;
+Module._load = function (request, parent, isMain) {
+  if (request === 'server-only') return {};
+  return originalLoad.call(this, request, parent, isMain);
 };
 const { runLocalExperiment, safeExperimentFailureCode, safeExperimentFreshnessDetails } = localRequire('../src/lib/tesla-tariff/supervised-local.ts');
 runLocalExperiment(process.argv.slice(2)).catch(error => {

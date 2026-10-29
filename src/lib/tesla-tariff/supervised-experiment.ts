@@ -4,7 +4,12 @@ import type { JournalCompletionCapability } from "./supervised-journal";
 import type { PreparedMutationContext } from "./prepared-mutation-context";
 import type { Site } from "../site/types";
 import type { KrakenState } from "../site/kraken-state";
-import { getSitePriceSignal } from "../site/get-site-price-signal";
+import { getSitePriceSignal, siteWithKrakenImportTariff } from "../site/get-site-price-signal";
+import { validateTeslaInspectionEvidence, validateKrakenInspectionEvidence } from "./smart-inspection";
+import { parseDispatchResponse } from "../kraken/dispatch-response";
+import { observedEconomicSignal } from "./observed-economic";
+import { krakenDispatchPriceWindows } from "../tariff/kraken-dispatches";
+import { buildPriceCurve } from "../tariff/price-signal";
 import { comparePriceSignalsInDomain } from "../tariff/comparison-domain";
 import { analyseObservedDates, type ObservedTariff } from "./observed-tariff";
 import { createTariffProposal, approveTariffProposal, assessProposalCurrentUse } from "./proposal-approval";
@@ -56,6 +61,26 @@ export class StaleApprovalOrEvidenceError extends Error {
     }
 }
 
+/** Current interactive acquisition contract. Validation is not authentication:
+ * only the existing server acquisition supplies the trusted snapshot. Legacy V1
+ * journal reconstruction remains readable without inventing historical pricing. */
+export function validateCurrentSupervisedCapture(site: Site, capture: Capture, at: string): Capture {
+    const before = validateTeslaInspectionEvidence(capture.before);
+    if (!before || before.source.energySiteId !== site.integrations.tesla.energySiteId
+        || before.source.timeZone !== site.tariff?.timeZone) throw Error("CURRENT_TESLA_EVIDENCE_INVALID");
+    const kraken = validateKrakenInspectionEvidence(capture.kraken);
+    if (!kraken || kraken.stale !== false || kraken.importTariffDiagnostic
+        || !fresh(kraken.lastSuccessfulUpdate, at, EVIDENCE_TTL_MS)
+        || !Array.isArray(kraken.vehicles) || kraken.vehicles.some(v => !v || typeof v.id !== "string"
+            || typeof v.name !== "string" || parseDispatchResponse({ flexPlannedDispatches: v.plannedDispatches }).status !== "complete"))
+        throw Error("CURRENT_KRAKEN_EVIDENCE_REQUIRED");
+    const identity = site.integrations.kraken.importTariffIdentity;
+    if (!identity || identity.accountRef && identity.accountRef !== kraken.importTariff?.accountRef
+        || !siteWithKrakenImportTariff(site, kraken, at, true).tariff?.versions?.length)
+        throw Error("CURRENT_KRAKEN_PRICING_REQUIRED");
+    return { before, kraken };
+}
+
 export function prepareSupervisedExperiment(site: Site, selection: Selection, capture: Capture, generatedAt: string) {
     if (!/^\d+$/.test(selection.energySiteId) || !selection.assetId || !fresh(capture.before.source.observedAt, generatedAt, CAPTURE_TTL_MS)
         || !fresh(capture.kraken.lastSuccessfulUpdate, generatedAt, EVIDENCE_TTL_MS) || capture.kraken.stale) throw new Error("FRESH_CAPTURE_AND_EVIDENCE_REQUIRED");
@@ -70,8 +95,27 @@ export function prepareSupervisedExperiment(site: Site, selection: Selection, ca
     const day = analyseObservedDates(capture.before, [date]).days[0];
     if (!day?.periods.length) throw new Error("DAY_COVERAGE_REQUIRED");
     const domain = { start: day.periods[0].start, end: day.periods.at(-1)!.end };
-    const signal = getSitePriceSignal(site, capture.kraken, domain.start).signal;
-    const base = getSitePriceSignal(site, null, domain.start).signal;
+    // Presence of current pricing opts into strict preparation. The no-pricing
+    // branch is retained solely for existing V1 evidence reconstruction; the
+    // interactive adapter always requires validateCurrentSupervisedCapture.
+    const currentEvidence = capture.kraken.importTariff !== undefined || capture.kraken.importTariffDiagnostic !== undefined;
+    let base, signal;
+    if (currentEvidence) {
+        capture = validateCurrentSupervisedCapture(site, capture, generatedAt);
+        const version = capture.kraken.importTariff!.version;
+        if (Date.parse(version.effectiveFrom) > Date.parse(domain.start)
+            || Date.parse(version.effectiveTo) < Date.parse(domain.end)
+            || Date.parse(dispatch.start) < Date.parse(version.effectiveFrom)
+            || Date.parse(dispatch.end) > Date.parse(version.effectiveTo)) throw Error("CURRENT_PRICING_COVERAGE_INCOMPLETE");
+        base = observedEconomicSignal(capture.before, domain).signal;
+        const windows = krakenDispatchPriceWindows(capture.kraken, version.scheduledChargingImport).filter(w =>
+            w.sources.some(source => source.cause?.assetId === selection.assetId
+                && source.cause.start === dispatch.start && source.cause.end === dispatch.end));
+        signal = { ...base, generatedAt, import: buildPriceCurve(domain, null, [...base.import, ...windows]) };
+    } else {
+        signal = getSitePriceSignal(site, capture.kraken, domain.start).signal;
+        base = getSitePriceSignal(site, null, domain.start).signal;
+    }
     const compared = comparePriceSignalsInDomain(base, signal, domain);
     if (compared.status === "indeterminate") throw new Error("COMMON_DOMAIN_UNAVAILABLE");
     const proposal = createTariffProposal({ proposalId: "supervised-smart-inspection", energySiteId: selection.energySiteId,
@@ -86,7 +130,7 @@ export function prepareSupervisedExperiment(site: Site, selection: Selection, ca
     const payloadJson = representationKey(payload);
     const binding = { authority: "supervised-experiment" as const, selection, proposalFingerprint: proposal.fingerprint,
         payloadKey: payloadJson, smartEvidenceKey: smartEvidenceKey(capture.kraken), generatedAt };
-    const hardBlockers = [...new Set([...proposal.compatibilityBlockers, ...restoration.blockers])].filter(code =>
+    const hardBlockers = [...new Set([...proposal.compatibilityBlockers, ...restoration.blockers, ...(currentEvidence ? ["CURRENT_EVIDENCE_PREPARATION_ONLY"] : [])])].filter(code =>
         !MANUAL_RECOVERY_RISKS.has(code) && !["EXACT_PROPOSAL_APPROVAL_REQUIRED", "OUTSIDE_CURRENT_VALIDITY", "AUTHORITY_OBSERVE_ONLY"].includes(code));
     return { proposal, restoration, binding, fingerprint: representationKey(binding), payloadJson, date, hardBlockers,
         before: capture.before, evidenceCapturedAt: capture.kraken.lastSuccessfulUpdate,

@@ -7,20 +7,21 @@ import { createHash, randomUUID } from "node:crypto";
 import { createInterface } from "node:readline/promises";
 import { loadEnvConfig } from "@next/env";
 import { currentSite } from "../site/current-site";
-import { getKrakenDevices, getKrakenPlannedDispatches } from "../kraken/client";
-import type { KrakenState } from "../site/kraken-state";
+import { getRecordedKrakenStateForInspection } from "../site/kraken-refresh";
 import { captureObservedTariff } from "./observed-tariff";
 import * as journalRecords from "./linked-experiment-records";
 import { prepareMutationContext } from "./prepared-mutation-context";
 import { ownershipStore } from "./ownership-store";
 import { persistConfirmedSmart } from "./ownership-sqlite";
 import { claimExperimentJournal } from "./supervised-journal";
-import { runSupervisedExperiment, interpretWriteResponse, StaleApprovalOrEvidenceError } from "./supervised-experiment";
+import { runSupervisedExperiment, interpretWriteResponse, StaleApprovalOrEvidenceError, validateCurrentSupervisedCapture } from "./supervised-experiment";
 
 const ROOT = "https://fleet-api.prd.eu.vn.cloud.tesla.com/api/1/energy_sites/";
 // Only these fixed identifiers may cross the CLI boundary. Never emit an
 // upstream message, cause, response body or stack (including authentication errors).
 const SAFE_FAILURE_CODES = new Set([
+    "CURRENT_TESLA_EVIDENCE_INVALID", "CURRENT_KRAKEN_EVIDENCE_REQUIRED", "CURRENT_KRAKEN_PRICING_REQUIRED",
+    "CURRENT_PRICING_COVERAGE_INCOMPLETE", "CURRENT_KRAKEN_ACQUISITION_FAILED",
     "INTERACTIVE_SUPERVISION_REQUIRED", "EXACT_SELECTION_REQUIRED", "INVALID_ARGUMENTS",
     "FRESH_CAPTURE_AND_EVIDENCE_REQUIRED", "CURRENT_SMART_DISPATCH_REQUIRED", "TARGET_MISMATCH",
     "STRUCTURALLY_VALID_BOUND_PROPOSAL_REQUIRED", "EXACT_HUMAN_APPROVAL_REQUIRED", "STALE_APPROVAL_OR_EVIDENCE",
@@ -105,15 +106,11 @@ export async function runLocalExperiment(args: string[]) {
     // is its existing obtainKrakenToken flow. Never invoke a preference mutation.
     const capture = async () => {
         try {
-            const readStartedAt = now();
-            const devices = await readBoundary("KRAKEN_DEVICE_READ_FAILED", getKrakenDevices);
-            const vehicles = [];
-            for (const device of devices) {
-                vehicles.push({ ...device, plannedDispatches: await readBoundary("KRAKEN_PLANNED_DISPATCH_READ_FAILED", () => getKrakenPlannedDispatches(device.id)),
-                    status: { currentState: null, isSuspended: null, stateOfCharge: null, activePower: null } });
-            }
-            const kraken: KrakenState = { vehicles, stale: false, lastSuccessfulUpdate: readStartedAt };
-            return { before: await readBefore(), kraken };
+            const result = await readBoundary("CURRENT_KRAKEN_ACQUISITION_FAILED", () => getRecordedKrakenStateForInspection(
+                currentSite.id, currentSite.integrations.kraken.importTariffIdentity, currentSite.integrations.kraken.exportTariffIdentity));
+            if (!result.state || !result.acquisition.freshEvidenceObtained || result.acquisition.staleFallbackUsed)
+                throw Error("CURRENT_KRAKEN_ACQUISITION_FAILED");
+            return validateCurrentSupervisedCapture(currentSite, { before: await readBefore(), kraken: result.state }, now());
         } catch (error) {
             if (safeExperimentFailureCode(error) === "READ_OR_EXECUTION_FAILED") throw new Error("CAPTURE_PREPARATION_FAILED");
             throw error;

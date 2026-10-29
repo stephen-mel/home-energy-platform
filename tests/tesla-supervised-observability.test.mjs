@@ -42,13 +42,12 @@ function harness(fault) {
     'node:readline/promises': { createInterface() { calls.prompts++; fail(); } },
     '@next/env': { loadEnvConfig() {} },
     '../site/current-site': { currentSite: site },
-    '../kraken/client': {
-      async getKrakenDevices() {
-        if (fault === 'devices') fail();
-        if (fault === 'capture') return null;
-        return fixture.kraken.vehicles;
+    '../site/kraken-refresh': {
+      async getRecordedKrakenStateForInspection() {
+        if (fault === 'devices' || fault === 'dispatches') fail();
+        return { state: fault === 'capture' ? null : fixture.kraken,
+          acquisition: { freshEvidenceObtained: true, staleFallbackUsed: false } };
       },
-      async getKrakenPlannedDispatches() { if (fault === 'dispatches') fail(); return fixture.kraken.vehicles[0].plannedDispatches; },
     },
     './observed-tariff': { captureObservedTariff() {
       if (fault === 'tesla-capture') fail();
@@ -57,7 +56,9 @@ function harness(fault) {
       return fixture.before;
     } },
     './supervised-journal': { claimExperimentJournal() { calls.claims++; fail(); } },
-    './supervised-experiment': core,
+    // These tests isolate transport error sanitisation; domain evidence validation
+    // is exercised through the real current-preparation integration suite.
+    './supervised-experiment': { ...core, validateCurrentSupervisedCapture: (_site, capture) => capture },
     './linked-experiment-records': domain('src/lib/tesla-tariff/linked-experiment-records.ts'),
     './prepared-mutation-context': domain('src/lib/tesla-tariff/prepared-mutation-context.ts'),
     './ownership-store': { ownershipStore: () => ({ read: async () => ({ status: 'missing' }) }) },
@@ -89,9 +90,9 @@ const failures = {
   'token-read': 'TESLA_TOKEN_READ_FAILED', 'token-json': 'TESLA_TOKEN_READ_FAILED',
   'token-invalid': 'READ_ACCESS_REQUIRED', 'tesla-network': 'TESLA_READ_FAILED',
   'tesla-http': 'TESLA_READ_FAILED', 'tesla-json': 'TESLA_READ_DECODE_FAILED',
-  site: 'SITE_MISMATCH', devices: 'KRAKEN_DEVICE_READ_FAILED',
-  dispatches: 'KRAKEN_PLANNED_DISPATCH_READ_FAILED', 'tesla-capture': 'TESLA_CAPTURE_FAILED',
-  capture: 'CAPTURE_PREPARATION_FAILED', preparation: 'PREPARATION_FAILED',
+  site: 'SITE_MISMATCH', devices: 'CURRENT_KRAKEN_ACQUISITION_FAILED',
+  dispatches: 'CURRENT_KRAKEN_ACQUISITION_FAILED', 'tesla-capture': 'TESLA_CAPTURE_FAILED',
+  capture: 'CURRENT_KRAKEN_ACQUISITION_FAILED', preparation: 'PREPARATION_FAILED',
   'known-preparation': 'FRESH_CAPTURE_AND_EVIDENCE_REQUIRED',
 };
 for (const [fault, code] of Object.entries(failures)) {
