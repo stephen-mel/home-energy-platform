@@ -1,3 +1,4 @@
+import { simulatedTariffObservation } from "./observed-tariff";
 import { validOwnershipTimestamp } from "./ownership-evidence";
 import type { JournalCompletionCapability } from "./supervised-journal";
 import type { PreparedMutationContext } from "./prepared-mutation-context";
@@ -176,7 +177,7 @@ export async function runSupervisedExperiment(input: {
     catch { apiWrite = { status: "unknown", httpStatus: null }; }
     let readBack: ObservedTariff | null = null;
     try { readBack = await ports.readBack(input.selection.energySiteId); } catch { /* recorded independently below */ }
-    const intended: ObservedTariff = { ...review.before, source: { ...review.before.source, kind: "simulation" }, tariff: review.proposal.bound.representation };
+    const intended = simulatedTariffObservation(review.before, review.proposal.bound.representation);
     const comparison = compareObservedTariffReadBack({ intended, readBack, after: attemptAt, dates: [review.date] });
     const classification = classifyExperimentResult(apiWrite, intended, readBack, comparison);
     const record = ports.journalRecords.createLinkedClassifiedRecord(initial, { phase: "classified", attemptedAt: attemptAt, completedAt: ports.now(), exception,

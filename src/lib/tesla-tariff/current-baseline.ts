@@ -1,6 +1,7 @@
 import type { PriceSignal } from "../tariff/types";
 import { comparePriceSignalsInDomain } from "../tariff/comparison-domain";
 import { inspectObservedProposalTariff } from "./experiment-tariff";
+import { validateTeslaInspectionEvidence } from "./smart-inspection";
 import { validOwnershipTimestamp } from "./ownership-evidence";
 import { captureObservedTariff, type ObservedTariff } from "./observed-tariff";
 import { representationKey } from "./rollback-evidence";
@@ -75,7 +76,7 @@ const exactObservedTariff = (value: unknown) => {
 function validTeslaEnvelope(value: unknown): value is TeslaCurrentState {
     if (!object(value) || !keys(value, ["source", "tariff", "operatingMode", "diagnostics"])
         || !object(value.source) || !keys(value.source, ["kind", "energySiteId", "observedAt", "timeZone"])
-        || !object(value.tariff) || !keys(value.tariff, ["source", "tariff", "diagnostics", "rollbackProven"])
+        || !object(value.tariff) || !keys(value.tariff, ["source", "tariff", "diagnostics", "rollbackProven"], ["representations"])
         || !object(value.tariff.source) || !keys(value.tariff.source, ["kind", "energySiteId", "observedAt", "timeZone"])
         || value.source.kind !== "tesla-site-info" || value.tariff.source.kind !== "tesla-site-info"
         || typeof value.source.energySiteId !== "string" || !/^\d+$/.test(value.source.energySiteId)
@@ -85,6 +86,9 @@ function validTeslaEnvelope(value: unknown): value is TeslaCurrentState {
         || !(value.tariff.source.timeZone === null || validTimeZone(value.tariff.source.timeZone))
         || !strings(value.diagnostics) || !strings(value.tariff.diagnostics) || value.tariff.rollbackProven !== false
         || !(value.operatingMode === null || enumValue(value.operatingMode, ["self_consumption", "autonomous", "backup"]))) return false;
+    const pair = value.tariff.representations;
+    if (pair !== undefined && (!object(pair) || !keys(pair, ["v2", "legacy", "relationship"])
+        || !enumValue(pair.relationship, ["consistent", "conflicting", "unverifiable"]))) return false;
     return value.tariff.tariff === null || object(value.tariff.tariff);
 }
 function validExpectedEnvelope(value: unknown): value is ExpectedEonState {
@@ -158,7 +162,10 @@ export function assessTrustedCurrentBaseline(input: {
     const expectedBound = !!timeZone && !!siteId && !!expected && expected.source.siteId === siteId && expected.source.timeZone === timeZone
         && expected.source.kind === "kraken-account-tariff";
     const teslaComplete = !!tesla?.tariff.tariff && exactObservedTariff(tesla.tariff.tariff)
-        && !tesla.tariff.diagnostics.includes("UNSUPPORTED_FIELDS_OMITTED");
+        && !tesla.tariff.diagnostics.includes("UNSUPPORTED_FIELDS_OMITTED")
+        // Envelope shape and completeness remain separate diagnostics. Reuse the
+        // shared strict validator for raw/extracted identity and dual coverage.
+        && (tesla.tariff.representations === undefined || validateTeslaInspectionEvidence(tesla.tariff) !== null);
     const expectedSourcesValid = !!expected && [...expected.signal.import, ...expected.signal.export].every(window =>
         window.sources.length > 0 && Array.from(window.sources).every(source =>
             source.provider === "eon-next-kraken" && source.observedAt === expected.source.observedAt && source.stale === false));

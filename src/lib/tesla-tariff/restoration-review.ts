@@ -1,5 +1,5 @@
 import { inspectObservedProposalTariff } from "./experiment-tariff";
-import { analyseObservedDates, priceAt, type ObservedTariff, type ObservedContent } from "./observed-tariff";
+import { compareTariffRepresentations, analyseObservedDates, priceAt, type ObservedTariff, type ObservedContent } from "./observed-tariff";
 import { representationKey, assessRollbackEvidence } from "./rollback-evidence";
 import { baselineExperimentContext, type BaselineRecord } from "./baseline";
 import { assessProposalCurrentUse, type Proposal } from "./proposal-approval";
@@ -35,7 +35,10 @@ export function reviewObservedRestoration(input: {
 }) {
     const { before, temporaryProposal: proposal } = input;
     const inspected = inspectObservedProposalTariff(before.tariff);
-    const lossless = inspected.exact && !before.diagnostics.includes("UNSUPPORTED_FIELDS_OMITTED");
+    const raw = before.representations;
+    const lossless = inspected.exact && !before.diagnostics.includes("UNSUPPORTED_FIELDS_OMITTED")
+        && (!raw || representationKey(raw.v2) === representationKey(before.tariff)
+            && (raw.legacy === null || compareTariffRepresentations(raw.v2, raw.legacy) === "consistent"));
     const candidate = lossless ? inspected.tariff : null;
     const captured = Date.parse(before.source.observedAt), now = Date.parse(input.asOf);
     const identityValid = before.source.kind === "tesla-site-info" && before.source.energySiteId === proposal.bound.energySiteId
@@ -118,9 +121,21 @@ export function compareObservedTariffReadBack(input: {
             buyRaisedToSell: p.buy !== null && p.sell !== null && p.buy < p.sell && q.buy === p.sell && q.sell === p.sell
                 && p.buyCurrency === q.buyCurrency && p.sellCurrency === q.sellCurrency });
     }
-    const exact = sufficient && representationKey(a.tariff) === representationKey(b.tariff);
-    return { outcome: !sufficient ? "insufficient-evidence" : exact ? "exact-observed-match" : "different-observed-representation",
-        representationMatches: !!exact, differences,
+    const pair = readBack?.representations;
+    const originalPair = intended.representations;
+    const requiredPair = intended.simulationBaselineRepresentations ?? originalPair;
+    const rawMatches = !pair || representationKey(pair.v2) === representationKey(readBack?.tariff);
+    const intendedEvidenceValid = !originalPair || representationKey(originalPair.v2) === representationKey(intended.tariff)
+        && (originalPair.legacy === null || compareTariffRepresentations(originalPair.v2, originalPair.legacy) === "consistent");
+    const dualSufficient = intendedEvidenceValid && (!pair || (pair.legacy === null || compareTariffRepresentations(pair.v2, pair.legacy) === "consistent"))
+        && (!requiredPair || requiredPair.legacy === null || !!pair && pair.legacy !== null && compareTariffRepresentations(pair.v2, pair.legacy) === "consistent");
+    const legacyMatches = !originalPair || originalPair.legacy === null || intended.source.kind === "simulation"
+        || !!pair && representationKey(originalPair.legacy) === representationKey(pair.legacy);
+    const exportSubtreeMatches = sufficient && rawMatches && dualSufficient
+        && representationKey(a.tariff?.sell_tariff) === representationKey(b.tariff?.sell_tariff);
+    const exact = sufficient && rawMatches && dualSufficient && legacyMatches && representationKey(a.tariff) === representationKey(b.tariff);
+    return { outcome: !sufficient || !dualSufficient ? "insufficient-evidence" : exact ? "exact-observed-match" : "different-observed-representation",
+        representationMatches: !!exact, exportSubtreeMatches: !!exportSubtreeMatches, differences,
         timelineScope: { dates: [...input.dates], complete: !!before && !!after && input.dates.length > 0
             && before.days.length === new Set(input.dates).size && !before.diagnostics.includes("INVALID_CALENDAR_DATE") },
         writeAcceptance: "not-established" as const, causation: "not-inferred" as const,

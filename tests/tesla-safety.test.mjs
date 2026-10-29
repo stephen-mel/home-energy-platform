@@ -36,7 +36,7 @@ const verify = record => baseline.verifyTariffBaseline(record, { fingerprint: re
 const rollback = load('src/lib/tesla-tariff/rollback-evidence.ts');
 const tariffTools = load('src/lib/tesla-tariff/experiment-tariff.ts');
 const domains = load('src/lib/tariff/comparison-domain.ts', { './compare-price-signal': comparison, './price-signal': curve });
-const observed = load('src/lib/tesla-tariff/observed-tariff.ts');
+const observed = load('src/lib/tesla-tariff/observed-tariff.ts', { './experiment-tariff': tariffTools });
 const simulation = load('src/lib/tesla-tariff/observed-simulation.ts', { './observed-tariff': observed });
 const syncPlanner = load('src/lib/tesla-tariff/sync-planner.ts', {
   '../tariff/comparison-domain': domains, '../tariff/compare-price-signal': comparison, './dry-run': dryRun,
@@ -377,6 +377,8 @@ test('exact restoration GET match is observation only; reordered object keys mat
 test('buy-raised-to-sell is detected during BOTH temporary and restoration read-back, without altering expected prices', () => {
   const original = q7Observation();
   const temporary = proposals.createTariffProposal(q7Input()).observedPreparation.simulation.simulated;
+  assert.equal(JSON.stringify(temporary.representations.v2), JSON.stringify(temporary.tariff));
+  assert.ok(temporary.simulationBaselineRepresentations);
   for (const intended of [original, temporary]) {
     const readBack = laterCapture(intended);
     for (const c of Object.values(readBack.tariff.energy_charges)) for (const label of Object.keys(c.rates)) if (c.rates[label] < 0.17) c.rates[label] = 0.17;

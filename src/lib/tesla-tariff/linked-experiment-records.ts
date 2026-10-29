@@ -4,7 +4,7 @@ import type { PreparedExperiment, Consent, WriteResult } from "./supervised-expe
 import { classifyExperimentResult, APPROVAL_TTL_MS, MIN_WRITE_REMAINING_MS } from "./supervised-experiment";
 import type { ProposalApproval } from "./proposal-approval";
 import { createTariffProposal } from "./proposal-approval";
-import type { ObservedTariff } from "./observed-tariff";
+import { simulatedTariffObservation, type ObservedTariff } from "./observed-tariff";
 import { compareObservedTariffReadBack } from "./restoration-review";
 import { representationKey } from "./rollback-evidence";
 import { checkOwnershipDomain, ownershipFingerprint } from "./ownership-transition";
@@ -177,8 +177,7 @@ export function validLinkedClassifiedRecord(value: unknown, initial: LinkedIniti
             && r.apiWrite.httpStatus >= 200 && r.apiWrite.httpStatus <= 299)) return false;
         const observation = r.apiTariffReadBack.observation;
         if (observation && (!validSource(observation.source) || observation.source.energySiteId !== r.energySiteId || observation.source.timeZone !== initial.review.proposal.bound.timeZone)) return false;
-        const intended: ObservedTariff = { ...initial.review.before,
-            source: { ...initial.review.before.source, kind: "simulation" }, tariff: initial.review.proposal.bound.representation };
+        const intended = simulatedTariffObservation(initial.review.before, initial.review.proposal.bound.representation);
         const comparison = compareObservedTariffReadBack({ intended,
             readBack: observation, after: r.attemptedAt, dates: [initial.review.date] });
         if (comparison.outcome !== "insufficient-evidence" && (!observation

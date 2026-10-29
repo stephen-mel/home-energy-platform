@@ -11,7 +11,7 @@ function load(file, dependencies = {}, globals = {}) {
     require(name) { assert.ok(name in dependencies, `Unexpected dependency: ${name}`); return dependencies[name]; } });
   return exports;
 }
-const observed = load('src/lib/tesla-tariff/observed-tariff.ts');
+const observed = load('src/lib/tesla-tariff/observed-tariff.ts', { './experiment-tariff': load('src/lib/tesla-tariff/experiment-tariff.ts') });
 const simulation = load('src/lib/tesla-tariff/observed-simulation.ts', { './observed-tariff': observed });
 const plain = x => JSON.parse(JSON.stringify(x));
 // Mirrors the relevant live 22 September 2026 tariff fields, with a fictitious site
@@ -141,4 +141,70 @@ test('nonzero demand charges are preserved in capture but block energy-only simu
   assert.equal(o.tariff.demand_charges.ALL.rates.ALL, 1);
   const result = simulate('2026-09-22', o);
   assert.equal(result.status, 'blocked'); assert.ok(result.blockers.includes('NONZERO_DEMAND_CHARGES_UNSUPPORTED'));
+});
+
+function legacyEncoding(v) {
+  const out = structuredClone(v); delete out.version;
+  for (const field of ['energy_charges', 'demand_charges'])
+    out[field] = Object.fromEntries(Object.entries(v[field]).map(([k, c]) => [k, c.rates ?? {}]));
+  for (const season of Object.values(out.seasons)) for (const [k, tou] of Object.entries(season.tou_periods))
+    season.tou_periods[k] = tou.periods.map(p => ({ fromDayOfWeek: 0, toDayOfWeek: 0, fromHour: 0, fromMinute: 0, toHour: 0, toMinute: 0, ...p }));
+  if (v.sell_tariff) out.sell_tariff = legacyEncoding(v.sell_tariff);
+  return structuredClone(out);
+}
+test('dual representations retain independent sparse encodings and annual wraparound', () => {
+  const raw = fixture(); raw.response.tariff_content = legacyEncoding(raw.response.tariff_content_v2);
+  const o = capture(raw);
+  assert.equal(o.representations.relationship, 'consistent');
+  assert.deepEqual(plain(o.representations.v2), raw.response.tariff_content_v2);
+  assert.deepEqual(plain(o.representations.legacy), raw.response.tariff_content);
+  raw.response.tariff_content.name = 'mutated';
+  assert.notEqual(o.representations.legacy.name, 'mutated');
+  assert.equal(observed.analyseObservedDates(o, ['2027-01-01']).days[0].periods[0].buySeason, 'ThreeDays');
+});
+test('dual comparison rejects price, metadata, period and zero/empty substitutions', () => {
+  for (const mutate of [
+    t => { t.sell_tariff.energy_charges.Today.hour_0_minute_0 = .175; },
+    t => { t.name += ' changed'; },
+    t => { t.seasons.Today.tou_periods.hour_0_minute_0[0].toMinute = 30; t.seasons.Today.tou_periods.hour_6_minute_0[0].fromMinute = 30; },
+    t => { t.demand_charges.Today = { ALL: 0 }; },
+  ]) {
+    const v = fixture().response.tariff_content_v2, l = legacyEncoding(v); mutate(l);
+    assert.equal(observed.compareTariffRepresentations(v, l), 'conflicting');
+  }
+});
+test('unknown fields are unverifiable, and missing timezone never gains temporal evidence', () => {
+  const raw = fixture(); raw.response.tariff_content = legacyEncoding(raw.response.tariff_content_v2);
+  raw.response.tariff_content.extension = true; delete raw.response.installation_time_zone;
+  const o = capture(raw);
+  assert.equal(o.representations.relationship, 'unverifiable');
+  assert.equal(o.source.timeZone, null);
+  assert.ok(o.diagnostics.includes('TIMEZONE_UNAVAILABLE'));
+  assert.equal(o.representations.legacy.extension, true);
+});
+
+test('observed restoration profile is lossless for dual sparse baseline and absent sell version', () => {
+  const raw = fixture(); raw.response.tariff_content = legacyEncoding(raw.response.tariff_content_v2);
+  const o = capture(raw);
+  const inspect = load('src/lib/tesla-tariff/experiment-tariff.ts').inspectObservedProposalTariff;
+  const result = inspect(o.tariff);
+  assert.equal(result.exact, true);
+  assert.deepEqual(plain(result.tariff), raw.response.tariff_content_v2);
+  assert.equal('version' in result.tariff.sell_tariff, false);
+  assert.equal('fromHour' in result.tariff.seasons.Today.tou_periods.hour_0_minute_0.periods[0], false);
+});
+
+test('matching empty or partially populated evidence is unverifiable, not consistent', () => {
+  for (const mutate of [
+    v => { for (const s of [v, v.sell_tariff]) { s.seasons = {}; s.energy_charges = {}; s.demand_charges = {}; } },
+    v => { delete v.seasons.Today; delete v.energy_charges.Today; delete v.demand_charges.Today; },
+    v => { v.sell_tariff.energy_charges.Today.rates = {}; },
+    v => { v.seasons.Today.tou_periods.hour_0_minute_0.periods = []; },
+    v => { v.seasons.Today.fromDay++; },
+  ]) {
+    const v = fixture().response.tariff_content_v2; mutate(v);
+    const legacy = legacyEncoding(v);
+    assert.equal(observed.compareTariffRepresentations(v, legacy), 'unverifiable');
+    assert.equal(observed.compareTariffRepresentations(fixture().response.tariff_content_v2, legacy), 'unverifiable');
+  }
 });

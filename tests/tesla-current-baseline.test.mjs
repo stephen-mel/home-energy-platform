@@ -29,3 +29,40 @@ test('comparison domain is validated before any dereference or comparison',()=>{
 test('untrusted enum objects and primitives are rejected without coercion',()=>{const hostile={toString:null,valueOf:null};for(const value of [hostile,{},[],undefined,7,true,Symbol('invalid')]){const t=structuredClone(capture());t.operatingMode=value;let r;assert.doesNotThrow(()=>{r=assess(t,expected());});assert.ok(r.blockers.includes('TESLA_EVIDENCE_MALFORMED'));noAuthority(r);}for(const value of [hostile,{},[],null,undefined,7,true,Symbol('invalid')]){let r;for(const field of ['priceStatus','kind','condition']){const e=expected();e.signal.import[0][field]=value;assert.doesNotThrow(()=>{r=assess(capture(),e);});assert.ok(r.blockers.includes('EXPECTED_EON_EVIDENCE_MALFORMED'),field);noAuthority(r);}const e=expected(),source=structuredClone(e.signal.import[0].sources[0]);e.signal.import[0].eligibilityPeriods=[{start:domain.start,end:domain.end,assessmentPeriod:{...domain},state:value,sources:[source]}];assert.doesNotThrow(()=>{r=assess(capture(),e);});assert.ok(r.blockers.includes('EXPECTED_EON_EVIDENCE_MALFORMED'),'eligibility state');noAuthority(r);}});
 test('operating mode is observational and missing or unknown modes do not become inferred',()=>{for(const mode of [undefined,'unexpected']){const value=raw();if(mode===undefined)delete value.response.default_real_mode;else value.response.default_real_mode=mode;const c=capture(value);assert.equal(c.operatingMode,null);assert.ok(c.diagnostics.some(x=>x.startsWith('OPERATING_MODE_')));const r=assess(c);assert.equal(r.tesla.operatingModeStatus,'unknown');assert.equal(r.writeReady,false);}});
 test('results are detached and deeply immutable while caller inputs remain mutable',()=>{const input=raw(),t=capture(input),e=expected(),r=assess(t,e);e.signal.import[0].price.amount=9;input.response.tariff_content_v2.name='caller mutation';assert.equal(r.status,'insufficient-evidence');assert.equal(t.tariff.tariff.name,'Next Drive Smart V5.2');assert.throws(()=>{r.tesla.diagnostics.push('x');});assert.throws(()=>{r.blockers.push('x');});noAuthority(r);});
+
+test('real current-state capture reaches assessment with retained V2/legacy evidence and legacy compatibility',()=>{
+ const value=raw();
+ const legacy=s=>{
+  const out=structuredClone(s);delete out.version;
+  for(const f of ['energy_charges','demand_charges'])out[f]=Object.fromEntries(Object.entries(s[f]).map(([k,c])=>[k,c.rates??{}]));
+  for(const season of Object.values(out.seasons))for(const [label,tou]of Object.entries(season.tou_periods))season.tou_periods[label]=tou.periods;
+  if(s.sell_tariff)out.sell_tariff=legacy(s.sell_tariff);return out;
+ };
+ for(const dual of [false,true]){
+  if(dual)value.response.tariff_content=legacy(value.response.tariff_content_v2);
+  const t=api.captureTeslaCurrentState(value,energySiteId,now),snapshot=JSON.stringify(t);
+  const r=assess(t);
+  assert.equal(r.tesla.freshness,'fresh');assert.equal(r.tesla.operatingMode,'autonomous');
+  assert.ok(!r.blockers.includes('TESLA_EVIDENCE_MALFORMED'));
+  assert.ok(!r.blockers.includes('TESLA_TARIFF_INCOMPLETE'));
+  assert.ok(r.blockers.includes('EXPECTED_EON_ACCOUNT_BINDING_UNAVAILABLE'));noAuthority(r);
+  assert.equal(JSON.stringify(t),snapshot);
+  const old=structuredClone(t);delete old.tariff.representations;
+  assert.deepEqual(structuredClone(assess(old)),structuredClone(r));
+ }
+});
+test('current-state assessment rejects malformed, contradictory and incomplete retained encodings',()=>{
+ for(const mutate of [
+  t=>{t.tariff.representations.v2.sell_tariff.name+=' changed';},
+  t=>{t.tariff.representations.legacy={};t.tariff.representations.relationship='consistent';},
+  t=>{t.tariff.representations.v2.seasons={};t.tariff.representations.v2.energy_charges={};},
+  t=>{t.tariff.representations=null;},
+  t=>{t.tariff.representations.extra=true;},
+  t=>{t.tariff.representations.relationship='forged';},
+ ]){
+  const t=structuredClone(capture());mutate(t);const snapshot=JSON.stringify(t),r=assess(t);
+  assert.equal(r.status,'insufficient-evidence');
+  assert.ok(r.blockers.includes('TESLA_EVIDENCE_MALFORMED')||r.blockers.includes('TESLA_TARIFF_INCOMPLETE'));
+  assert.equal(r.comparison,null);noAuthority(r);assert.equal(JSON.stringify(t),snapshot);
+ }
+});

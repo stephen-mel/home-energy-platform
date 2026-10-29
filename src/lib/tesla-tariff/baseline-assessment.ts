@@ -1,5 +1,5 @@
-import type { ObservedContent, ObservedTariff } from "./observed-tariff";
-import { inspectObservedProposalTariff } from "./experiment-tariff";
+import { simulatedTariffObservation, type ObservedContent, type ObservedTariff } from "./observed-tariff";
+import { validateTeslaInspectionEvidence } from "./smart-inspection";
 import { validOwnership, validOwnershipTimestamp } from "./ownership-evidence";
 import type { OwnershipRead } from "./ownership-store";
 import { ownershipFingerprint } from "./ownership-transition";
@@ -30,15 +30,14 @@ function validSource(value: unknown, site: string) {
     try { new Intl.DateTimeFormat("en-GB", { timeZone: value.timeZone }); return true; } catch { return false; }
 }
 function validObservation(value: unknown, site: string): value is ObservedTariff {
-    return object(value) && keys(value, ["source", "tariff", "diagnostics", "rollbackProven"])
+    return object(value) && keys(value, ["source", "tariff", "diagnostics", "rollbackProven", ...(value.representations !== undefined ? ["representations"] : [])])
         && validSource(value.source, site) && (value.tariff === null || object(value.tariff))
         && Array.isArray(value.diagnostics) && value.diagnostics.every((item: unknown) => typeof item === "string")
         && value.rollbackProven === false;
 }
 function completeObservation(value: unknown, site: string): value is ObservedTariff & { tariff: ObservedContent } {
     return validObservation(value, site) && value.tariff !== null
-        && inspectObservedProposalTariff(value.tariff).exact
-        && !value.diagnostics.includes("UNSUPPORTED_FIELDS_OMITTED");
+        && validateTeslaInspectionEvidence(value) !== null;
 }
 function validSuppliedReadBackChronology(value: unknown) {
     if (!object(value) || !object(value.apiTariffReadBack)) return false;
@@ -81,9 +80,7 @@ function legacyPair(records: unknown[], site: string): HistoricalPair | null {
         || !object(bound.representation) || !object(classified.apiTariffReadBack)
         || !keys(classified.apiTariffReadBack, ["observation", "comparison"])) return null;
     const typedInitial = initial as LegacyInitial, typedClassified = classified as LegacyClassified;
-    const temporary: ObservedTariff = { ...structuredClone(before),
-        source: { ...structuredClone(before.source), kind: "simulation" },
-        tariff: structuredClone(bound.representation) as ObservedContent };
+    const temporary = simulatedTariffObservation(before, bound.representation as ObservedContent);
     const readBack = classified.apiTariffReadBack.observation;
     if (readBack !== null && !completeObservation(readBack, site)) return null;
     const comparison = compareObservedTariffReadBack({ intended: temporary, readBack: readBack as ObservedTariff | null,
@@ -101,8 +98,7 @@ function historicalPair(records: unknown[], site: string): HistoricalPair | null
         const initial = records[0], classified = records[1];
         if (!validSuppliedReadBackChronology(classified)) return null;
         return { integrity: "linked-validated", initial, classified, baseline: initial.review.before,
-            temporary: { ...structuredClone(initial.review.before), source: { ...initial.review.before.source, kind: "simulation" },
-                tariff: structuredClone(initial.review.proposal.bound.representation)! },
+            temporary: simulatedTariffObservation(initial.review.before, initial.review.proposal.bound.representation),
             date: initial.review.date, site };
     }
     return legacyPair(records, site);

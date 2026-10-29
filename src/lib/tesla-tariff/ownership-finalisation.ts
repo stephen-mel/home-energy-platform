@@ -1,5 +1,5 @@
 import { createTariffProposal, approveTariffProposal, type Proposal, type ProposalApproval } from "./proposal-approval";
-import type { ObservedTariff } from "./observed-tariff";
+import { simulatedTariffObservation, type ObservedTariff } from "./observed-tariff";
 import { compareObservedTariffReadBack } from "./restoration-review";
 import { representationKey } from "./rollback-evidence";
 import { CAPTURE_TTL_MS, APPROVAL_TTL_MS, type WriteResult } from "./supervised-experiment";
@@ -64,7 +64,7 @@ export function validateConfirmedSmartReceipt(supplied: ConfirmedSmartReceipt) {
             || typeof execution.apiWrite.httpStatus !== "number" || !Number.isFinite(execution.apiWrite.httpStatus)
             || !Number.isInteger(execution.apiWrite.httpStatus) || execution.apiWrite.httpStatus < 200 || execution.apiWrite.httpStatus > 299)
             return reject("MUTATION_NOT_CONFIRMED");
-        const intended = { ...before, tariff: proposal.bound.representation! };
+        const intended = simulatedTariffObservation(before, proposal.bound.representation!);
         const compared = compareObservedTariffReadBack({ intended, readBack: after, after: execution.submittedAt,
             dates: [proposal.observedPreparation!.localValidity!.date] });
         if (compared.outcome !== "exact-observed-match" || !compared.timelineScope.complete) return reject("READBACK_NOT_EXACT");

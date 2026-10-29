@@ -1,4 +1,4 @@
-import { analyseObservedDates, calendarDate, ordinal, priceAt, seasonContains, type ObservedTariff, type ObservedSide, type ObservedSeason } from "./observed-tariff";
+import { simulatedTariffObservation, analyseObservedDates, calendarDate, ordinal, priceAt, seasonContains, type ObservedTariff, type ObservedSide, type ObservedSeason } from "./observed-tariff";
 
 /** Exhaustive calendar-date/weekday structural coverage, sampling every time boundary. */
 export function observedCoverage(side: ObservedSide): string[] {
@@ -112,7 +112,7 @@ export function simulateObservedSmartDate(observed: ObservedTariff, input: {
     }
     blockers.push(...observedCoverage(tariff), ...observedCoverage(tariff.sell_tariff));
     if (blockers.length) return failure();
-    const simulated: ObservedTariff = { ...observed, source: { ...observed.source, kind: "simulation" }, tariff };
+    const simulated = simulatedTariffObservation(observed, tariff);
     const dates = [...new Set([input.date, ...input.compareDates])];
     const before = analyseObservedDates(observed, dates), after = analyseObservedDates(simulated, dates);
     const differences: Array<{ date: string; start: string; end: string; fromMinute: number; toMinute: number; offsetMinutes: number;

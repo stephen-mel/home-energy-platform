@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import type { Site } from "../site/types";
 import type { KrakenState } from "../site/kraken-state";
 import type { KrakenImportTariffEvidence } from "../kraken/import-tariff";
-import type { ObservedTariff } from "./observed-tariff";
+import { compareTariffRepresentations, type ObservedTariff } from "./observed-tariff";
 import { reconcileTeslaTariff, unavailableReconciliation } from "./reconciliation";
 import { siteWithKrakenImportTariff } from "../site/get-site-price-signal";
 import { krakenDispatchPriceWindows } from "../tariff/kraken-dispatches";
@@ -93,7 +93,7 @@ function validatedImportTariff(value: unknown): KrakenImportTariffEvidence | nul
 }
 
 function validatedTeslaObservation(value: unknown): ObservedTariff | null {
-    if (!object(value) || !exact(value, ["source", "tariff", "diagnostics", "rollbackProven"])
+    if (!object(value) || !exact(value, ["source", "tariff", "diagnostics", "rollbackProven", ...(value.representations !== undefined ? ["representations"] : [])])
         || !object(value.source) || !exact(value.source, ["kind", "energySiteId", "observedAt", "timeZone"])
         || value.source.kind !== "tesla-site-info" || !text(value.source.energySiteId)
         || !timestamp(value.source.observedAt) || !text(value.source.timeZone)
@@ -102,7 +102,16 @@ function validatedTeslaObservation(value: unknown): ObservedTariff | null {
     try { new Intl.DateTimeFormat("en-GB", { timeZone: value.source.timeZone }); } catch { return null; }
     const inspected = inspectObservedProposalTariff(value.tariff);
     if (!inspected.exact || !inspected.tariff || value.diagnostics.includes("UNSUPPORTED_FIELDS_OMITTED")) return null;
-    return { source: value.source as ObservedTariff["source"], tariff: inspected.tariff,
+    if (value.representations !== undefined) {
+        const pair = value.representations;
+        if (!object(pair) || !exact(pair, ["v2", "legacy", "relationship"])
+            || representationKey(pair.v2) !== representationKey(inspected.tariff)
+            || !inspectObservedProposalTariff(pair.v2).exact
+            || (pair.legacy === null ? pair.relationship !== "unverifiable"
+                : pair.relationship !== "consistent" || compareTariffRepresentations(pair.v2, pair.legacy) !== "consistent")) return null;
+    }
+    return { ...(value.representations !== undefined ? { representations: value.representations as ObservedTariff["representations"] } : {}),
+        source: value.source as ObservedTariff["source"], tariff: inspected.tariff,
         diagnostics: [...value.diagnostics] as string[], rollbackProven: false };
 }
 

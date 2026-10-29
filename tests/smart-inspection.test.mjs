@@ -421,3 +421,30 @@ test('validated evidence is detached and valid proposal/restoration bytes remain
  assert.deepEqual(structuredClone(actual.restorationCandidate),structuredClone(expected.restorationCandidate));
  for(const key of ['writeReady','rollbackProven','restorationProven','resolvesHistoricalJournal','grantsRepeatAuthority'])assert.equal(actual[key],false);
 });
+
+test('actual captured dual evidence survives inspection; contradictions and incomplete raw evidence fail closed',()=>{
+ const f=fixture(),v=f.observation.representations.v2;
+ const legacy=side=>{
+  const out=structuredClone(side);delete out.version;
+  for(const field of ['energy_charges','demand_charges'])if(side[field])out[field]=Object.fromEntries(Object.entries(side[field]).map(([k,c])=>[k,c.rates??{}]));
+  for(const season of Object.values(out.seasons))for(const [label,tou]of Object.entries(season.tou_periods))season.tou_periods[label]=tou.periods;
+  if(side.sell_tariff)out.sell_tariff=legacy(side.sell_tariff);return out;
+ };
+ f.observation=captureObservedTariff({installation_time_zone:'Europe/London',tariff_content_v2:v,tariff_content:legacy(v)},'123',f.now);
+ const good=inspectSmartTariff(f);assert.ok(good.payload);assert.equal(good.writeReady,false);
+ const validated=load('src/lib/tesla-tariff/smart-inspection.ts').validateTeslaInspectionEvidence(f.observation);
+ assert.equal(validated.representations.relationship,'consistent');
+ assert.notEqual(validated.representations,f.observation.representations);
+ for(const mutate of [
+  p=>{p.v2.sell_tariff.name+=' altered';},
+  p=>{p.legacy.sell_tariff.name+=' altered';},
+  p=>{p.legacy.seasons={};p.legacy.energy_charges={};},
+  p=>{p.relationship='unverifiable';},
+  p=>{p.extra=true;},
+ ]){
+  const bad=structuredClone(f);mutate(bad.observation.representations);
+  const result=inspectSmartTariff(bad);
+  assert.ok(result.blockers.includes('INSPECTION_TESLA_EVIDENCE_INVALID'));
+  assert.equal(result.payload,null);
+ }
+});

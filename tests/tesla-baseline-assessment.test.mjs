@@ -141,3 +141,96 @@ test('wrong-site capture cannot be verified and outputs are detached and immutab
  const good=observation(),result=assess(good);good.tariff.name='mutated';assert.equal(result.current.representation.name,'Next Drive Smart V5.2');
  assert.throws(()=>{result.current.representation.energy_charges.Annual.rates.peak=.9;},TypeError);assert.equal(result.current.representation.energy_charges.Annual.rates.peak,.25177);
 });
+
+test('dual readback detects intervening export metadata and refuses missing legacy evidence', () => {
+ const capture=load('src/lib/tesla-tariff/observed-tariff.ts').captureObservedTariff;
+ const toLegacy=v=>{const o=structuredClone(v);delete o.version;
+  for(const f of ['energy_charges','demand_charges'])o[f]=Object.fromEntries(Object.entries(v[f]).map(([k,c])=>[k,c.rates??{}]));
+  for(const s of Object.values(o.seasons))for(const [k,t]of Object.entries(s.tou_periods))s.tou_periods[k]=t.periods;
+  if(v.sell_tariff)o.sell_tariff=toLegacy(v.sell_tariff);return o;};
+ const v={...side(),sell_tariff:side(true)},raw={installation_time_zone:'Europe/London',tariff_content_v2:v,tariff_content:toLegacy(v)};
+ const before=capture(raw,'fixture-site','2026-10-27T10:00:00Z');
+ const check=r=>compare({intended:before,readBack:r,after:'2026-10-27T10:01:00Z',dates:['2026-10-27']});
+ assert.equal(check(capture(raw,'fixture-site','2026-10-27T10:02:00Z')).representationMatches,true);
+ const changed=structuredClone(raw);changed.tariff_content_v2.sell_tariff.name+=' changed';changed.tariff_content=toLegacy(changed.tariff_content_v2);
+ const result=check(capture(changed,'fixture-site','2026-10-27T10:02:00Z'));
+ assert.equal(result.representationMatches,false);assert.equal(result.exportSubtreeMatches,false);
+ delete changed.tariff_content;
+ assert.equal(check(capture(changed,'fixture-site','2026-10-27T10:02:00Z')).outcome,'insufficient-evidence');
+});
+
+test('contradictory intended raw V2 or legacy cannot produce exact readback match', () => {
+ const capture=load('src/lib/tesla-tariff/observed-tariff.ts').captureObservedTariff;
+ const raw={installation_time_zone:'Europe/London',tariff_content_v2:{...side(),sell_tariff:side(true)}};
+ const original=capture(raw,'fixture-site','2026-10-27T10:00:00Z');
+ const readBack=capture(raw,'fixture-site','2026-10-27T10:02:00Z');
+ const check=intended=>compare({intended,readBack,after:'2026-10-27T10:01:00Z',dates:['2026-10-27']});
+ assert.equal(check(original).outcome,'exact-observed-match');
+ const intended=structuredClone(original);
+ intended.representations.v2.sell_tariff.name+=' altered';
+ assert.equal(key(intended.tariff),key(original.tariff));
+ assert.equal(check(intended).outcome,'insufficient-evidence');
+ assert.equal(check(intended).representationMatches,false);
+ const legacyContradiction=structuredClone(original);
+ legacyContradiction.representations.legacy={name:'incomplete'};
+ legacyContradiction.representations.relationship='consistent';
+ assert.equal(check(legacyContradiction).outcome,'insufficient-evidence');
+});
+
+test('production simulation builds consistent intended evidence for exact proposed readback', () => {
+ const observed=load('src/lib/tesla-tariff/observed-tariff.ts');
+ const simulator=load('src/lib/tesla-tariff/observed-simulation.ts');
+ const v={...side(),sell_tariff:side(true)};
+ const before=observed.captureObservedTariff({installation_time_zone:'Europe/London',tariff_content_v2:v},'fixture-site','2026-10-27T10:00:00Z');
+ const baseline=key(before);
+ const result=simulator.simulateObservedSmartDate(before,{date:'2026-10-27',fromMinute:780,toMinute:810,buy:.0285,currency:'GBP',compareDates:[]});
+ assert.equal(result.status,'simulation-only');
+ const intended=result.simulated;
+ const readBack=observed.captureObservedTariff({installation_time_zone:'Europe/London',tariff_content_v2:intended.tariff},'fixture-site','2026-10-27T10:02:00Z');
+ assert.equal(compare({intended,readBack,after:'2026-10-27T10:01:00Z',dates:['2026-10-27']}).outcome,'exact-observed-match');
+ assert.equal(key(before),baseline);
+ assert.equal(key(intended.simulationBaselineRepresentations),key(before.representations));
+ assert.equal(key(intended.representations.v2),key(intended.tariff));
+ assert.equal(intended.representations.legacy,null);
+});
+
+function capturedBaseline(dual=false){
+ const capture=load('src/lib/tesla-tariff/observed-tariff.ts').captureObservedTariff;
+ const v={...side(),sell_tariff:side(true)};
+ const legacy=s=>{
+  const out=structuredClone(s);delete out.version;
+  for(const f of ['energy_charges','demand_charges'])out[f]=Object.fromEntries(Object.entries(s[f]).map(([k,c])=>[k,c.rates??{}]));
+  for(const season of Object.values(out.seasons))for(const [label,tou]of Object.entries(season.tou_periods))season.tou_periods[label]=tou.periods;
+  if(s.sell_tariff)out.sell_tariff=legacy(s.sell_tariff);return out;
+ };
+ return capture({installation_time_zone:'Europe/London',tariff_content_v2:v,...(dual?{tariff_content:legacy(v)}:{})},site,afterAt);
+}
+test('baseline assessment accepts actual V2 and dual capture output without stripping or changing evidence',()=>{
+ for(const dual of [false,true]){
+  const current=capturedBaseline(dual),before=key(current),result=assess(current);
+  assert.equal(result.current.status,'verified-current-authenticated-readback');
+  assert.notEqual(result.status,'current-unavailable');
+  assert.equal(key(current),before);
+  assert.ok(current.representations);
+  assert.equal(result.current.representationFingerprint,key(current.tariff));
+ }
+ assert.equal(assess(observation()).current.status,'verified-current-authenticated-readback');
+});
+test('baseline assessment rejects contradictory, malformed and incomplete retained representations',()=>{
+ for(const mutate of [
+  p=>{p.v2.sell_tariff.name+=' contradictory';},
+  p=>{p.legacy.sell_tariff.name+=' contradictory';},
+  p=>{p.legacy.seasons={};p.legacy.energy_charges={};},
+  p=>{p.v2.seasons={};p.v2.energy_charges={};},
+  p=>{p.legacy={};},
+  p=>{p.v2=null;},
+  p=>{p.relationship='conflicting';},
+  p=>{p.extra=true;},
+ ]){
+  const current=capturedBaseline(true);mutate(current.representations);
+  const before=key(current),result=assess(current);
+  assert.equal(result.current.status,'incomplete-or-contradictory');
+  assert.equal(result.status,'current-unavailable');
+  assert.equal(key(current),before);
+ }
+});

@@ -1,3 +1,5 @@
+import { inspectObservedProposalTariff } from "./experiment-tariff";
+
 export type ObservedPeriod = Partial<Record<"fromDayOfWeek" | "toDayOfWeek" | "fromHour" | "toHour" | "fromMinute" | "toMinute", number>>;
 export type ObservedSeason = { fromMonth: number; fromDay: number; toMonth: number; toDay: number;
     tou_periods: Record<string, { periods: ObservedPeriod[] }> };
@@ -6,10 +8,76 @@ export type ObservedSide = { code?: string; name: string; utility: string; curre
     demand_charges?: Record<string, { rates?: Record<string, number> }> };
 export type ObservedContent = ObservedSide & { sell_tariff: ObservedSide };
 export type ObservedTariff = { source: { kind: "tesla-site-info" | "simulation"; energySiteId: string; observedAt: string; timeZone: string | null };
+    representations?: { v2: unknown; legacy: unknown; relationship: "consistent" | "conflicting" | "unverifiable" };
+    simulationBaselineRepresentations?: ObservedTariff["representations"];
     tariff: ObservedContent | null; diagnostics: string[]; rollbackProven: false };
 const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 const safe = (s: unknown): s is string => typeof s === "string" && s.length <= 180 && !/token|secret|password|private.?key|authorization|bearer|-----BEGIN/i.test(s)
     && !["__proto__", "constructor", "prototype"].includes(s);
+
+/** Construct intended evidence, never an authenticated observation. Retain the
+ * captured encodings separately; no legacy response is predicted by simulation. */
+export function simulatedTariffObservation(before: ObservedTariff, tariff: ObservedContent | null): ObservedTariff {
+    return { ...structuredClone(before), source: { ...before.source, kind: "simulation" }, tariff: structuredClone(tariff),
+        ...(before.representations ? { simulationBaselineRepresentations: structuredClone(before.simulationBaselineRepresentations ?? before.representations),
+            representations: { v2: structuredClone(tariff), legacy: null, relationship: "unverifiable" as const } } : {}) };
+}
+
+/** Comparison only: raw encodings remain independent. Unknown fields are never
+ * silently normalised away. This establishes consistency, not write semantics. */
+export function compareTariffRepresentations(v2: unknown, legacy: unknown): "consistent" | "conflicting" | "unverifiable" {
+    const canonical = (v: unknown): string => JSON.stringify(v, (_k, x) => object(x)
+        ? Object.fromEntries(Object.keys(x).sort().map(k => [k, x[k]])) : x);
+    const convert = (raw: unknown, legacyEncoding: boolean, root = true): unknown => {
+        if (!object(raw) || !safe(raw.name) || !safe(raw.utility) || !safe(raw.currency)
+            || !object(raw.energy_charges) || !object(raw.seasons) || root && !object(raw.sell_tariff)) throw new Error();
+        const allowed = ["code", "name", "utility", "currency", "demand_charges", "energy_charges", "seasons", ...(root ? ["sell_tariff"] : []), ...(!legacyEncoding ? ["version"] : [])];
+        if (Object.keys(raw).some(k => !allowed.includes(k))) throw new Error();
+        const result: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(raw)) {
+            if (k === "version") { if (v !== 1) throw new Error(); continue; }
+            if (k === "sell_tariff") { result[k] = convert(v, legacyEncoding, false); continue; }
+            if (k === "energy_charges" || k === "demand_charges") {
+                if (!object(v)) throw new Error();
+                result[k] = Object.fromEntries(Object.entries(v).map(([label, charge]) => {
+                    if (!object(charge)) throw new Error();
+                    if (legacyEncoding) {
+                        if (Object.values(charge).some(n => typeof n !== "number" || !Number.isFinite(n))) throw new Error();
+                        return [label, Object.keys(charge).length ? { rates: charge } : {}];
+                    }
+                    if (Object.keys(charge).some(f => f !== "rates") || charge.rates !== undefined && (!object(charge.rates) || Object.values(charge.rates).some(n => typeof n !== "number" || !Number.isFinite(n)))) throw new Error();
+                    return [label, charge];
+                })); continue;
+            }
+            if (k === "seasons") {
+                if (!object(v)) throw new Error();
+                result[k] = Object.fromEntries(Object.entries(v).map(([label, season]) => {
+                    if (!object(season) || Object.keys(season).some(f => !["fromDay", "fromMonth", "toDay", "toMonth", "tou_periods"].includes(f)) || !object(season.tou_periods)) throw new Error();
+                    return [label, { ...season, tou_periods: Object.fromEntries(Object.entries(season.tou_periods).map(([name, tou]) => {
+                        if (!legacyEncoding && (!object(tou) || Object.keys(tou).some(f => f !== "periods"))) throw new Error();
+                        const periods = legacyEncoding ? tou : (tou as Record<string, unknown>).periods;
+                        if (!Array.isArray(periods)) throw new Error();
+                        return [name, { periods: periods.map(p => {
+                            const fields = ["fromDayOfWeek", "toDayOfWeek", "fromHour", "fromMinute", "toHour", "toMinute"];
+                            if (!object(p) || Object.keys(p).some(f => !fields.includes(f)) || Object.values(p).some(n => !Number.isInteger(n))) throw new Error();
+                            return Object.fromEntries(fields.map(f => [f, p[f] ?? 0]));
+                        }) }];
+                    })) }];
+                })); continue;
+            }
+            result[k] = v;
+        }
+        return result;
+    };
+    try {
+        const convertedV2 = convert(v2, false), convertedLegacy = convert(legacy, true);
+        // Reuse the existing full-year, full-week coverage validator on each
+        // encoding independently; matching incomplete records prove nothing.
+        if (!inspectObservedProposalTariff(convertedV2).exact || !inspectObservedProposalTariff(convertedLegacy).exact) return "unverifiable";
+        return canonical(convertedV2) === canonical(convertedLegacy) ? "consistent" : "conflicting";
+    }
+    catch { return "unverifiable"; }
+}
 
 /** Extract only tariff fields, never credentials or the raw site-info envelope.
  * Omitted TOU fields remain omitted in the captured representation.
@@ -65,7 +133,17 @@ export function captureObservedTariff(siteInfo: unknown, energySiteId: string, o
         if (!object(raw)) throw new Error();
         tariff = { ...side(raw, true), sell_tariff: side(raw.sell_tariff) };
     } catch { diagnostics.push("TARIFF_UNREADABLE"); }
-    return { source: { kind: "tesla-site-info", energySiteId, observedAt, timeZone }, tariff,
+    const retain = (value: unknown): unknown => {
+        const sensitive = (v: unknown): boolean => typeof v === "string" ? !safe(v)
+            : Array.isArray(v) ? v.some(sensitive) : object(v) ? Object.entries(v).some(([k, w]) => !safe(k) || sensitive(w)) : false;
+        if (sensitive(value)) { diagnostics.push("UNSUPPORTED_FIELDS_OMITTED"); return null; }
+        return structuredClone(value);
+    };
+    const v2 = object(body) && body.tariff_content_v2 !== undefined ? retain(body.tariff_content_v2) : null;
+    const legacy = object(body) && body.tariff_content !== undefined ? retain(body.tariff_content) : null;
+    const relationship = v2 !== null && legacy !== null ? compareTariffRepresentations(v2, legacy) : "unverifiable";
+    if (legacy !== null && relationship !== "consistent") diagnostics.push("DUAL_TARIFF_" + relationship.toUpperCase());
+    return { representations: { v2, legacy, relationship }, source: { kind: "tesla-site-info", energySiteId, observedAt, timeZone }, tariff,
         diagnostics: [...new Set(diagnostics)], rollbackProven: false };
 }
 
