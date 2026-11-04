@@ -1,14 +1,16 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import * as io from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import vm from 'node:vm';
 import ts from 'typescript';
 import * as crypto from 'node:crypto';
 const modules=new Map();
 function load(file){file=path.resolve(file);if(modules.has(file))return modules.get(file);const exports={};modules.set(file,exports);
- vm.runInNewContext(ts.transpileModule(fs.readFileSync(file,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText,
- {exports,structuredClone,Date,Intl,Error,require(n){if(n.startsWith('.'))return load(path.resolve(path.dirname(file),n+'.ts'));if(n==='node:crypto')return crypto;throw Error('OFFLINE_ONLY');}});return exports;}
+ vm.runInNewContext(ts.transpileModule(fs.readFileSync(file,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,
+ {exports,structuredClone,Date,Intl,Error,require(n){if(n.startsWith('.'))return load(path.resolve(path.dirname(file),n+'.ts'));if(n==='node:crypto')return crypto;if(n==='node:fs/promises')return io;if(n==='node:path')return path;throw Error('OFFLINE_ONLY');}});return exports;}
 const api=load('src/lib/tesla-tariff/supervised-experiment.ts');
 const {captureObservedTariff}=load('src/lib/tesla-tariff/observed-tariff.ts');
 const {representationKey:key}=load('src/lib/tesla-tariff/rollback-evidence.ts');
@@ -104,4 +106,137 @@ test('interactive dry-run uses validated acquisition and never invokes a write t
   else{await assert.rejects(run(),/CURRENT_KRAKEN_ACQUISITION_FAILED/);assert.equal(calls.get,0);}
   assert.equal(calls.acquisition,1);
  }
+});
+
+const journals=load('src/lib/tesla-tariff/repeat-attempt-journal.ts');
+const linked=load('src/lib/tesla-tariff/linked-experiment-records.ts');
+const {ownershipFingerprint:hash}=load('src/lib/tesla-tariff/ownership-transition.ts');
+async function admissionFixture(t){
+ const directory=await io.realpath(await io.mkdtemp(path.join(os.tmpdir(),'hep-reconciled-')));
+ t.after(()=>io.rm(directory,{recursive:true,force:true}));
+ const f=fixture();
+ const context=await load('src/lib/tesla-tariff/prepared-mutation-context.ts').prepareMutationContext(f,
+  {now:()=>now,readOwnership:async()=>({status:'missing'}),newMutationId:()=> 'independent-new-mutation'});
+ const review=context.original,approval=load('src/lib/tesla-tariff/proposal-approval.ts').approveTariffProposal(review.proposal,{fingerprint:review.proposal.fingerprint,approvedAt:now});
+ const initial=linked.createLinkedInitialRecord(context,{phase:'approval-consumed-before-write',review,
+  exception:{kind:'supervised-manual-recovery',consent:{challenge:'offline-fixture',automaticRollbackUnproven:true,manualAppRecoveryMayBeRequired:true},
+   approvedAt:approval.approvedAt,approval,exactExperimentFingerprint:review.fingerprint,productionBlockers:review.restoration.blockers,
+   automaticRollbackProven:false,manualRecovery:'offline fixture only'},
+  preWriteRecheck:{teslaSource:f.capture.before.source,tariffKey:key(f.capture.before.tariff),krakenObservedAt:now,smartEvidenceKey:review.binding.smartEvidenceKey}});
+ // Synthetic unlinked September-shaped evidence; never edits the real report or journal.
+ const old=JSON.parse(fs.readFileSync('tests/fixtures/tesla-q7-sept23.json','utf8')).before;
+ const priorInitial={phase:'approval-consumed-before-write',review:{before:old,date:'2026-09-23',proposal:{bound:{energySiteId:'12345',representation:old.tariff}}},exception:{kind:'supervised-manual-recovery'},preWriteRecheck:{tariffKey:key(old.tariff)}};
+ const attemptedAt='2026-09-23T08:12:00Z',completedAt='2026-09-23T08:13:00Z';
+ const comparison=load('src/lib/tesla-tariff/restoration-review.ts').compareObservedTariffReadBack({intended:{...old,source:{...old.source,kind:'simulation'}},readBack:null,after:attemptedAt,dates:['2026-09-23']});
+ const priorClassified={phase:'classified',attemptedAt,completedAt,exception:priorInitial.exception,apiWrite:{status:'unknown',httpStatus:200},
+  apiTariffReadBack:{observation:null,comparison},classification:'write-outcome-unknown',laterTeslaAppObservation:null,laterPowerwallOpticasterObservation:null,
+  rollbackProven:false,productionWriteReady:false,automaticRestoreAttempted:false};
+ const priorBytes=JSON.stringify(priorInitial)+'\n'+JSON.stringify(priorClassified)+'\n',root=path.join(directory,'site-12345.jsonl');
+ await io.writeFile(root,priorBytes);
+ const config={mode:'offline',directory,durableRoot:directory,site:'12345'};
+ const ports={now:()=>now,capture:async()=>structuredClone(f.capture),readOwnership:async()=>({status:'missing'}),
+  approveReconciliation:async binding=>({approvalId:'separate-reconciliation',bindingKey:hash(binding),approvedAt:now,disposition:'prior-conflict-reconciled-for-new-experiment',historicalApiRestoration:'not-proved'}),
+  approveExperiment:async binding=>({approvalId:'separate-experiment',bindingKey:hash(binding),approvedAt:now})};
+ return {f,initial,config,ports,root,priorBytes};
+}
+const noRuntimeAuthority=r=>{for(const k of ['writeReady','executionReady','grantsAdmissionAuthority','grantsRepeatAuthority','grantsSuccessorAuthority','restorationProven','runtimeConfirmationVerified','resolvesHistoricalJournal'])assert.equal(r[k],false,k);};
+test('separate reconciliation admits offline without changing unlinked September-shaped evidence',async t=>{
+ const x=await admissionFixture(t),result=await journals.admitOfflineReconciledExperiment(x.config,'new-experiment',x.initial,x.ports);
+ assert.equal(result.status,'admitted-offline');noRuntimeAuthority(result);assert.equal('finish' in result,false);
+ assert.equal(await io.readFile(x.root,'utf8'),x.priorBytes);
+ assert.ok(x.initial.review.hardBlockers.includes('CURRENT_EVIDENCE_PREPARATION_ONLY'));
+ modules.delete(path.resolve('src/lib/tesla-tariff/repeat-attempt-journal.ts'));
+ const restarted=load('src/lib/tesla-tariff/repeat-attempt-journal.ts');assert.notEqual(restarted,journals);
+ const recovered=await restarted.readOfflineReconciledExperiment(x.config);
+ assert.equal(recovered.status,'consistent-offline-admission');assert.equal(recovered.blocked,true);noRuntimeAuthority(recovered);
+ assert.equal((await journals.repeatAttemptEligibility(x.config.directory,'12345',{status:'missing'})).code,'ATTEMPT_IN_PROGRESS');
+ await assert.rejects(journals.admitOfflineReconciledExperiment(x.config,'new-experiment',x.initial,x.ports),/ATTEMPT_IN_PROGRESS/);
+});
+test('missing reconciliation, mismatched site/baseline/ownership/approval and stale evidence cannot acquire a claim',async t=>{
+ const cases=[
+  x=>{x.ports.approveReconciliation=async()=>null;},
+  x=>{x.ports.approveReconciliation=async b=>({approvalId:'r',bindingKey:hash(b),approvedAt:now,disposition:'unresolved',historicalApiRestoration:'not-proved'});},
+  x=>{x.ports.approveExperiment=async()=>({approvalId:'e',bindingKey:'a'.repeat(64),approvedAt:now});},
+  x=>{x.ports.approveExperiment=async b=>({approvalId:'separate-reconciliation',bindingKey:hash(b),approvedAt:now});},
+  x=>{x.f.capture.before.source.energySiteId='999';},
+  x=>{x.f.capture.before.representations.legacy.sell_tariff.name='changed';},
+  x=>{x.ports.readOwnership=async()=>({status:'invalid'});},
+  x=>{x.f.capture.kraken.lastSuccessfulUpdate='2026-10-27T11:58:00Z';},
+ ];
+ for(const mutate of cases){const x=await admissionFixture(t);mutate(x);await assert.rejects(journals.admitOfflineReconciledExperiment(x.config,'new-experiment',x.initial,x.ports));
+  assert.equal(await io.readFile(x.root,'utf8'),x.priorBytes);assert.deepEqual((await io.readdir(x.config.directory)).sort(),['site-12345.jsonl']);}
+});
+test('incomplete prior journal and unfinalised claim remain blocking despite new approvals',async t=>{
+ for(const pending of [false,true]){const x=await admissionFixture(t);
+  if(pending)await io.writeFile(path.join(x.config.directory,'site-12345-attempt.active'),'pending');else await io.writeFile(x.root,x.priorBytes.split('\n')[0]+'\n');
+  await assert.rejects(journals.admitOfflineReconciledExperiment(x.config,'new-experiment',x.initial,x.ports));
+ }
+});
+test('concurrent admissions cannot both succeed; recovery cannot grant another claim',async t=>{
+ const x=await admissionFixture(t);
+ const results=await Promise.allSettled(['one','two'].map(id=>journals.admitOfflineReconciledExperiment(x.config,id,x.initial,x.ports)));
+ assert.equal(results.filter(r=>r.status==='fulfilled').length,1);
+ const recovered=await journals.readOfflineReconciledExperiment(x.config);noRuntimeAuthority(recovered);
+ assert.equal(recovered.status,'consistent-offline-admission');assert.equal(await io.readFile(x.root,'utf8'),x.priorBytes);
+ await assert.rejects(journals.admitOfflineReconciledExperiment(x.config,'three',x.initial,x.ports),/ATTEMPT_IN_PROGRESS/);
+});
+test('baseline or prior evidence changed during approval rejects; interrupted locked recheck stays consumed',async t=>{
+ for(const kind of ['baseline','history','locked']){const x=await admissionFixture(t),original=x.ports.approveExperiment;let reads=0;
+  if(kind==='locked'){const read=x.ports.capture;x.ports.capture=async(...args)=>{if(++reads===3)throw Error('INTERRUPTED');return read(...args);};}
+  else x.ports.approveExperiment=async b=>{const a=await original(b);if(kind==='baseline')x.f.capture.before.representations.v2.name='changed';else await io.appendFile(x.root,'\n');return a;};
+  await assert.rejects(journals.admitOfflineReconciledExperiment(x.config,'new-experiment',x.initial,x.ports));
+  if(kind==='locked'){assert.equal((await journals.readOfflineReconciledExperiment(x.config)).status,'blocked');assert.equal((await journals.repeatAttemptEligibility(x.config.directory,'12345',{status:'missing'})).code,'ATTEMPT_IN_PROGRESS');}
+ }
+});
+test('altered recovered approval and missing journal evidence remain blocked',async t=>{
+ for(const change of ['approval','missing','historical']){const x=await admissionFixture(t);await journals.admitOfflineReconciledExperiment(x.config,'new-experiment',x.initial,x.ports);
+  if(change==='approval'){const file=path.join(x.config.directory,'site-12345-attempt.active'),marker=JSON.parse(await io.readFile(file,'utf8'));marker.approval.bindingKey='b'.repeat(64);const {checksum:_checksum,...body}=marker;void _checksum;marker.checksum=hash(body);await io.writeFile(file,JSON.stringify(marker)+'\n');}
+  if(change==='missing')await io.unlink(path.join(x.config.directory,`site-12345-attempt-${x.initial.mutationId}.jsonl`));
+  if(change==='historical')await io.appendFile(x.root,'\n');
+  const r=await journals.readOfflineReconciledExperiment(x.config);assert.equal(r.status,'blocked');noRuntimeAuthority(r);
+ }
+});
+
+test('known mutation replay is blocked without relabelling the linked prior outcome',async t=>{
+ const x=await admissionFixture(t),attemptedAt='2026-10-27T12:00:01Z',completedAt='2026-10-27T12:00:02Z';
+ const comparison=load('src/lib/tesla-tariff/restoration-review.ts').compareObservedTariffReadBack({intended:x.initial.review.before,readBack:null,after:attemptedAt,dates:['2026-10-27']});
+ const classified=linked.createLinkedClassifiedRecord(x.initial,{phase:'classified',attemptedAt,completedAt,exception:x.initial.exception,
+  apiWrite:{status:'unknown',httpStatus:200},apiTariffReadBack:{observation:null,comparison},classification:'write-outcome-unknown',
+  laterTeslaAppObservation:null,laterPowerwallOpticasterObservation:null,rollbackProven:false,productionWriteReady:false,automaticRestoreAttempted:false});
+ const bytes=JSON.stringify(x.initial)+'\n'+JSON.stringify(classified)+'\n';await io.writeFile(x.root,bytes);
+ x.ports.now=()=> '2026-10-27T12:00:03Z';
+ await assert.rejects(journals.admitOfflineReconciledExperiment(x.config,'different-experiment',x.initial,x.ports),/DUPLICATE_MUTATION_ID/);
+ assert.equal(await io.readFile(x.root,'utf8'),bytes);
+});
+test('expired approvals, changed SMART rate and valid but different recaptured baseline block admission',async t=>{
+ for(const kind of ['expired','price','baseline']){const x=await admissionFixture(t);
+  if(kind==='expired'){const approve=x.ports.approveExperiment;x.ports.approveExperiment=async b=>({...await approve(b),approvedAt:'2026-10-27T11:58:00Z'});}
+  if(kind==='price'){x.f.capture.kraken.importTariff.version.scheduledChargingImport.amount=.03;x.f.capture.kraken.importTariff.version.dailyImportWindows[0].price.amount=.03;}
+  if(kind==='baseline'){x.f.capture.before.tariff.name+=' changed';x.f.capture.before.representations.v2.name=x.f.capture.before.tariff.name;x.f.capture.before.representations.legacy.name=x.f.capture.before.tariff.name;}
+  await assert.rejects(journals.admitOfflineReconciledExperiment(x.config,'new-experiment',x.initial,x.ports));
+  assert.deepEqual(await io.readdir(x.config.directory),['site-12345.jsonl']);
+ }
+});
+
+test('admission revalidates 12:00:00 evidence at actual 12:01:01 after final validation at 12:00:59',async t=>{
+ const x=await admissionFixture(t);let clockReads=0;
+ x.ports.now=()=>++clockReads<=3?'2026-10-27T12:00:59Z':'2026-10-27T12:01:01Z';
+ for(const name of ['approveReconciliation','approveExperiment']){const original=x.ports[name];x.ports[name]=async b=>({...await original(b),approvedAt:'2026-10-27T12:00:59Z'});}
+ await assert.rejects(journals.admitOfflineReconciledExperiment(x.config,'expiry-transition',x.initial,x.ports),/INDEPENDENT_EVIDENCE_INVALID/);
+ assert.equal(clockReads,4);
+ assert.equal(await io.readFile(path.join(x.config.directory,'site-12345-attempt.active'),'utf8'),'');
+ await assert.rejects(io.access(path.join(x.config.directory,`site-12345-attempt-${x.initial.mutationId}.jsonl`)),{code:'ENOENT'});
+ assert.equal((await journals.readOfflineReconciledExperiment(x.config)).status,'blocked');
+ assert.equal((await journals.repeatAttemptEligibility(x.config.directory,'12345',{status:'missing'})).code,'ATTEMPT_IN_PROGRESS');
+ assert.equal(await io.readFile(x.root,'utf8'),x.priorBytes);
+});
+test('admission at the inclusive 12:01:00 evidence deadline remains recoverably consistent',async t=>{
+ const x=await admissionFixture(t);let clockReads=0;
+ x.ports.now=()=>++clockReads<=3?'2026-10-27T12:00:59Z':'2026-10-27T12:01:00Z';
+ for(const name of ['approveReconciliation','approveExperiment']){const original=x.ports[name];x.ports[name]=async b=>({...await original(b),approvedAt:'2026-10-27T12:00:59Z'});}
+ const r=await journals.admitOfflineReconciledExperiment(x.config,'deadline-control',x.initial,x.ports);
+ assert.equal(r.status,'admitted-offline');assert.equal(clockReads,4);noRuntimeAuthority(r);
+ const recovered=await journals.readOfflineReconciledExperiment(x.config);
+ assert.equal(recovered.status,'consistent-offline-admission');noRuntimeAuthority(recovered);
+ assert.equal(await io.readFile(x.root,'utf8'),x.priorBytes);
 });

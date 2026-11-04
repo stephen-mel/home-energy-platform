@@ -1,3 +1,9 @@
+import { parseDispatchResponse } from "../kraken/dispatch-response";
+import { assessTeslaBaseline } from "./baseline-assessment";
+import { validateTeslaInspectionEvidence, validateKrakenInspectionEvidence } from "./smart-inspection";
+import { validOwnershipTimestamp } from "./ownership-evidence";
+import { CAPTURE_TTL_MS, APPROVAL_TTL_MS, smartEvidenceKey } from "./smart-evidence";
+import type { Capture } from "./supervised-experiment";
 import { validateOwnershipAttribution } from "./ownership-attribution";
 import { lstat, mkdir, open, readFile, readdir, realpath, rename } from "node:fs/promises";
 import path from "node:path";
@@ -573,4 +579,188 @@ export function smartLifecycleRehearsalJournal(directory: string, site: string, 
             } };
         },
     };
+}
+
+export type OfflineExperimentBinding = {
+    version: 1; site: string; timeZone: string; experimentId: string; mutationId: string;
+    initialRecordId: string; baselineKey: string; ownershipKey: string; priorHistoryKey: string;
+    pricingKey: string; scheduleKey: string;
+};
+type OfflineExperimentApproval = { approvalId: string; bindingKey: string; approvedAt: string };
+export type OfflineReconciliationPorts = {
+    now(): string;
+    /** Independent offline acquisition composition, never a caller's evidence envelope. */
+    capture(site: string): Promise<Capture>;
+    readOwnership(site: string): Promise<OwnershipRead>;
+    approveReconciliation(binding: OfflineExperimentBinding): Promise<OfflineExperimentApproval & {
+        disposition: "prior-conflict-reconciled-for-new-experiment";
+        historicalApiRestoration: "not-proved";
+    }>;
+    approveExperiment(binding: OfflineExperimentBinding): Promise<OfflineExperimentApproval>;
+};
+type OfflineExperimentConfig = { mode: "offline"; directory: string; site: string; durableRoot: string };
+type PriorFile = { name: string; digest: string };
+const offlineAdmissionOnly = { ...documentaryOnly, grantsAdmissionAuthority: false,
+    runtimeConfirmationVerified: false, identityProvenance: "offline-ports-only" as const };
+const identifier = (v: unknown): v is string => typeof v === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(v);
+const currentTime = (at: string, now: string, ttl: number) => validOwnershipTimestamp(at) && validOwnershipTimestamp(now)
+    && Date.parse(at) <= Date.parse(now) && Date.parse(now) - Date.parse(at) <= ttl;
+const baselineKey = (capture: Capture) => ownershipFingerprint({ source: { kind: capture.before.source.kind,
+    energySiteId: capture.before.source.energySiteId, timeZone: capture.before.source.timeZone },
+    tariff: capture.before.tariff, representations: capture.before.representations ?? null });
+const pricingKey = (capture: Capture) => ownershipFingerprint({ account: capture.kraken.importTariff?.accountRef,
+    agreement: capture.kraken.importTariff?.agreement, version: capture.kraken.importTariff?.version });
+
+async function independentCapture(ports: OfflineReconciliationPorts, initial: LinkedInitialRecord, site: string) {
+    const capture = structuredClone(await ports.capture(site)), ownership = structuredClone(await ports.readOwnership(site)), now = ports.now();
+    if (!validOwnershipTimestamp(now) || !ownershipSafe(ownership, site) || !capturedOwnershipMatches(initial, ownership)) throw Error("OWNERSHIP_UNRESOLVED");
+    if (!admissionCaptureMatches(capture, initial, site, now)) throw Error("INDEPENDENT_EVIDENCE_INVALID");
+    return { capture, ownership, now };
+}
+function admissionCaptureMatches(capture: Capture, initial: LinkedInitialRecord, site: string, now: string) {
+    const selected = initial.review.proposal.input.observedSmart!.dispatch;
+    const windows = initial.review.proposal.input.signal.import.filter(w => Date.parse(w.end) > Date.parse(selected.start)
+        && Date.parse(w.start) < Date.parse(selected.end));
+    return !!validateTeslaInspectionEvidence(capture.before) && !!validateKrakenInspectionEvidence(capture.kraken)
+        && Array.isArray(capture.kraken.vehicles) && capture.kraken.vehicles.every(v => v && typeof v.id === "string" && typeof v.name === "string"
+            && parseDispatchResponse({ flexPlannedDispatches: v.plannedDispatches }).status === "complete")
+        && windows.length > 0 && windows.every(w => ownershipFingerprint(w.price) === ownershipFingerprint(capture.kraken.importTariff!.version.scheduledChargingImport))
+        && !(capture.kraken.stale || capture.kraken.importTariffDiagnostic
+        || capture.before.source.energySiteId !== site || capture.before.source.timeZone !== initial.review.before.source.timeZone
+        || !currentTime(capture.before.source.observedAt, now, CAPTURE_TTL_MS)
+        || !currentTime(initial.review.before.source.observedAt, now, CAPTURE_TTL_MS)
+        || !currentTime(capture.kraken.lastSuccessfulUpdate, now, EVIDENCE_TTL_MS)
+        || !currentTime(capture.kraken.importTariff!.observedAt, now, EVIDENCE_TTL_MS)
+        || baselineKey(capture) !== baselineKey({ before: initial.review.before, kraken: capture.kraken })
+        || smartEvidenceKey(capture.kraken) !== initial.review.binding.smartEvidenceKey);
+}
+
+/** Inspect physical prior evidence without changing its historical classification.
+ * Unlinked September records use the existing baseline assessor. Later V1 chains
+ * use the existing history validator. Unknown versions and partial records block. */
+async function independentPrior(config: OfflineExperimentConfig, capture: Capture, ownership: OwnershipRead,
+    now: string, ignoreActive = false): Promise<{ files: PriorFile[]; mutations: string[] }> {
+    const { directory, site, durableRoot } = config;
+    await assertPhysicalChain(directory, durableRoot);
+    const names = (await readdir(directory)).filter(n => n === legacyName(site) || n.startsWith(`site-${site}-`)).sort();
+    if (!ignoreActive && names.includes(activeName(site))) throw Error("ATTEMPT_IN_PROGRESS");
+    const files = names.filter(n => n !== activeName(site));
+    const root = legacyName(site), mutations: string[] = [];
+    if (files.length > 1 || files.length === 1 && files[0] !== root) {
+        const checked = await history(directory, site, ignoreActive);
+        if (checked.active) throw Error("ATTEMPT_IN_PROGRESS");
+        mutations.push(...[...(checked.attemptIds ?? [])].map(id => id.slice("mutation:".length)));
+    }
+    const prior = [];
+    for (const name of files) {
+        const text = await physicalJournalText(path.join(directory, name));
+        if (name === root) {
+            const records = text.trimEnd().split("\n").map(line => JSON.parse(line));
+            const assessed = assessTeslaBaseline({ energySiteId: site, timeZone: capture.before.source.timeZone!,
+                assessedAt: now, maxObservationAgeMs: CAPTURE_TTL_MS, current: capture.before, historicalJournal: records, ownership });
+            if (!assessed.historical) throw Error("HISTORICAL_JOURNAL_INVALID");
+            if (typeof records[0]?.mutationId === "string") mutations.push(records[0].mutationId);
+        }
+        prior.push({ name, digest: ownershipFingerprint(text) });
+    }
+    return { files: prior, mutations };
+}
+
+/** OFFLINE admission only, reusing the existing site active marker and initial
+ * journal. No finish/completion capability is returned. Production repeat and
+ * operation readers see the permanent active marker and continue to block.
+ * The separate reconciliation approval resolves only this proposed experiment's
+ * conflict; it never reclassifies the historical write or proves API restoration.
+ * Ports and owner-only physical storage are the offline composition boundary;
+ * documents, their hashes and recovered claims are never authentication proof. */
+export async function admitOfflineReconciledExperiment(config: OfflineExperimentConfig,
+    experimentId: string, supplied: LinkedInitialRecord, ports: OfflineReconciliationPorts) {
+    const initial = structuredClone(supplied), { directory, site, durableRoot } = config;
+    if (config.mode !== "offline" || !identifier(experimentId) || !/^\d+$/.test(site)
+        || !validLinkedInitialRecord(initial, site)
+        || !initial.review.hardBlockers.includes("CURRENT_EVIDENCE_PREPARATION_ONLY")) throw Error("OFFLINE_EXPERIMENT_REQUIRED");
+    await ensureDurableDirectory(directory, durableRoot);
+    const first = await independentCapture(ports, initial, site);
+    const prior = await independentPrior(config, first.capture, first.ownership, first.now);
+    if (prior.mutations.includes(initial.mutationId)) throw Error("DUPLICATE_MUTATION_ID");
+    const binding: OfflineExperimentBinding = { version: 1, site, timeZone: initial.review.before.source.timeZone!, experimentId,
+        mutationId: initial.mutationId, initialRecordId: initial.initialRecordId,
+        baselineKey: baselineKey(first.capture), ownershipKey: ownershipKey(initial), priorHistoryKey: ownershipFingerprint(prior.files),
+        pricingKey: pricingKey(first.capture), scheduleKey: smartEvidenceKey(first.capture.kraken) };
+    const reconciliation = structuredClone(await ports.approveReconciliation(structuredClone(binding)));
+    const approval = structuredClone(await ports.approveExperiment(structuredClone(binding)));
+    const validApproval = (value: OfflineExperimentApproval, now: string) => identifier(value.approvalId)
+        && value.bindingKey === ownershipFingerprint(binding) && currentTime(value.approvedAt, now, APPROVAL_TTL_MS)
+        && Date.parse(value.approvedAt) >= Date.parse(initial.review.proposal.bound.validFrom)
+        && Date.parse(now) < Date.parse(initial.review.proposal.bound.expiresAt);
+    const validate = async (ignoreActive = false) => {
+        const next = await independentCapture(ports, initial, site), known = await independentPrior(config, next.capture, next.ownership, next.now, ignoreActive);
+        if (ownershipFingerprint(known.files) !== binding.priorHistoryKey || pricingKey(next.capture) !== binding.pricingKey
+            || reconciliation.disposition !== "prior-conflict-reconciled-for-new-experiment" || reconciliation.historicalApiRestoration !== "not-proved"
+            || !validApproval(reconciliation, next.now) || !validApproval(approval, next.now)
+            || reconciliation.approvalId === approval.approvalId) throw Error("OFFLINE_RECONCILIATION_INVALID");
+        return next;
+    };
+    await validate();
+    await assertPhysicalChain(directory, durableRoot);
+    const file = path.join(directory, activeName(site)), handle = await open(file, "wx", 0o600);
+    try {
+        const final = await validate(true);
+        const admittedAt = ports.now();
+        if (!admissionCaptureMatches(final.capture, initial, site, admittedAt)) throw Error("INDEPENDENT_EVIDENCE_INVALID");
+        if (!validApproval(reconciliation, admittedAt) || !validApproval(approval, admittedAt)) throw Error("OFFLINE_RECONCILIATION_INVALID");
+        const body = { version: 3, mode: "offline-reconciled-experiment", binding, reconciliation, approval, prior: prior.files,
+            admittedAt, reconciliationEvidence: { capture: final.capture, ownership: final.ownership },
+            historicalApiRestoration: "not-proved", ...offlineAdmissionOnly };
+        const marker = { ...body, checksum: ownershipFingerprint(body) };
+        await handle.writeFile(JSON.stringify(marker) + "\n", "utf8"); await handle.sync();
+        const journal = await open(path.join(directory, journalName(site, initial.mutationId)), "wx", 0o600);
+        try { await journal.writeFile(JSON.stringify(initial) + "\n", "utf8"); await journal.sync(); }
+        finally { await journal.close(); }
+    } finally { await handle.close(); }
+    await syncDirectory(directory);
+    return Object.freeze({ status: "admitted-offline" as const, experimentId, mutationId: initial.mutationId, ...offlineAdmissionOnly });
+}
+
+/** Recovery reports documentary consistency only and never resumes the operation.
+ * Incomplete/uncertain claims remain blocking for every existing claimant. */
+export async function readOfflineReconciledExperiment(config: OfflineExperimentConfig) {
+    try {
+        if (config.mode !== "offline" || !/^\d+$/.test(config.site)) throw Error();
+        await assertPhysicalChain(config.directory, config.durableRoot);
+        const marker = JSON.parse(await physicalJournalText(path.join(config.directory, activeName(config.site))));
+        const { checksum, ...body } = marker;
+        if (!validJournalEvidenceJson(marker) || marker.version !== 3 || marker.mode !== "offline-reconciled-experiment" || checksum !== ownershipFingerprint(body)
+            || marker.binding.site !== config.site || !identifier(marker.binding.experimentId)
+            || !validOwnershipTimestamp(marker.admittedAt) || marker.historicalApiRestoration !== "not-proved"
+            || Object.entries(offlineAdmissionOnly).some(([k, v]) => marker[k] !== v)
+            || !identifier(marker.approval.approvalId) || !identifier(marker.reconciliation.approvalId)
+            || marker.approval.approvalId === marker.reconciliation.approvalId
+            || marker.reconciliation.disposition !== "prior-conflict-reconciled-for-new-experiment"
+            || marker.reconciliation.historicalApiRestoration !== "not-proved"
+            || [marker.approval, marker.reconciliation].some(a => a.bindingKey !== ownershipFingerprint(marker.binding)
+                || !currentTime(a.approvedAt, marker.admittedAt, APPROVAL_TTL_MS))) throw Error();
+        const text = await physicalJournalText(path.join(config.directory, journalName(config.site, marker.binding.mutationId)));
+        const rows = text.trimEnd().split("\n").map(line => JSON.parse(line));
+        if (rows.length !== 1 || !validLinkedInitialRecord(rows[0], config.site) || rows[0].initialRecordId !== marker.binding.initialRecordId
+            || ownershipKey(rows[0]) !== marker.binding.ownershipKey || baselineKey({ before: rows[0].review.before, kraken: {} as Capture["kraken"] }) !== marker.binding.baselineKey
+            || !rows[0].review.hardBlockers.includes("CURRENT_EVIDENCE_PREPARATION_ONLY")
+            || rows[0].mutationId !== marker.binding.mutationId || rows[0].review.before.source.timeZone !== marker.binding.timeZone
+            || rows[0].review.binding.smartEvidenceKey !== marker.binding.scheduleKey
+            || Date.parse(marker.admittedAt) >= Date.parse(rows[0].review.proposal.bound.expiresAt)
+            || ownershipFingerprint(marker.prior) !== marker.binding.priorHistoryKey) throw Error();
+        const evidence = marker.reconciliationEvidence;
+        if (!evidence || !admissionCaptureMatches(evidence.capture, rows[0], config.site, marker.admittedAt)
+            || !ownershipSafe(evidence.ownership, config.site) || !capturedOwnershipMatches(rows[0], evidence.ownership)
+            || baselineKey(evidence.capture) !== marker.binding.baselineKey || pricingKey(evidence.capture) !== marker.binding.pricingKey) throw Error();
+        const names = (await readdir(config.directory)).filter(n => n === legacyName(config.site) || n.startsWith(`site-${config.site}-`));
+        const expected = new Set([...marker.prior.map((p: PriorFile) => p.name), activeName(config.site), journalName(config.site, marker.binding.mutationId)]);
+        if (names.length !== expected.size || names.some(n => !expected.has(n))) throw Error();
+        for (const p of marker.prior as PriorFile[]) {
+            if (!expected.has(p.name) || path.basename(p.name) !== p.name
+                || ownershipFingerprint(await physicalJournalText(path.join(config.directory, p.name))) !== p.digest) throw Error();
+        }
+        return Object.freeze({ status: "consistent-offline-admission" as const, experimentId: marker.binding.experimentId,
+            blocked: true as const, ...offlineAdmissionOnly });
+    } catch { return Object.freeze({ status: "blocked" as const, code: "OFFLINE_ADMISSION_INCOMPLETE_OR_CONFLICTING", ...offlineAdmissionOnly }); }
 }
