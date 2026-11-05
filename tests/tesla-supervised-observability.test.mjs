@@ -49,6 +49,10 @@ function harness(fault) {
           acquisition: { freshEvidenceObtained: true, staleFallbackUsed: false } };
       },
     },
+    './rollback-evidence': domain('src/lib/tesla-tariff/rollback-evidence.ts'),
+    './proposal-approval': domain('src/lib/tesla-tariff/proposal-approval.ts'),
+    './ownership-transition': domain('src/lib/tesla-tariff/ownership-transition.ts'),
+    './repeat-attempt-journal': { admitOfflineReconciledExperiment: fail },
     './observed-tariff': { captureObservedTariff() {
       if (fault === 'tesla-capture') fail();
       if (fault === 'preparation') return {};

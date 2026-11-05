@@ -1,8 +1,9 @@
 # Offline reconciled experiment admission
 
 `admitOfflineReconciledExperiment()` extends the existing repeat-attempt journal
-module for offline documentary admission only. It is not connected to the CLI,
-executor, private completion registry or ownership writer. All runtime authority
+module for documentary admission only. The CLI can now connect authenticated
+acquisition and interactive approval to this preparation boundary. It is not
+connected to execution, the private completion registry or the ownership writer. All runtime authority
 flags remain false and `CURRENT_EVIDENCE_PREPARATION_ONLY` is mandatory.
 
 ## Reconciliation policy
@@ -47,10 +48,13 @@ and every runtime authority flag is false.
 
 The independent acquisition and two approval ports are supplied by offline trusted
 composition (fixtures in tests), following the existing offline operation-journal
-pattern. They are not production authentication or a trusted reconciliation issuer.
+pattern. The closed interactive CLI now supplies the existing authenticated GET
+and validated Kraken acquisition paths, and separate foreground approvals, for
+preparation only. Stored approvals remain documentary, not runtime credentials.
 Calling a callback, producing consistent JSON or recomputing hashes does not prove
-Tesla/Kraken authentication. Recovery never grants such provenance. A future closed
-production acquisition/approval binding is still required before live admission.
+Tesla/Kraken authentication. Recovery never grants such provenance. A separately
+reviewed runtime execution-authority and durable completion bridge is still
+required before live admission can proceed to a write.
 
 The durable root must be owner-only and physically trusted, as required by the
 existing journal. Arbitrary replacement of every file by a privileged writer is
@@ -59,3 +63,33 @@ production completion capability, and cannot unblock the historical CLI latch.
 
 Tests use temporary synthetic September-shaped evidence, never the real historical
 journal, report, captures or credentials. No external calls are made.
+
+## Interactive preparation connection
+
+The existing local CLI supports `--prepare-reconciled --experiment-id NEW_ID`
+alongside its existing site, vehicle and dispatch selection. This mode requires a
+foreground terminal and is mutually exclusive with `--execute-supervised`.
+It is not invoked automatically by a route, scheduler or dashboard.
+
+The CLI runs the existing supervised executor in dry-run mode to obtain its exact
+prepared context. It displays and saves the review, obtains exact preparatory
+consent, constructs the existing linked initial record, and supplies the admission
+module with fixed acquisition and ownership adapters. Reconciliation and new
+experiment approvals each require their own nonce-bound confirmation against the
+complete admission binding. Reconciliation explicitly acknowledges that historical
+API restoration remains unproved. Existing freshness limits can expire during
+operator review; they are never extended.
+
+On success it prints `reconciled-preparation-recorded` and returns. The prepared
+review retains `CURRENT_EVIDENCE_PREPARATION_ONLY` and every other safety blocker.
+The admission has no finish method or runtime completion capability; no write or
+ownership-persistence adapter is called. The active claim remains consumed across
+restart and blocks legacy execution. Running this mode is therefore not a way to
+unlock or subsequently execute the same operation. No live command is authorised
+by preparing or recovering its claim.
+
+The production command was not run as part of implementation. Integration tests
+use synthetic responses, temporary durable storage and simulated terminal answers;
+they reject every attempted HTTP method other than GET. Restoration can reuse the
+same exact-review, independent-approval, pre-write recheck and durable-record
+pattern, but its live phase transitions and completion authority remain unimplemented.

@@ -91,6 +91,10 @@ test('interactive dry-run uses validated acquisition and never invokes a write t
    '@next/env':{loadEnvConfig(){}},'../site/current-site':{currentSite:f.site},
    '../site/kraken-refresh':{async getRecordedKrakenStateForInspection(id,identity){calls.acquisition++;assert.equal(id,f.site.id);assert.equal(identity,f.site.integrations.kraken.importTariffIdentity);return {state:f.capture.kraken,acquisition:{freshEvidenceObtained:fresh,staleFallbackUsed:!fresh}};}},
    './observed-tariff':load('src/lib/tesla-tariff/observed-tariff.ts'),
+   './rollback-evidence':load('src/lib/tesla-tariff/rollback-evidence.ts'),
+   './proposal-approval':load('src/lib/tesla-tariff/proposal-approval.ts'),
+   './ownership-transition':load('src/lib/tesla-tariff/ownership-transition.ts'),
+   './repeat-attempt-journal':{admitOfflineReconciledExperiment:blocked},
    './linked-experiment-records':load('src/lib/tesla-tariff/linked-experiment-records.ts'),
    './prepared-mutation-context':load('src/lib/tesla-tariff/prepared-mutation-context.ts'),
    './ownership-store':{ownershipStore:()=>({read:async()=>({status:'missing'})})},
@@ -239,4 +243,85 @@ test('admission at the inclusive 12:01:00 evidence deadline remains recoverably 
  const recovered=await journals.readOfflineReconciledExperiment(x.config);
  assert.equal(recovered.status,'consistent-offline-admission');noRuntimeAuthority(recovered);
  assert.equal(await io.readFile(x.root,'utf8'),x.priorBytes);
+});
+
+async function reconciledCliHarness(t,fault){
+ const x=await admissionFixture(t),cwd=x.config.directory,root=path.join(cwd,'.cache/home-energy-platform'),directory=path.join(root,'tesla-experiments');
+ await io.mkdir(directory,{recursive:true,mode:0o700});
+ const historical=path.join(directory,'site-12345.jsonl');await io.writeFile(historical,x.priorBytes);
+ if(fault==='conflict')await io.writeFile(path.join(directory,'site-12345-attempt.active'),'already-pending');
+ const calls={gets:0,posts:0,acquisitions:0,questions:0,output:[]};let uuid=0,lastReconciliation='';
+ const blocked=()=>{throw Error('UNEXPECTED_EXECUTION');};
+ const dependencies={
+  'node:fs/promises':{...io,readFile:async(file,...args)=>file===path.join(cwd,'.tesla-tokens.json')?JSON.stringify({access_token:'offline-only'}):io.readFile(file,...args)},
+  'node:path':path,'node:crypto':{...crypto,randomUUID:()=>`fixture-identity-${++uuid}`},
+  'node:readline/promises':{createInterface:()=>({close(){},async question(message){calls.questions++;
+   if(message==='Type AUTOMATIC ROLLBACK IS UNPROVEN: ')return 'AUTOMATIC ROLLBACK IS UNPROVEN';
+   if(message==='Type MANUAL TESLA APP RECOVERY MAY BE REQUIRED: ')return 'MANUAL TESLA APP RECOVERY MAY BE REQUIRED';
+   const expected=message.match(/\n([^\n]+)\n> $/)?.[1];assert.ok(expected,message);
+   if(expected.startsWith('RECONCILE')){lastReconciliation=expected;if(fault==='approval')return 'wrong';}
+   if(expected.startsWith('PREPARE')&&fault==='replay')return lastReconciliation;
+   return expected;
+  }})},
+  '@next/env':{loadEnvConfig(){}},'../site/current-site':{currentSite:x.f.site},
+  '../site/kraken-refresh':{async getRecordedKrakenStateForInspection(){calls.acquisitions++;return{state:fault==='missing'?null:structuredClone(x.f.capture.kraken),acquisition:{freshEvidenceObtained:fault!=='stale',staleFallbackUsed:fault==='stale'}};}},
+  './observed-tariff':load('src/lib/tesla-tariff/observed-tariff.ts'),'./rollback-evidence':load('src/lib/tesla-tariff/rollback-evidence.ts'),
+  './proposal-approval':load('src/lib/tesla-tariff/proposal-approval.ts'),'./ownership-transition':load('src/lib/tesla-tariff/ownership-transition.ts'),
+  './repeat-attempt-journal':journals,'./linked-experiment-records':linked,'./prepared-mutation-context':load('src/lib/tesla-tariff/prepared-mutation-context.ts'),
+  './ownership-store':{ownershipStore:()=>({read:async()=>({status:'missing'})})},
+  './ownership-sqlite':{persistConfirmedSmart:blocked},'./supervised-journal':{claimExperimentJournal:blocked},'./supervised-experiment':api,
+ };
+ class FixedDate extends Date{constructor(...a){super(...(a.length?a:[now]));}}
+ const exports={};
+ vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/lib/tesla-tariff/supervised-local.ts','utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,
+ {exports,Date:FixedDate,AbortSignal,process:{cwd:()=>cwd,env:{},stdin:{isTTY:fault!=='noninteractive'},stdout:{isTTY:true},stderr:{isTTY:true}},
+ console:{log:value=>calls.output.push(value)},fetch:async(_url,options)=>{
+  if(options.method!=='GET'){calls.posts++;throw Error('POST_FORBIDDEN');}calls.gets++;
+  if(fault==='interrupted'&&calls.gets===4)throw Error('INTERRUPTED');
+  const v=structuredClone(x.f.capture.before.representations.v2);
+  if(fault==='substituted'&&calls.gets>=2)v.name='changed';
+  return{ok:true,json:async()=>({response:{energy_site_id:'12345',installation_time_zone:'Europe/London',tariff_content_v2:v,tariff_content:legacy(v)}})};
+ },require:n=>{assert.ok(n in dependencies,n);return dependencies[n];}});
+ return {x,calls,config:{mode:'offline',directory,durableRoot:root,site:'12345'},historical,
+  run:(extra=[])=>exports.runLocalExperiment(['--site','12345','--vehicle','fixture-ev','--dispatch-start',x.f.selection.dispatchStart,'--prepare-reconciled','--experiment-id','cli-independent',...extra])};
+}
+test('closed CLI connects acquisition, exact review, separate approvals, durable claim and supervised dry-run only',async t=>{
+ const h=await reconciledCliHarness(t);await h.run();
+ const result=JSON.parse(h.calls.output.at(-1));assert.equal(result.status,'reconciled-preparation-recorded');
+ assert.equal(result.admission.status,'admitted-offline');noRuntimeAuthority(result.admission);
+ assert.ok(result.blockers.includes('CURRENT_EVIDENCE_PREPARATION_ONLY'));assert.ok(result.blockers.includes('BUY_BELOW_SELL'));
+ assert.equal(h.calls.posts,0);assert.equal(h.calls.gets,4);assert.equal(h.calls.questions,5);
+ assert.equal(await io.readFile(h.historical,'utf8'),h.x.priorBytes);
+ assert.equal((await journals.readOfflineReconciledExperiment(h.config)).status,'consistent-offline-admission');
+ await assert.rejects(h.run(),/ATTEMPT_IN_PROGRESS/);assert.equal(h.calls.posts,0);
+});
+test('closed preparation rejects missing/stale/substituted evidence and approval mismatch/replay without claims',async t=>{
+ for(const fault of ['missing','stale','substituted','approval','replay']){const h=await reconciledCliHarness(t,fault);
+  await assert.rejects(h.run());assert.equal(h.calls.posts,0);
+  assert.equal(await io.readFile(h.historical,'utf8'),h.x.priorBytes);
+  await assert.rejects(io.access(path.join(h.config.directory,'site-12345-attempt.active')),{code:'ENOENT'});
+ }
+});
+test('closed preparation preserves conflicting and interrupted claims after recovery',async t=>{
+ for(const fault of ['conflict','interrupted']){const h=await reconciledCliHarness(t,fault);
+  await assert.rejects(h.run());assert.equal(h.calls.posts,0);
+  assert.equal((await journals.readOfflineReconciledExperiment(h.config)).status,'blocked');
+  assert.equal((await journals.repeatAttemptEligibility(h.config.directory,'12345',{status:'missing'})).code,'ATTEMPT_IN_PROGRESS');
+  assert.equal(await io.readFile(h.historical,'utf8'),h.x.priorBytes);
+ }
+});
+test('preparation cannot be combined with execute and requires a foreground interactive terminal',async t=>{
+ for(const [fault,args,code]of [[undefined,['--execute-supervised'],'INVALID_ARGUMENTS'],['noninteractive',[],'INTERACTIVE_SUPERVISION_REQUIRED']]){
+  const h=await reconciledCliHarness(t,fault);await assert.rejects(h.run(args),new RegExp(code));
+  assert.equal(h.calls.gets+h.calls.posts+h.calls.acquisitions+h.calls.questions,0);
+ }
+});
+test('offline admission, recovered record and approvals cannot replace the executor prepared context',async t=>{
+ const x=await admissionFixture(t),admission=await journals.admitOfflineReconciledExperiment(x.config,'authority-negative',x.initial,x.ports);
+ const recovered=await journals.readOfflineReconciledExperiment(x.config);let writes=0;
+ for(const candidate of [admission,recovered,x.initial.exception.approval,x.initial]){
+  await assert.rejects(api.runSupervisedExperiment({site:x.f.site,selection:x.f.selection,mode:'execute-supervised',authority:'supervised-experiment'},
+   {now:()=>now,capture:async()=>x.f.capture,prepareContext:async()=>candidate,journalRecords:linked,write:async()=>{writes++;}}),/JOURNAL_INITIAL_INVALID/);
+ }
+ assert.equal(writes,0);
 });

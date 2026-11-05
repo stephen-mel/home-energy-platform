@@ -8,18 +8,24 @@ import { createInterface } from "node:readline/promises";
 import { loadEnvConfig } from "@next/env";
 import { currentSite } from "../site/current-site";
 import { getRecordedKrakenStateForInspection } from "../site/kraken-refresh";
+import { representationKey as journalKey } from "./rollback-evidence";
 import { captureObservedTariff } from "./observed-tariff";
 import * as journalRecords from "./linked-experiment-records";
-import { prepareMutationContext } from "./prepared-mutation-context";
+import { prepareMutationContext, type PreparedMutationContext } from "./prepared-mutation-context";
 import { ownershipStore } from "./ownership-store";
 import { persistConfirmedSmart } from "./ownership-sqlite";
+import { admitOfflineReconciledExperiment, type OfflineExperimentBinding } from "./repeat-attempt-journal";
+import { ownershipFingerprint } from "./ownership-transition";
+import { approveTariffProposal } from "./proposal-approval";
 import { claimExperimentJournal } from "./supervised-journal";
-import { runSupervisedExperiment, interpretWriteResponse, StaleApprovalOrEvidenceError, validateCurrentSupervisedCapture } from "./supervised-experiment";
+import { runSupervisedExperiment, interpretWriteResponse, StaleApprovalOrEvidenceError, validateCurrentSupervisedCapture, type ExperimentPorts } from "./supervised-experiment";
 
 const ROOT = "https://fleet-api.prd.eu.vn.cloud.tesla.com/api/1/energy_sites/";
 // Only these fixed identifiers may cross the CLI boundary. Never emit an
 // upstream message, cause, response body or stack (including authentication errors).
 const SAFE_FAILURE_CODES = new Set([
+    "RECONCILIATION_APPROVAL_REQUIRED", "OFFLINE_RECONCILIATION_INVALID", "INDEPENDENT_EVIDENCE_INVALID",
+    "OFFLINE_EXPERIMENT_REQUIRED", "OWNERSHIP_UNRESOLVED", "ATTEMPT_IN_PROGRESS", "HISTORICAL_JOURNAL_INVALID", "DUPLICATE_MUTATION_ID",
     "CURRENT_TESLA_EVIDENCE_INVALID", "CURRENT_KRAKEN_EVIDENCE_REQUIRED", "CURRENT_KRAKEN_PRICING_REQUIRED",
     "CURRENT_PRICING_COVERAGE_INCOMPLETE", "CURRENT_KRAKEN_ACQUISITION_FAILED",
     "INTERACTIVE_SUPERVISION_REQUIRED", "EXACT_SELECTION_REQUIRED", "INVALID_ARGUMENTS",
@@ -62,19 +68,22 @@ async function readBoundary<T>(code: string, read: () => Promise<T>): Promise<T>
 
 export async function runLocalExperiment(args: string[]) {
     if (args.includes("--help")) {
-        console.log("Local Tesla tariff experiment (default: dry-run).\nUsage: node scripts/tesla-tariff-experiment.mjs --site SITE_ID --vehicle KRAKEN_DEVICE_ID --dispatch-start EXACT_ISO [--execute-supervised]\nNo saved approval can be loaded. Execution requires an interactive foreground terminal and three exact confirmations. No automatic restore or retry.");
+        console.log("Local Tesla tariff experiment (default: dry-run).\nUsage: node scripts/tesla-tariff-experiment.mjs --site SITE_ID --vehicle KRAKEN_DEVICE_ID --dispatch-start EXACT_ISO [--execute-supervised | --prepare-reconciled --experiment-id NEW_ID]\nReconciled preparation records a permanent offline claim and cannot execute.\nNo saved approval can be loaded. Execution requires an interactive foreground terminal and three exact confirmations. No automatic restore or retry.");
         return;
     }
-    const allowed = new Set(["--site", "--vehicle", "--dispatch-start", "--execute-supervised"]);
+    const allowed = new Set(["--site", "--vehicle", "--dispatch-start", "--execute-supervised", "--prepare-reconciled", "--experiment-id"]);
     const options = new Map<string, string>();
     for (let i = 0; i < args.length; i++) {
         const arg = args[i];
         if (!allowed.has(arg) || options.has(arg)) throw new Error("INVALID_ARGUMENTS");
-        options.set(arg, arg === "--execute-supervised" ? "yes" : args[++i] ?? "");
+        options.set(arg, ["--execute-supervised", "--prepare-reconciled"].includes(arg) ? "yes" : args[++i] ?? "");
     }
-    const execute = options.has("--execute-supervised");
+    const execute = options.has("--execute-supervised"), prepareAdmission = options.has("--prepare-reconciled");
+    const experimentId = options.get("--experiment-id");
+    if (prepareAdmission && execute || prepareAdmission !== options.has("--experiment-id")
+        || prepareAdmission && !/^[A-Za-z0-9_-]{1,128}$/.test(experimentId ?? "")) throw Error("INVALID_ARGUMENTS");
     // No test runner, CI, redirected stdin/stdout, or noninteractive execution.
-    if (execute && (!process.stdin.isTTY || !process.stdout.isTTY || !process.stderr.isTTY
+    if ((execute || prepareAdmission) && (!process.stdin.isTTY || !process.stdout.isTTY || !process.stderr.isTTY
         || process.env.NODE_ENV === "test" || process.env.NODE_TEST_CONTEXT || process.env.CI)) throw new Error("INTERACTIVE_SUPERVISION_REQUIRED");
     const selection = { energySiteId: options.get("--site") ?? "", assetId: options.get("--vehicle") ?? "", dispatchStart: options.get("--dispatch-start") ?? "" };
     if (!/^\d+$/.test(selection.energySiteId) || !selection.assetId || !Number.isFinite(Date.parse(selection.dispatchStart))) throw new Error("EXACT_SELECTION_REQUIRED");
@@ -118,11 +127,15 @@ export async function runLocalExperiment(args: string[]) {
     };
     let writeAttempted = false;
     let beforeConfirmation = true;
-    const result = await runSupervisedExperiment({ site: currentSite, selection,
-        mode: execute ? "execute-supervised" : "dry-run", authority: execute ? "supervised-experiment" : "observe" }, {
+    let preparedContext: PreparedMutationContext | null = null;
+    const ports: ExperimentPorts = {
         now, capture, readBack: readBefore, journalRecords,
-        prepareContext: capture => prepareMutationContext({ site: currentSite, selection, capture },
-            { readOwnership: ownershipStore().read, now, newMutationId: randomUUID }),
+        prepareContext: async capture => {
+            const context = await prepareMutationContext({ site: currentSite, selection, capture },
+                { readOwnership: ownershipStore().read, now, newMutationId: randomUUID });
+            preparedContext = context;
+            return context;
+        },
         challenge: binding => `EXECUTE ${selection.energySiteId} ${digest(binding + randomUUID())}`,
         async confirm(review, challenge) {
             beforeConfirmation = false;
@@ -149,7 +162,56 @@ export async function runLocalExperiment(args: string[]) {
             try { body = await response.json(); } catch { /* unknown response must not cause retry */ }
             return interpretWriteResponse(response.status, body);
         },
-    }).catch(error => {
+    };
+    if (prepareAdmission) {
+        // The existing executor is invoked ONLY in its non-executing dry-run mode.
+        // No supplied/recovered admission is accepted as an execution credential.
+        const prepared = await runSupervisedExperiment({ site: currentSite, selection, mode: "dry-run", authority: "observe" }, ports);
+        const context = preparedContext as PreparedMutationContext | null;
+        if (prepared.status !== "dry-run" || !context || !prepared.review.hardBlockers.includes("CURRENT_EVIDENCE_PREPARATION_ONLY"))
+            throw Error("OFFLINE_EXPERIMENT_REQUIRED");
+        const review = prepared.review;
+        const challenge = `REVIEW ONLY ${selection.energySiteId} ${digest(review.fingerprint + randomUUID())}`;
+        const consent = await ports.confirm(review, challenge), approvedAt = now();
+        if (consent.challenge !== challenge || !consent.automaticRollbackUnproven || !consent.manualAppRecoveryMayBeRequired)
+            throw Error("EXACT_HUMAN_APPROVAL_REQUIRED");
+        const approval = approveTariffProposal(review.proposal, { fingerprint: review.proposal.fingerprint, approvedAt });
+        const initial = journalRecords.createLinkedInitialRecord(context, {
+            phase: "approval-consumed-before-write", review,
+            exception: { kind: "supervised-manual-recovery", consent, approvedAt: approval.approvedAt, approval,
+                exactExperimentFingerprint: review.fingerprint, productionBlockers: review.restoration.blockers,
+                automaticRollbackProven: false, manualRecovery: "Preparation only; no Tesla command authorised" },
+            preWriteRecheck: { teslaSource: review.before.source, tariffKey: journalKey(review.before.tariff),
+                krakenObservedAt: review.evidenceCapturedAt, smartEvidenceKey: review.binding.smartEvidenceKey },
+        });
+        const separateApproval = async (kind: "RECONCILE" | "PREPARE", binding: OfflineExperimentBinding) => {
+            const bindingKey = ownershipFingerprint(binding), approvalId = randomUUID();
+            console.log(`Preparation only. Historical API restoration remains unproved.\nExact admission binding:\n${JSON.stringify(binding, null, 2)}\nThis claim remains blocking after restart; it cannot execute or be automatically released.`);
+            const expected = `${kind} ${bindingKey} ${approvalId}`;
+            const prompt = createInterface({ input: process.stdin, output: process.stdout });
+            try {
+                const typed = await prompt.question(kind === "RECONCILE"
+                    ? `Independently review the retained prior journal and fresh baseline/ownership. Approve reconciliation for this new experiment only:\n${expected}\n> `
+                    : `Separately approve this exact new experiment for preparation only:\n${expected}\n> `);
+                if (typed !== expected) throw Error("RECONCILIATION_APPROVAL_REQUIRED");
+                return { approvalId, bindingKey, approvedAt: now() };
+            } finally { prompt.close(); }
+        };
+        const admission = await admitOfflineReconciledExperiment({ mode: "offline", directory,
+            durableRoot: path.join(process.cwd(), ".cache/home-energy-platform"), site: selection.energySiteId }, experimentId!, initial, {
+            now, capture: async site => { if (site !== selection.energySiteId) throw Error("TARGET_MISMATCH"); return capture(); },
+            readOwnership: site => ownershipStore().read(site),
+            approveReconciliation: async binding => ({ ...await separateApproval("RECONCILE", binding),
+                disposition: "prior-conflict-reconciled-for-new-experiment", historicalApiRestoration: "not-proved" }),
+            approveExperiment: binding => separateApproval("PREPARE", binding),
+        });
+        console.log(JSON.stringify({ status: "reconciled-preparation-recorded", admission,
+            blockers: [...new Set([...review.hardBlockers, ...review.restoration.blockers])],
+            writeReady: false, executionReady: false, restorationProven: false }, null, 2));
+        return;
+    }
+    const result = await runSupervisedExperiment({ site: currentSite, selection,
+        mode: execute ? "execute-supervised" : "dry-run", authority: execute ? "supervised-experiment" : "observe" }, ports).catch(error => {
         if (beforeConfirmation && safeExperimentFailureCode(error) === "READ_OR_EXECUTION_FAILED") throw new Error("PREPARATION_FAILED");
         throw error;
     });
