@@ -93,3 +93,31 @@ use synthetic responses, temporary durable storage and simulated terminal answer
 they reject every attempted HTTP method other than GET. Restoration can reuse the
 same exact-review, independent-approval, pre-write recheck and durable-record
 pattern, but its live phase transitions and completion authority remain unimplemented.
+
+## Closed mocked admission-to-apply continuation
+
+`mockedReconciledApply()` in the current-supervised-preparation test suite composes
+actual reconciled admission with a private, single-use in-memory simulation. It
+accepts only fixed internal fault scenarios, not providers, records, capabilities
+or paths. Its identity never leaves the composition and is consumed before the
+first asynchronous continuation check. Copied documents and recovery results
+cannot replace it. This is a test composition, not a production runtime bridge.
+
+The same distinct admitted operation journal receives two explicitly simulated
+records: `simulated-apply-intent` (flushed before the simulated transport), then
+`simulated-apply-classified`. The latter wraps an existing validated linked
+classification; the wrapper explicitly denies runtime confirmation. No second
+historical site claim, completion capability, receipt or ownership write is made.
+The original admission marker and historical journal remain unchanged.
+
+Existing current-evidence preparation, strict dual observation validation,
+readback comparison, response interpretation and classification are reused.
+`CURRENT_EVIDENCE_PREPARATION_ONLY` and `BUY_BELOW_SELL` remain present; simulated
+execution does not establish that either production gate has passed. Readback
+source labels are synthetic fixtures, not authenticated Tesla observations.
+
+The existing recovery reader deliberately does not interpret these extra test
+records as a resumable or completed admission. It fails closed, and all uncertain
+or interrupted outcomes retain the exclusive claim. Restoration, terminal claim
+completion, production continuation authority and recovery phase interpretation
+are still absent. Any future versioned reader must preserve these distinctions.

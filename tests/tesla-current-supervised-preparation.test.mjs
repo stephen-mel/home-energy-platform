@@ -325,3 +325,124 @@ test('offline admission, recovered record and approvals cannot replace the execu
  }
  assert.equal(writes,0);
 });
+
+// Closed, TEST-ONLY continuation. No providers, documents, paths or capability
+// are accepted from a caller or exported. The only transport is local state.
+async function mockedReconciledApply(t, fault = 'valid') {
+ const x = await admissionFixture(t), original = key(x.initial.review.before);
+ const admission = await journals.admitOfflineReconciledExperiment(x.config, 'mocked-continuation', x.initial, x.ports);
+ noRuntimeAuthority(admission);
+ const file = path.join(x.config.directory, `site-12345-attempt-${x.initial.mutationId}.jsonl`);
+ const admittedBytes = await io.readFile(file, 'utf8');
+ const markerFile = path.join(x.config.directory, 'site-12345-attempt.active');
+ const markerBytes = await io.readFile(markerFile, 'utf8');
+ const live = Object.freeze({}), identities = new WeakMap([[live, { used: false }]]);
+ const events = []; let writes = 0;
+ const append = async record => {
+  const handle = await io.open(file, 'a');
+  try { await handle.writeFile(JSON.stringify(record) + '\n'); await handle.sync(); }
+  finally { await handle.close(); }
+ };
+ const continueOnce = async identity => {
+  const state = identities.get(identity);
+  if (!state || state.used) throw Error('MOCK_CONTINUATION_NOT_LIVE');
+  state.used = true; // consume before any await, including failed admission checks
+  if (await io.readFile(file, 'utf8') !== admittedBytes || await io.readFile(markerFile, 'utf8') !== markerBytes)
+   throw Error('MOCK_ADMISSION_CHANGED');
+  const capture = structuredClone(x.f.capture);
+  if (fault === 'site') capture.before.source.energySiteId = '999';
+  if (fault === 'baseline') capture.before.representations.legacy.sell_tariff.name = 'substituted';
+  if (fault === 'stale') capture.kraken.lastSuccessfulUpdate = '2026-10-27T11:58:00Z';
+  const validated = api.validateCurrentSupervisedCapture(x.f.site, capture, now);
+  const review = api.prepareSupervisedExperiment(x.f.site, x.f.selection, validated, now);
+  if (key(review) !== key(x.initial.review) || key(capture.before) !== original
+    || key(await x.ports.readOwnership('12345')) !== key({ status: 'missing' })) throw Error('MOCK_BINDING_CHANGED');
+  // This is NOT removal of a production gate: both gates remain recorded and
+  // the only execution below is an internally selected in-memory simulation.
+  assert.ok(review.hardBlockers.includes('CURRENT_EVIDENCE_PREPARATION_ONLY'));
+  assert.ok(review.restoration.blockers.includes('BUY_BELOW_SELL'));
+  const attemptedAt = '2026-10-27T12:00:01Z';
+  const intent = { version: 1, mode: 'mocked-reconciled-apply', phase: 'simulated-apply-intent',
+   initialRecordId: x.initial.initialRecordId, mutationId: x.initial.mutationId,
+   experimentId: admission.experimentId, site: '12345', baselineKey: hash(review.before),
+   payloadKey: hash(review.payloadJson), admissionKey: hash(markerBytes), attemptedAt,
+   writeReady: false, runtimeConfirmationVerified: false };
+  if (fault === 'intent-interruption') { await io.appendFile(file, '{'); throw Error('INTERRUPTED_INTENT'); }
+  await append(intent); events.push('durable-intent');
+  // Private simulated transport: cannot call fetch or the Fleet API client.
+  const simulate = async () => {
+   const rows = (await io.readFile(file, 'utf8')).trim().split('\n').map(JSON.parse);
+   assert.equal(key(rows.at(-1)), key(intent)); events.push('simulated-post'); writes++;
+   if (fault === 'timeout') throw Error('SIMULATED_TIMEOUT');
+   return api.interpretWriteResponse(fault === 'rejected' ? 400 : 200, { response: { result: fault !== 'rejected' } });
+  };
+  let apiWrite;
+  try { apiWrite = await simulate(); } catch { apiWrite = { status: 'unknown', httpStatus: null }; }
+  if (fault === 'after-write') throw Error('INTERRUPTED_AFTER_WRITE');
+  const tariff = structuredClone(review.proposal.bound.representation);
+  if (fault === 'transformed') tariff.name = 'Transformed';
+  const readBack = fault === 'missing-readback' ? null : captureObservedTariff({ installation_time_zone: 'Europe/London',
+   tariff_content_v2: tariff, tariff_content: legacy(tariff) }, '12345', '2026-10-27T12:00:02Z');
+  const intended = load('src/lib/tesla-tariff/observed-tariff.ts').simulatedTariffObservation(review.before, review.proposal.bound.representation);
+  const comparison = load('src/lib/tesla-tariff/restoration-review.ts').compareObservedTariffReadBack({ intended, readBack, after: attemptedAt, dates: [review.date] });
+  const classification = api.classifyExperimentResult(apiWrite, intended, readBack, comparison);
+  const classified = linked.createLinkedClassifiedRecord(x.initial, { phase: 'classified', attemptedAt,
+   completedAt: '2026-10-27T12:00:03Z', exception: x.initial.exception, apiWrite,
+   apiTariffReadBack: { observation: readBack, comparison }, classification,
+   laterTeslaAppObservation: null, laterPowerwallOpticasterObservation: null,
+   rollbackProven: false, productionWriteReady: false, automaticRestoreAttempted: false });
+  assert.equal(linked.validLinkedClassifiedRecord(classified, x.initial), true);
+  if (fault === 'result-interruption') { await io.appendFile(file, '{'); throw Error('INTERRUPTED_RESULT'); }
+  // Label simulated provenance outside the reusable linked evidence. Never call
+  // journal.finish(), the completion registry or an ownership writer.
+  await append({ version: 1, mode: 'mocked-reconciled-apply', phase: 'simulated-apply-classified',
+   intentKey: hash(intent), classified, runtimeConfirmationVerified: false, writeReady: false });
+  events.push('durable-result');
+  return { classification, comparison };
+ };
+ if (fault === 'approval') {
+  const marker = JSON.parse(markerBytes); marker.approval.approvalId = 'substituted';
+  const { checksum: _checksum, ...body } = marker; void _checksum;
+  await io.writeFile(markerFile, JSON.stringify({ ...body, checksum: hash(body) }) + '\n');
+ }
+ const results = fault === 'concurrent' ? await Promise.allSettled([continueOnce(live), continueOnce(live)])
+  : await Promise.allSettled([continueOnce(fault === 'copy' ? structuredClone(live) : fault === 'document' ? admission : live)]);
+ await assert.rejects(continueOnce(['copy', 'document'].includes(fault) ? admission : live), /MOCK_CONTINUATION_NOT_LIVE/);
+ assert.equal(key(x.initial.review.before), original);
+ assert.equal(await io.readFile(x.root, 'utf8'), x.priorBytes);
+ const recovered = await journals.readOfflineReconciledExperiment(x.config);
+ assert.ok(['blocked', 'consistent-offline-admission'].includes(recovered.status)); noRuntimeAuthority(recovered);
+ assert.equal((await journals.repeatAttemptEligibility(x.config.directory, '12345', { status: 'missing' })).code, 'ATTEMPT_IN_PROGRESS');
+ return { results, events, writes, original: x.initial.review.before, rows: await io.readFile(file, 'utf8') };
+}
+
+test('closed mocked continuation durably records intent before one simulated apply and exact dual readback', async t => {
+ const r = await mockedReconciledApply(t);
+ assert.equal(r.results[0].status, 'fulfilled');
+ assert.equal(r.results[0].value.classification, 'submitted-representation-preserved');
+ assert.equal(r.results[0].value.comparison.outcome, 'exact-observed-match');
+ assert.equal(r.results[0].value.comparison.exportSubtreeMatches, true);
+ assert.deepEqual(r.events, ['durable-intent', 'simulated-post', 'durable-result']);
+ assert.equal(r.writes, 1); assert.equal(r.original.representations.relationship, 'consistent');
+ assert.equal(r.rows.trim().split('\n').length, 3);
+});
+test('mocked continuation classifies transformed, missing, rejected and ambiguous results without retry', async t => {
+ for (const [fault, expected] of [['transformed', 'accepted-but-transformed-differently'], ['missing-readback', 'read-back-unavailable-or-insufficient'],
+  ['rejected', 'request-rejected'], ['timeout', 'write-outcome-unknown']]) {
+  const r = await mockedReconciledApply(t, fault);
+  assert.equal(r.results[0].status, 'fulfilled'); assert.equal(r.results[0].value.classification, expected); assert.equal(r.writes, 1);
+ }
+});
+test('mocked continuation rejects copied authority, changed evidence and rehashed approval substitution', async t => {
+ for (const fault of ['copy', 'document', 'site', 'baseline', 'stale', 'approval']) {
+  const r = await mockedReconciledApply(t, fault); assert.equal(r.results[0].status, 'rejected', fault); assert.equal(r.writes, 0, fault);
+ }
+});
+test('mocked continuation consumes once under concurrency and retains interrupted claims', async t => {
+ const concurrent = await mockedReconciledApply(t, 'concurrent');
+ assert.equal(concurrent.results.filter(r => r.status === 'fulfilled').length, 1); assert.equal(concurrent.writes, 1);
+ for (const fault of ['intent-interruption', 'after-write', 'result-interruption']) {
+  const r = await mockedReconciledApply(t, fault); assert.equal(r.results[0].status, 'rejected');
+  assert.equal(r.writes, fault === 'intent-interruption' ? 0 : 1);
+ }
+});
