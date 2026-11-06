@@ -183,3 +183,42 @@ original dual readback, and independently confirmed ownership disposition. The
 existing simulation demonstrates those phases but cannot authenticate them. No
 restoration, claim release, ownership persistence or safety-policy change is
 implemented here. `CURRENT_EVIDENCE_PREPARATION_ONLY` remains mandatory.
+
+## Private execution-attempt capture prerequisite
+
+`createPrivateAttemptProducer()` is a dormant, unexported function in the closed
+local adapter. It is not called by the CLI, existing executor or reconciled
+admission. There is no new switch, endpoint, public factory or runtime registry.
+Without an adapter it returns `disabled-production` / `not-attempted`, with no
+attempt identity or transport invocation. Every supplied adapter is categorically
+`simulated-injected-transport`; no authentication flag or callback can change that.
+VM instrumentation exposes the private function in tests only.
+
+The producer snapshots the exact original observation, approved payload, ownership
+context and durable intent/claim identities. Before invoking a simulated POST it
+checks unchanged journal bytes, independently syncs the existing intent and its
+directory, and enforces the existing approval/evidence deadlines. Its private,
+single-use closure captures the transport response itself, then invokes readback
+itself. Method replacement, external result arguments, copied handles, concurrent
+invocations and process-local intent reuse do not supply execution authority. Raw response bodies
+and exception messages are not retained. No journal record is appended or claim
+released by this producer.
+
+Results distinguish not attempted, unknown outcome, rejected, accepted with
+unverified readback, and accepted with exact readback. Existing response parsing,
+strict observation validation, readback comparison and result classification are
+reused. Unknown outcomes remain unknown even with matching readback. Exact results
+from test adapters remain simulated, frozen documentary output with every
+production-confirmation/completion flag false. No attempt ID or copied result is a
+capability, receipt or authenticated readback witness.
+
+This establishes causal capture for offline tests, not production authentication.
+A separately reviewed, internally selected authenticated adapter is still needed
+before any production attempt can be confirmed. Connecting that origin to the
+reconciled continuation, durable confirmed completion, restoration and ownership
+disposition remains future work. The Fleet POST closure, preparation-only gate,
+pricing policy, receipt registry and historical journals are unchanged.
+
+The process-local attempt guard is not restart-proof mutation admission. No
+recovery entry point exists; the existing durable exclusive claim remains blocking.
+A future production connection must preserve durable uncertain-attempt handling.

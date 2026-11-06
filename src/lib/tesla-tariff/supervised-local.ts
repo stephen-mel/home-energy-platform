@@ -9,7 +9,7 @@ import { loadEnvConfig } from "@next/env";
 import { currentSite } from "../site/current-site";
 import { getRecordedKrakenStateForInspection } from "../site/kraken-refresh";
 import { representationKey as journalKey } from "./rollback-evidence";
-import { captureObservedTariff } from "./observed-tariff";
+import { captureObservedTariff, simulatedTariffObservation, type ObservedTariff } from "./observed-tariff";
 import * as journalRecords from "./linked-experiment-records";
 import { prepareMutationContext, type PreparedMutationContext } from "./prepared-mutation-context";
 import { ownershipStore } from "./ownership-store";
@@ -17,8 +17,10 @@ import { persistConfirmedSmart } from "./ownership-sqlite";
 import { admitOfflineReconciledExperiment, readOfflineReconciledExperiment, validReconciledApplyRecords, type ReconciledApplyIntent, type ReconciledApplyClassification, type OfflineExperimentBinding } from "./repeat-attempt-journal";
 import { ownershipFingerprint } from "./ownership-transition";
 import { approveTariffProposal } from "./proposal-approval";
+import { compareObservedTariffReadBack } from "./restoration-review";
+import { validateTeslaInspectionEvidence } from "./smart-inspection";
 import { claimExperimentJournal } from "./supervised-journal";
-import { runSupervisedExperiment, interpretWriteResponse, StaleApprovalOrEvidenceError, validateCurrentSupervisedCapture, prepareSupervisedExperiment, CAPTURE_TTL_MS, EVIDENCE_TTL_MS, APPROVAL_TTL_MS, MIN_WRITE_REMAINING_MS, type ExperimentPorts } from "./supervised-experiment";
+import { runSupervisedExperiment, interpretWriteResponse, StaleApprovalOrEvidenceError, validateCurrentSupervisedCapture, prepareSupervisedExperiment, classifyExperimentResult, CAPTURE_TTL_MS, EVIDENCE_TTL_MS, APPROVAL_TTL_MS, MIN_WRITE_REMAINING_MS, type ExperimentPorts } from "./supervised-experiment";
 
 const ROOT = "https://fleet-api.prd.eu.vn.cloud.tesla.com/api/1/energy_sites/";
 // Only these fixed identifiers may cross the CLI boundary. Never emit an
@@ -161,6 +163,110 @@ async function createReconciledApplyContinuation(initialRecord: journalRecords.L
         },
     });
     return continuation;
+}
+
+// No production transport is accepted as authenticated through this interface.
+// Any injected adapter is ALWAYS simulated. A future authenticated producer needs
+// separately reviewed closed transport wiring, not a caller-controlled flag.
+type SimulatedAttemptAdapter = {
+    post(site: string, payload: string): Promise<{ httpStatus: number; body: unknown }>;
+    readBack(site: string): Promise<ObservedTariff>;
+};
+const attemptedIntents = new Set<string>();
+const intentAttempted = attemptedIntents.has.bind(attemptedIntents);
+const rememberAttempt = attemptedIntents.add.bind(attemptedIntents);
+
+/** Dormant private producer; not called by the CLI, executor or admission path.
+ * Supplied adapters can exercise causal capture only in the simulated namespace.
+ * No transport means no execution, journal completion, or confirmation authority.
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- Deliberately dormant; VM tests expose it only in their own realm.
+async function createPrivateAttemptProducer(initialRecord: journalRecords.LinkedInitialRecord,
+    config: Parameters<typeof readOfflineReconciledExperiment>[0], now: () => string, adapter?: SimulatedAttemptAdapter) {
+    config = structuredClone(config);
+    const initial = structuredClone(initialRecord);
+    const site = config.site, file = path.join(config.directory, `site-${site}-attempt-${initial.mutationId}.jsonl`);
+    const markerFile = path.join(config.directory, `site-${site}-attempt.active`);
+    const markerText = await readFile(markerFile, "utf8"), marker = JSON.parse(markerText);
+    const text = await readFile(file, "utf8"), rows = text.trimEnd().split("\n").map(line => JSON.parse(line));
+    const intent = rows[1] as ReconciledApplyIntent;
+    const { checksum, ...markerBody } = marker;
+    if (rows.length !== 2 || journalKey(rows[0]) !== journalKey(initial)
+        || !validReconciledApplyRecords(initial, ownershipFingerprint(markerText), [intent])
+        || marker.version !== 3 || marker.mode !== "offline-reconciled-experiment"
+        || checksum !== ownershipFingerprint(markerBody) || marker.binding.site !== site
+        || marker.binding.initialRecordId !== initial.initialRecordId || marker.binding.mutationId !== initial.mutationId)
+        throw Error("ATTEMPT_INTENT_INVALID");
+    const binding = Object.freeze({ site, mutationId: initial.mutationId, experimentId: marker.binding.experimentId,
+        initialRecordId: initial.initialRecordId, intentRecordId: intent.recordId, admissionKey: intent.admissionKey,
+        payloadKey: ownershipFingerprint(initial.review.payloadJson), ownershipKey: ownershipFingerprint(initial.preparedContext.ownership),
+        originalObservationKey: ownershipFingerprint(initial.review.before) });
+    // Capture methods once. Replacing an adapter after construction cannot change
+    // the transport paired with this attempt. No results/flags are accepted by run.
+    const post = adapter?.post.bind(adapter), read = adapter?.readBack.bind(adapter);
+    let used = false;
+    const freeze = <T>(value: T): T => {
+        if (value && typeof value === "object") { Object.values(value).forEach(freeze); Object.freeze(value); }
+        return value;
+    };
+    const producer = Object.freeze({ async run(...args: unknown[]) {
+        if (this !== producer || used) throw Error("ATTEMPT_NOT_LIVE");
+        used = true;
+        if (args.length) throw Error("ATTEMPT_EXTERNAL_EVIDENCE_REJECTED");
+        const denied = { productionConfirmation: false as const, runtimeConfirmationVerified: false as const,
+            writeReady: false as const, executionReady: false as const, grantsCompletionAuthority: false as const };
+        if (!post || !read) return freeze({ ...denied, provenance: "disabled-production" as const,
+            outcome: "not-attempted" as const, attemptId: null, binding });
+        const claim = path.resolve(file) + ":" + intent.recordId;
+        if (intentAttempted(claim)) throw Error("ATTEMPT_ALREADY_CONSUMED");
+        rememberAttempt(claim); // consume before durability checks or transport
+        if (await readFile(markerFile, "utf8") !== markerText || await readFile(file, "utf8") !== text)
+            throw Error("ATTEMPT_JOURNAL_CHANGED");
+        // Independently flush the existing intent and directory before invoking
+        // even a simulated transport. Failure never reaches post and cannot retry.
+        const handle = await open(file, "r");
+        try { await handle.sync(); } finally { await handle.close(); }
+        const parent = await open(config.directory, "r");
+        try { await parent.sync(); } finally { await parent.close(); }
+        const attemptedAt = now();
+        const age = (at: string) => Date.parse(attemptedAt) - Date.parse(at);
+        if (!Number.isFinite(Date.parse(attemptedAt)) || Date.parse(attemptedAt) < Date.parse(intent.attemptedAt)
+            || age(initial.exception.approvedAt) < 0 || age(initial.exception.approvedAt) > APPROVAL_TTL_MS
+            || age(initial.review.before.source.observedAt) < 0 || age(initial.review.before.source.observedAt) > CAPTURE_TTL_MS
+            || age(initial.preWriteRecheck.krakenObservedAt) < 0 || age(initial.preWriteRecheck.krakenObservedAt) > EVIDENCE_TTL_MS
+            || ![marker.approval, marker.reconciliation].every(a => age(a.approvedAt) >= 0 && age(a.approvedAt) <= APPROVAL_TTL_MS)
+            || Date.parse(attemptedAt) + MIN_WRITE_REMAINING_MS >= Date.parse(initial.review.proposal.bound.expiresAt))
+            throw Error("ATTEMPT_EVIDENCE_EXPIRED");
+        if (await readFile(markerFile, "utf8") !== markerText || await readFile(file, "utf8") !== text)
+            throw Error("ATTEMPT_JOURNAL_CHANGED");
+        const attemptId = randomUUID();
+        let apiWrite: ReturnType<typeof interpretWriteResponse> = { status: "unknown", httpStatus: null };
+        try {
+            const response = await post(site, initial.review.payloadJson);
+            if (Number.isInteger(response.httpStatus) && response.httpStatus >= 100 && response.httpStatus <= 599)
+                apiWrite = interpretWriteResponse(response.httpStatus, response.body);
+        } catch { /* Invocation may have mutated state; never retry or infer acceptance from GET. */ }
+        let observation: ObservedTariff | null = null;
+        try { observation = validateTeslaInspectionEvidence(await read(site)); } catch { /* Unverified readback below. */ }
+        let completedAt: string | null = null;
+        try {
+            const at = now();
+            if (Number.isFinite(Date.parse(at)) && Date.parse(at) >= Date.parse(attemptedAt)) completedAt = at;
+        } catch { /* A failed clock after invocation must not erase the attempted write. */ }
+        if (observation && (!completedAt || observation.source.kind !== "tesla-site-info" || observation.source.energySiteId !== site
+            || observation.source.timeZone !== initial.review.before.source.timeZone
+            || !Number.isFinite(Date.parse(completedAt)) || Date.parse(completedAt) < Date.parse(attemptedAt)
+            || Date.parse(observation.source.observedAt) > Date.parse(completedAt)
+            || Date.parse(completedAt) - Date.parse(observation.source.observedAt) > CAPTURE_TTL_MS)) observation = null;
+        const intended = simulatedTariffObservation(initial.review.before, initial.review.proposal.bound.representation);
+        const comparison = compareObservedTariffReadBack({ intended, readBack: observation, after: attemptedAt, dates: [initial.review.date] });
+        const classification = classifyExperimentResult(apiWrite, intended, observation, comparison);
+        const outcome = apiWrite.status === "unknown" ? "write-outcome-unknown" : apiWrite.status === "rejected" ? "write-rejected"
+            : comparison.outcome === "exact-observed-match" && comparison.timelineScope.complete ? "accepted-exact-readback" : "accepted-readback-unverified";
+        return freeze({ ...denied, provenance: "simulated-injected-transport" as const, attemptId, binding,
+            attemptedAt, completedAt, apiWrite, observation, comparison, classification, outcome });
+    } });
+    return producer;
 }
 
 export async function runLocalExperiment(args: string[]) {

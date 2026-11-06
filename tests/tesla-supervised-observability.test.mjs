@@ -49,6 +49,8 @@ function harness(fault) {
           acquisition: { freshEvidenceObtained: true, staleFallbackUsed: false } };
       },
     },
+    './restoration-review': domain('src/lib/tesla-tariff/restoration-review.ts'),
+    './smart-inspection': domain('src/lib/tesla-tariff/smart-inspection.ts'),
     './rollback-evidence': domain('src/lib/tesla-tariff/rollback-evidence.ts'),
     './proposal-approval': domain('src/lib/tesla-tariff/proposal-approval.ts'),
     './ownership-transition': domain('src/lib/tesla-tariff/ownership-transition.ts'),

@@ -92,6 +92,8 @@ test('interactive dry-run uses validated acquisition and never invokes a write t
    '../site/kraken-refresh':{async getRecordedKrakenStateForInspection(id,identity){calls.acquisition++;assert.equal(id,f.site.id);assert.equal(identity,f.site.integrations.kraken.importTariffIdentity);return {state:f.capture.kraken,acquisition:{freshEvidenceObtained:fresh,staleFallbackUsed:!fresh}};}},
    './observed-tariff':load('src/lib/tesla-tariff/observed-tariff.ts'),
    './rollback-evidence':load('src/lib/tesla-tariff/rollback-evidence.ts'),
+   './restoration-review':load('src/lib/tesla-tariff/restoration-review.ts'),
+   './smart-inspection':load('src/lib/tesla-tariff/smart-inspection.ts'),
    './proposal-approval':load('src/lib/tesla-tariff/proposal-approval.ts'),
    './ownership-transition':load('src/lib/tesla-tariff/ownership-transition.ts'),
    './repeat-attempt-journal':{admitOfflineReconciledExperiment:blocked},
@@ -262,9 +264,10 @@ async function reconciledCliHarness(t,fault){
      await target.sync();if(fault==='continuation-slow-sync')x.ports.now=()=> '2026-10-27T12:01:01Z';
     };const v=target[k];return typeof v==='function'?v.bind(target):v;}});
    }
+   if(fault==='attempt-sync-failure'&&flags==='r')return new Proxy(handle,{get(target,k){if(k==='sync')return async()=>{throw Error('ATTEMPT_SYNC_FAILURE');};const v=target[k];return typeof v==='function'?v.bind(target):v;}});
    return handle;
   },readFile:async(file,...args)=>file===path.join(cwd,'.tesla-tokens.json')?JSON.stringify({access_token:'offline-only'}):io.readFile(file,...args)},
-  'node:path':path,'node:crypto':{...crypto,randomUUID:()=>`fixture-identity-${++uuid}`},
+  'node:path':path,'node:crypto':{...crypto,randomUUID:()=>`fixture-identity-${++uuid}-${hash(cwd).slice(0,8)}`},
   'node:readline/promises':{createInterface:()=>({close(){},async question(message){calls.questions++;
    if(message==='Type AUTOMATIC ROLLBACK IS UNPROVEN: ')return 'AUTOMATIC ROLLBACK IS UNPROVEN';
    if(message==='Type MANUAL TESLA APP RECOVERY MAY BE REQUIRED: ')return 'MANUAL TESLA APP RECOVERY MAY BE REQUIRED';
@@ -276,7 +279,9 @@ async function reconciledCliHarness(t,fault){
   '@next/env':{loadEnvConfig(){}},'../site/current-site':{currentSite:x.f.site},
   '../site/kraken-refresh':{async getRecordedKrakenStateForInspection(){calls.acquisitions++;return{state:fault==='missing'?null:structuredClone(x.f.capture.kraken),acquisition:{freshEvidenceObtained:fault!=='stale',staleFallbackUsed:fault==='stale'}};}},
   './observed-tariff':load('src/lib/tesla-tariff/observed-tariff.ts'),'./rollback-evidence':load('src/lib/tesla-tariff/rollback-evidence.ts'),
-  './proposal-approval':load('src/lib/tesla-tariff/proposal-approval.ts'),'./ownership-transition':load('src/lib/tesla-tariff/ownership-transition.ts'),
+  './restoration-review':load('src/lib/tesla-tariff/restoration-review.ts'),
+   './smart-inspection':load('src/lib/tesla-tariff/smart-inspection.ts'),
+   './proposal-approval':load('src/lib/tesla-tariff/proposal-approval.ts'),'./ownership-transition':load('src/lib/tesla-tariff/ownership-transition.ts'),
   './repeat-attempt-journal':journals,'./linked-experiment-records':linked,'./prepared-mutation-context':load('src/lib/tesla-tariff/prepared-mutation-context.ts'),
   './ownership-store':{ownershipStore:()=>({read:async()=>({status:'missing'})})},
   './ownership-sqlite':{persistConfirmedSmart:blocked},'./supervised-journal':{claimExperimentJournal:blocked},'./supervised-experiment':api,
@@ -284,7 +289,7 @@ async function reconciledCliHarness(t,fault){
  class FixedDate extends Date{constructor(...a){super(...(a.length?a:[now]));}}
  const exports={};
  // Test-realm-only instrumentation; no application export or runtime switch.
- vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/lib/tesla-tariff/supervised-local.ts','utf8')+'\nexport { createReconciledApplyContinuation as testPrivateContinuation };',{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,
+ vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/lib/tesla-tariff/supervised-local.ts','utf8')+'\nexport { createReconciledApplyContinuation as testPrivateContinuation, createPrivateAttemptProducer as testPrivateAttemptProducer };',{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,
  {exports,structuredClone,Date:FixedDate,AbortSignal,process:{cwd:()=>cwd,env:{},stdin:{isTTY:fault!=='noninteractive'},stdout:{isTTY:true},stderr:{isTTY:true}},
  console:{log:value=>calls.output.push(value)},fetch:async(_url,options)=>{
   if(options.method!=='GET'){calls.posts++;throw Error('POST_FORBIDDEN');}calls.gets++;
@@ -295,6 +300,7 @@ async function reconciledCliHarness(t,fault){
  },require:n=>{assert.ok(n in dependencies,n);return dependencies[n];}});
  return {x,calls,config:{mode:'offline',directory,durableRoot:root,site:'12345'},historical,
   createPrivate:()=>exports.testPrivateContinuation(x.initial,x.config,x.ports),
+  createAttempt:adapter=>exports.testPrivateAttemptProducer(x.initial,x.config,()=>x.ports.now(),adapter),
   run:(extra=[])=>exports.runLocalExperiment(['--site','12345','--vehicle','fixture-ev','--dispatch-start',x.f.selection.dispatchStart,'--prepare-reconciled','--experiment-id','cli-independent',...extra])};
 }
 test('closed CLI connects acquisition, exact review, separate approvals, durable claim and supervised dry-run only',async t=>{
@@ -703,4 +709,109 @@ test('private production continuation cannot advance after slow intent sync or u
   assert.equal((await journals.readOfflineReconciledExperiment(h.x.config)).status, 'blocked');
   assert.equal(await io.readFile(h.marker, 'utf8'), h.markerBytes);
  }
+});
+
+async function attemptProducerFixture(t, fault = 'valid') {
+ const h = await privateContinuationFixture(t); await h.handle.recordApplyIntent();
+ const calls = [];
+ const adapter = {
+  async post(site, payload) {
+   calls.push('post'); assert.equal(site, '12345'); assert.equal(payload, h.x.initial.review.payloadJson);
+   const rows = (await io.readFile(h.file, 'utf8')).trim().split('\n').map(JSON.parse);
+   assert.equal(rows[1].phase, 'apply-intent'); assert.equal(rows.length, 2);
+   if (fault === 'timeout') throw Error('OFFLINE_TIMEOUT');
+   return { httpStatus: fault === 'rejected' ? 400 : fault === 'ambiguous' ? 503 : 200,
+    body: { response: { result: fault !== 'rejected' }, secret: 'DO_NOT_RETAIN_RESPONSE_BODY' } };
+  },
+  async readBack(site) {
+   calls.push('readback'); assert.equal(site, '12345');
+   h.x.ports.now = () => '2026-10-27T12:00:02Z';
+   if (fault === 'missing') throw Error('OFFLINE_READ_FAILURE');
+   const observation = privateApplyReport(h.x).apiTariffReadBack.observation;
+   if (fault === 'stale') observation.source.observedAt = '2026-10-27T11:59:00Z';
+   if (fault === 'future') observation.source.observedAt = '2026-10-27T12:01:00Z';
+   if (fault === 'wrong-site') observation.source.energySiteId = '54321';
+   if (fault === 'transformed') observation.representations.legacy.sell_tariff.name = 'Changed export';
+   if (fault === 'simulation-source') observation.source.kind = 'simulation';
+   if (fault === 'clock-failure') h.x.ports.now = () => { throw Error('OFFLINE_CLOCK_FAILURE'); };
+   return observation;
+  },
+ };
+ const producer = await h.createAttempt(adapter);
+ return { ...h, producer, adapter, calls };
+}
+test('private attempt producer captures exact simulated response/readback causality and binds durable intent without authority', async t => {
+ const h = await attemptProducerFixture(t), result = await h.producer.run();
+ assert.deepEqual(h.calls, ['post', 'readback']); assert.equal(result.outcome, 'accepted-exact-readback');
+ assert.equal(result.provenance, 'simulated-injected-transport'); assert.ok(result.attemptId);
+ assert.equal(result.binding.mutationId, h.x.initial.mutationId); assert.equal(result.binding.payloadKey, hash(h.x.initial.review.payloadJson));
+ assert.equal(result.binding.ownershipKey, hash(h.x.initial.preparedContext.ownership));
+ assert.equal(result.binding.originalObservationKey, hash(h.x.initial.review.before));
+ assert.equal(result.comparison.exportSubtreeMatches, true); assert.equal(result.productionConfirmation, false);
+ assert.equal(result.runtimeConfirmationVerified, false); assert.equal(result.grantsCompletionAuthority, false);
+ assert.equal(Object.isFrozen(result.binding), true); assert.equal(Object.isFrozen(result.observation.representations), true);
+ assert.equal(JSON.stringify(result).includes('DO_NOT_RETAIN_RESPONSE_BODY'), false);
+ const issuer = load('src/lib/tesla-tariff/confirmed-smart-receipt-issuer.ts');
+ for (const candidate of [result, result.attemptId, structuredClone(result), h.producer])
+  assert.equal(issuer.issueConfirmedSmartReceipt(candidate, h.x.initial, privateApplyReport(h.x)).code, 'JOURNAL_COMPLETION_NOT_BOUND');
+ assert.equal((await journals.readOfflineReconciledExperiment(h.x.config)).status, 'blocked');
+ assert.equal(await io.readFile(h.marker, 'utf8'), h.markerBytes);
+ await assert.rejects(h.producer.run(), /ATTEMPT_NOT_LIVE/);
+ const other = await attemptProducerFixture(t); const next = await other.producer.run();
+ assert.notEqual(result.attemptId, next.attemptId);
+});
+test('private attempt producer disabled production path invokes no transport and external evidence never supplies authority', async t => {
+ const h = await privateContinuationFixture(t);
+ await assert.rejects(h.createAttempt(), /ATTEMPT_INTENT_INVALID/);
+ await h.handle.recordApplyIntent();
+ const disabled = await h.createAttempt(); const result = await disabled.run();
+ assert.equal(result.outcome, 'not-attempted'); assert.equal(result.attemptId, null);
+ assert.equal(result.provenance, 'disabled-production'); assert.equal(result.productionConfirmation, false);
+ const fake = await h.createAttempt(); await assert.rejects(fake.run({ authenticated: true, attemptId: 'forged', apiWrite: { status: 'accepted', httpStatus: 200 } }), /ATTEMPT_EXTERNAL_EVIDENCE_REJECTED/);
+ await assert.rejects(fake.run(), /ATTEMPT_NOT_LIVE/); assert.equal(h.calls.posts + h.calls.gets, 0);
+ assert.equal(/export\s+(?:async\s+)?function\s+createPrivateAttemptProducer/.test(fs.readFileSync('src/lib/tesla-tariff/supervised-local.ts', 'utf8')), false);
+});
+test('private attempt producer does not confirm response-only or readback-only and keeps ambiguous attempts unknown', async t => {
+ for (const [fault, expected] of [['missing', 'accepted-readback-unverified'], ['timeout', 'write-outcome-unknown'],
+  ['ambiguous', 'write-outcome-unknown'], ['rejected', 'write-rejected'], ['stale', 'accepted-readback-unverified'],
+  ['future', 'accepted-readback-unverified'], ['wrong-site', 'accepted-readback-unverified'],
+  ['transformed', 'accepted-readback-unverified'], ['simulation-source', 'accepted-readback-unverified'], ['clock-failure', 'accepted-readback-unverified']]) {
+  const h = await attemptProducerFixture(t, fault), result = await h.producer.run();
+  assert.equal(result.outcome, expected, fault); assert.equal(result.productionConfirmation, false);
+  assert.deepEqual(h.calls, ['post', 'readback']); await assert.rejects(h.producer.run(), /ATTEMPT_NOT_LIVE/);
+ }
+});
+test('private attempt producer rejects duplicate/concurrent invocation and copied identities; captures adapter methods once', async t => {
+ const h = await attemptProducerFixture(t), second = await h.createAttempt(h.adapter);
+ h.adapter.post = async () => { throw Error('SUBSTITUTED_TRANSPORT'); };
+ await assert.rejects(({ ...h.producer }).run(), /ATTEMPT_NOT_LIVE/);
+ const results = await Promise.allSettled([h.producer.run(), h.producer.run(), second.run()]);
+ assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
+ assert.equal(results[0].value.outcome, 'accepted-exact-readback'); assert.deepEqual(h.calls, ['post', 'readback']);
+ assert.equal(typeof JSON.parse(JSON.stringify(results[0].value)).run, 'undefined');
+});
+test('private attempt producer requires unchanged bound durable intent before invoking any transport', async t => {
+ for (const fault of ['missing-intent', 'changed-intent', 'ownership-substitution', 'changed-marker', 'expired']) {
+  const h = await attemptProducerFixture(t);
+  if (fault === 'missing-intent') await io.writeFile(h.file, JSON.stringify(h.x.initial) + '\n');
+  if (fault === 'changed-intent') await io.appendFile(h.file, '{');
+  if (fault === 'ownership-substitution') {
+   const rows = (await io.readFile(h.file, 'utf8')).trim().split('\n').map(JSON.parse); rows[0].preparedContext.ownership.energySiteId = '999';
+   await io.writeFile(h.file, rows.map(JSON.stringify).join('\n') + '\n');
+  }
+  if (fault === 'changed-marker') await io.appendFile(h.marker, '\n');
+  if (fault === 'expired') h.x.ports.now = () => '2026-10-27T12:01:01Z';
+  await assert.rejects(h.producer.run()); assert.deepEqual(h.calls, []);
+  await assert.rejects(h.producer.run(), /ATTEMPT_NOT_LIVE/);
+ }
+});
+
+test('private attempt producer cannot invoke transport after intent durability uncertainty', async t => {
+ const h = await privateContinuationFixture(t, 'attempt-sync-failure'); await h.handle.recordApplyIntent();
+ let calls = 0;
+ const producer = await h.createAttempt({ post: async () => { calls++; throw Error('FORBIDDEN'); },
+  readBack: async () => { calls++; throw Error('FORBIDDEN'); } });
+ await assert.rejects(producer.run(), /ATTEMPT_SYNC_FAILURE/); assert.equal(calls, 0);
+ await assert.rejects(producer.run(), /ATTEMPT_NOT_LIVE/);
+ assert.equal(await io.readFile(h.marker, 'utf8'), h.markerBytes);
 });
