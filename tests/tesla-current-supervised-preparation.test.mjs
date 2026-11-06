@@ -102,7 +102,7 @@ test('interactive dry-run uses validated acquisition and never invokes a write t
   };
   class FixedDate extends Date{constructor(...a){super(...(a.length?a:[now]));}}
   vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/lib/tesla-tariff/supervised-local.ts','utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,
-   {exports,Date:FixedDate,AbortSignal,process:{cwd:()=>'/offline',env:{},stdin:{isTTY:false},stdout:{isTTY:false},stderr:{isTTY:false}},console:{log:v=>calls.output.push(v)},
+   {exports,structuredClone,Date:FixedDate,AbortSignal,process:{cwd:()=>'/offline',env:{},stdin:{isTTY:false},stdout:{isTTY:false},stderr:{isTTY:false}},console:{log:v=>calls.output.push(v)},
     fetch:async(_url,options)=>{assert.equal(options.method,'GET');calls.get++;return {ok:true,json:async()=>({response:{energy_site_id:'12345',installation_time_zone:'Europe/London',tariff_content_v2:f.capture.before.representations.v2,tariff_content:f.capture.before.representations.legacy}})};},
     require:n=>{assert.ok(n in dependencies,n);return dependencies[n];}});
   const run=()=>exports.runLocalExperiment(['--site','12345','--vehicle','fixture-ev','--dispatch-start',f.selection.dispatchStart]);
@@ -250,10 +250,20 @@ async function reconciledCliHarness(t,fault){
  await io.mkdir(directory,{recursive:true,mode:0o700});
  const historical=path.join(directory,'site-12345.jsonl');await io.writeFile(historical,x.priorBytes);
  if(fault==='conflict')await io.writeFile(path.join(directory,'site-12345-attempt.active'),'already-pending');
- const calls={gets:0,posts:0,acquisitions:0,questions:0,output:[]};let uuid=0,lastReconciliation='';
+ const calls={gets:0,posts:0,acquisitions:0,questions:0,output:[]};let uuid=0,lastReconciliation='',continuationAppends=0;
  const blocked=()=>{throw Error('UNEXPECTED_EXECUTION');};
  const dependencies={
-  'node:fs/promises':{...io,readFile:async(file,...args)=>file===path.join(cwd,'.tesla-tokens.json')?JSON.stringify({access_token:'offline-only'}):io.readFile(file,...args)},
+  'node:fs/promises':{...io,open:async(file,flags,...args)=>{
+   const handle=await io.open(file,flags,...args);
+   if(flags==='a'&&['continuation-io-failure','continuation-result-io-failure','continuation-slow-sync'].includes(fault)){
+    const number=++continuationAppends;
+    return new Proxy(handle,{get(target,k){if(k==='sync')return async()=>{
+     if(fault==='continuation-io-failure'||fault==='continuation-result-io-failure'&&number===2)throw Error('SIMULATED_SYNC_FAILURE');
+     await target.sync();if(fault==='continuation-slow-sync')x.ports.now=()=> '2026-10-27T12:01:01Z';
+    };const v=target[k];return typeof v==='function'?v.bind(target):v;}});
+   }
+   return handle;
+  },readFile:async(file,...args)=>file===path.join(cwd,'.tesla-tokens.json')?JSON.stringify({access_token:'offline-only'}):io.readFile(file,...args)},
   'node:path':path,'node:crypto':{...crypto,randomUUID:()=>`fixture-identity-${++uuid}`},
   'node:readline/promises':{createInterface:()=>({close(){},async question(message){calls.questions++;
    if(message==='Type AUTOMATIC ROLLBACK IS UNPROVEN: ')return 'AUTOMATIC ROLLBACK IS UNPROVEN';
@@ -273,8 +283,9 @@ async function reconciledCliHarness(t,fault){
  };
  class FixedDate extends Date{constructor(...a){super(...(a.length?a:[now]));}}
  const exports={};
- vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/lib/tesla-tariff/supervised-local.ts','utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,
- {exports,Date:FixedDate,AbortSignal,process:{cwd:()=>cwd,env:{},stdin:{isTTY:fault!=='noninteractive'},stdout:{isTTY:true},stderr:{isTTY:true}},
+ // Test-realm-only instrumentation; no application export or runtime switch.
+ vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/lib/tesla-tariff/supervised-local.ts','utf8')+'\nexport { createReconciledApplyContinuation as testPrivateContinuation };',{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,
+ {exports,structuredClone,Date:FixedDate,AbortSignal,process:{cwd:()=>cwd,env:{},stdin:{isTTY:fault!=='noninteractive'},stdout:{isTTY:true},stderr:{isTTY:true}},
  console:{log:value=>calls.output.push(value)},fetch:async(_url,options)=>{
   if(options.method!=='GET'){calls.posts++;throw Error('POST_FORBIDDEN');}calls.gets++;
   if(fault==='interrupted'&&calls.gets===4)throw Error('INTERRUPTED');
@@ -283,6 +294,7 @@ async function reconciledCliHarness(t,fault){
   return{ok:true,json:async()=>({response:{energy_site_id:'12345',installation_time_zone:'Europe/London',tariff_content_v2:v,tariff_content:legacy(v)}})};
  },require:n=>{assert.ok(n in dependencies,n);return dependencies[n];}});
  return {x,calls,config:{mode:'offline',directory,durableRoot:root,site:'12345'},historical,
+  createPrivate:()=>exports.testPrivateContinuation(x.initial,x.config,x.ports),
   run:(extra=[])=>exports.runLocalExperiment(['--site','12345','--vehicle','fixture-ev','--dispatch-start',x.f.selection.dispatchStart,'--prepare-reconciled','--experiment-id','cli-independent',...extra])};
 }
 test('closed CLI connects acquisition, exact review, separate approvals, durable claim and supervised dry-run only',async t=>{
@@ -574,5 +586,121 @@ test('mocked restore journal intent classification and terminal failures retain 
   const r = await mockedReconciledApply(t, 'valid', scenario);
   assert.equal(r.results[0].status, 'rejected', scenario); assert.equal(r.writes, scenario === 'intent-failure' ? 1 : 2);
   assert.equal(r.events.includes('simulation-complete'), false);
+ }
+});
+
+async function privateContinuationFixture(t, fault) {
+ const h = await reconciledCliHarness(t, fault), x = h.x;
+ await journals.admitOfflineReconciledExperiment(x.config, 'private-journal-continuation', x.initial, x.ports);
+ const marker = path.join(x.config.directory, 'site-12345-attempt.active');
+ const markerBytes = await io.readFile(marker, 'utf8');
+ const file = path.join(x.config.directory, `site-12345-attempt-${x.initial.mutationId}.jsonl`);
+ const handle = await h.createPrivate();
+ return { ...h, handle, marker, markerBytes, file };
+}
+function privateApplyReport(x, status = 'accepted') {
+ const review = x.initial.review, observed = load('src/lib/tesla-tariff/observed-tariff.ts');
+ const intended = observed.simulatedTariffObservation(review.before, review.proposal.bound.representation);
+ const v = structuredClone(review.proposal.bound.representation);
+ const observation = captureObservedTariff({ installation_time_zone: 'Europe/London', tariff_content_v2: v, tariff_content: legacy(v) },
+  '12345', '2026-10-27T12:00:01Z');
+ const apiWrite = { status, httpStatus: status === 'accepted' ? 200 : null };
+ const comparison = load('src/lib/tesla-tariff/restoration-review.ts').compareObservedTariffReadBack({ intended, readBack: observation,
+  after: now, dates: [review.date] });
+ return linked.createLinkedClassifiedRecord(x.initial, { phase: 'classified', attemptedAt: now, completedAt: '2026-10-27T12:00:02Z',
+  exception: x.initial.exception, apiWrite, apiTariffReadBack: { observation, comparison },
+  classification: api.classifyExperimentResult(apiWrite, intended, observation, comparison), laterTeslaAppObservation: null,
+  laterPowerwallOpticasterObservation: null, rollbackProven: false, productionWriteReady: false, automaticRestoreAttempted: false });
+}
+test('private production continuation records intent and unverified classification on the original claim without execution authority', async t => {
+ const h = await privateContinuationFixture(t);
+ assert.deepEqual(Object.keys(h.handle).sort(), ['recordApplyClassification', 'recordApplyIntent']);
+ await h.handle.recordApplyIntent();
+ let rows = (await io.readFile(h.file, 'utf8')).trim().split('\n').map(JSON.parse);
+ assert.equal(rows.length, 2); assert.equal(rows[1].phase, 'apply-intent');
+ h.x.ports.now = () => '2026-10-27T12:00:02Z';
+ const report = privateApplyReport(h.x);
+ await h.handle.recordApplyClassification(report);
+ rows = (await io.readFile(h.file, 'utf8')).trim().split('\n').map(JSON.parse);
+ assert.equal(journals.validReconciledApplyRecords(h.x.initial, hash(h.markerBytes), rows.slice(1)), true);
+ assert.equal(rows[2].executionProvenance, 'unverified-report'); assert.equal(rows[2].runtimeConfirmationVerified, false);
+ assert.equal((await journals.readOfflineReconciledExperiment(h.x.config)).status, 'blocked');
+ assert.equal(await io.readFile(h.marker, 'utf8'), h.markerBytes);
+ assert.equal(await io.readFile(h.x.root, 'utf8'), h.x.priorBytes);
+ assert.equal(h.calls.posts + h.calls.gets, 0);
+ await assert.rejects(h.handle.recordApplyIntent(), /CONTINUATION_NOT_LIVE/);
+ await assert.rejects(h.handle.recordApplyClassification(report), /CONTINUATION_NOT_LIVE/);
+ const receipt = load('src/lib/tesla-tariff/confirmed-smart-receipt-issuer.ts').issueConfirmedSmartReceipt(h.handle, h.x.initial, report);
+ assert.equal(receipt.code, 'JOURNAL_COMPLETION_NOT_BOUND');
+ await assert.rejects(h.createPrivate(), /CONTINUATION_ALREADY_CREATED/);
+});
+test('private production continuation rejects copied handles and concurrent intent/classification replay', async t => {
+ const h = await privateContinuationFixture(t);
+ await assert.rejects(h.createPrivate(), /CONTINUATION_ALREADY_CREATED/);
+ await assert.rejects(({ ...h.handle }).recordApplyIntent(), /CONTINUATION_NOT_LIVE/);
+ const pending = await Promise.allSettled([h.handle.recordApplyIntent(), h.handle.recordApplyIntent()]);
+ assert.equal(pending.filter(r => r.status === 'fulfilled').length, 1);
+ h.x.ports.now = () => '2026-10-27T12:00:02Z';
+ const reports = await Promise.allSettled([h.handle.recordApplyClassification(privateApplyReport(h.x, 'unknown')),
+  h.handle.recordApplyClassification(privateApplyReport(h.x, 'unknown'))]);
+ assert.equal(reports.filter(r => r.status === 'fulfilled').length, 1);
+ const rows = (await io.readFile(h.file, 'utf8')).trim().split('\n').map(JSON.parse);
+ assert.equal(rows[2].classified.classification, 'write-outcome-unknown');
+ assert.equal((await journals.readOfflineReconciledExperiment(h.x.config)).status, 'blocked');
+});
+test('private production continuation fails closed on stale or changed Tesla Kraken ownership and approval evidence', async t => {
+ for (const fault of ['stale', 'baseline', 'site', 'pricing', 'ownership', 'approval']) {
+  const h = await privateContinuationFixture(t);
+  if (fault === 'stale') h.x.ports.now = () => '2026-10-27T12:01:01Z';
+  if (fault === 'baseline') h.x.f.capture.before.representations.legacy.sell_tariff.name = 'changed';
+  if (fault === 'site') h.x.f.capture.before.source.energySiteId = '54321';
+  if (fault === 'pricing') h.x.f.capture.kraken.importTariff.version.scheduledChargingImport.amount = .03;
+  if (fault === 'ownership') h.x.ports.readOwnership = async () => ({ status: 'invalid' });
+  if (fault === 'approval') { const m = JSON.parse(h.markerBytes); m.approval.approvalId = 'replacement';
+   const { checksum: _checksum, ...body } = m; void _checksum; await io.writeFile(h.marker, JSON.stringify({ ...body, checksum: hash(body) }) + '\n'); }
+  await assert.rejects(h.handle.recordApplyIntent(), undefined, fault);
+  await assert.rejects(h.handle.recordApplyIntent(), /CONTINUATION_NOT_LIVE/);
+  assert.equal((await io.readFile(h.file, 'utf8')).trim().split('\n').length, 1);
+  assert.equal((await journals.repeatAttemptEligibility(h.x.config.directory, '12345', { status: 'missing' })).code, 'ATTEMPT_IN_PROGRESS');
+ }
+});
+test('private production continuation retains the claim after durable-write uncertainty and rejects invalid ordering', async t => {
+ const h = await privateContinuationFixture(t, 'continuation-io-failure');
+ await assert.rejects(h.handle.recordApplyClassification(privateApplyReport(h.x)), /CONTINUATION_NOT_LIVE/);
+ await assert.rejects(h.handle.recordApplyIntent(), /SIMULATED_SYNC_FAILURE/);
+ await assert.rejects(h.handle.recordApplyIntent(), /CONTINUATION_NOT_LIVE/);
+ await assert.rejects(h.handle.recordApplyClassification(privateApplyReport(h.x)), /CONTINUATION_NOT_LIVE/);
+ assert.equal((await journals.readOfflineReconciledExperiment(h.x.config)).status, 'blocked');
+ assert.equal(await io.readFile(h.marker, 'utf8'), h.markerBytes);
+});
+test('pure lifecycle validation rejects rehashed substitutions and never promotes documentary confirmation', async t => {
+ const h = await privateContinuationFixture(t); await h.handle.recordApplyIntent();
+ h.x.ports.now = () => '2026-10-27T12:00:02Z';
+ await h.handle.recordApplyClassification(privateApplyReport(h.x));
+ const rows = (await io.readFile(h.file, 'utf8')).trim().split('\n').map(JSON.parse).slice(1);
+ for (const mutate of [r => { r[0].site = '54321'; }, r => { r[0].admissionKey = hash('other'); },
+  r => { r[1].intentRecordId = hash('other'); }, r => { r[1].runtimeConfirmationVerified = true; },
+  r => { r[1].classified.classification = 'write-outcome-unknown'; }]) {
+  const changed = structuredClone(rows); mutate(changed);
+  for (const r of changed) { const { recordId: _recordId, ...body } = r; void _recordId; r.recordId = hash(body); }
+  assert.equal(journals.validReconciledApplyRecords(h.x.initial, hash(h.markerBytes), changed), false);
+ }
+ assert.equal(journals.validReconciledApplyRecords(h.x.initial, hash(h.markerBytes), [...rows, rows[1]]), false);
+ assert.equal(/export\s+(?:async\s+)?function\s+createReconciledApplyContinuation/.test(fs.readFileSync('src/lib/tesla-tariff/supervised-local.ts', 'utf8')), false);
+});
+
+test('private production continuation cannot advance after slow intent sync or uncertain classification durability', async t => {
+ for (const fault of ['continuation-slow-sync', 'continuation-result-io-failure']) {
+  const h = await privateContinuationFixture(t, fault);
+  if (fault === 'continuation-slow-sync') {
+   await assert.rejects(h.handle.recordApplyIntent(), /CONTINUATION_EVIDENCE_EXPIRED/);
+  } else {
+   await h.handle.recordApplyIntent(); h.x.ports.now = () => '2026-10-27T12:00:02Z';
+   await assert.rejects(h.handle.recordApplyClassification(privateApplyReport(h.x)), /SIMULATED_SYNC_FAILURE/);
+  }
+  await assert.rejects(h.handle.recordApplyIntent(), /CONTINUATION_NOT_LIVE/);
+  await assert.rejects(h.handle.recordApplyClassification(privateApplyReport(h.x)), /CONTINUATION_NOT_LIVE/);
+  assert.equal((await journals.readOfflineReconciledExperiment(h.x.config)).status, 'blocked');
+  assert.equal(await io.readFile(h.marker, 'utf8'), h.markerBytes);
  }
 });

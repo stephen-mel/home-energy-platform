@@ -151,3 +151,35 @@ rollback authority, ownership retirement or safe claim release. Production recov
 continues rejecting these extra simulation records, with no authority hydration.
 No production executor, journal reader, capability registry or persistence path
 has been changed. All readbacks and approvals here are fixed offline fixtures.
+
+## Disabled production-code continuation foundation
+
+`supervised-local.ts` now privately constructs a journal-only continuation after
+successful closed interactive reconciled admission. Its factory is unexported;
+there is no CLI argument, public provider registration, recovery hydration or
+transport hook. The preparation-only command discards the continuation on return.
+It cannot invoke the existing Fleet API write closure. Tests expose the private
+function solely by VM source instrumentation, following the SQLite test pattern.
+
+The private handle can record `apply-intent`, then `apply-classification` in the
+existing distinct admitted journal. Intent rechecks the exact original dual
+observation, payload, complete pricing identity, schedule, ownership, independent
+approvals, prior physical history and freshness. It flushes intent before allowing
+classification; a slow/uncertain flush consumes the handle. Concurrent, copied or
+replayed handle calls cannot advance. The active marker is never modified.
+
+The versioned `disabled-supervised-lifecycle` records use
+`validReconciledApplyRecords()` and the existing linked classification validator.
+Every classification is explicitly an `unverified-report`, even if its reported
+HTTP outcome and readback match. This increment has no trusted execution report
+producer. Neither these documents nor the private journal handle can supply the
+existing runtime journal-completion capability or issue a production receipt.
+Recovery rejects the extra records and keeps the claim blocking.
+
+Restoration approval/intent, restoration classification and terminal eligibility
+are deliberately deferred. They need a trusted execution/completion boundary,
+separately approved restore binding, authenticated current-state recheck, exact
+original dual readback, and independently confirmed ownership disposition. The
+existing simulation demonstrates those phases but cannot authenticate them. No
+restoration, claim release, ownership persistence or safety-policy change is
+implemented here. `CURRENT_EVIDENCE_PREPARATION_ONLY` remains mandatory.

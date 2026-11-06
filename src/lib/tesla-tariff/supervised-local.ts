@@ -1,7 +1,7 @@
 /** Local interactive adapter ONLY. Never import from a route, page, sync planner,
  * scheduled task or test transport. No token refresh, new scopes or other commands.
  */
-import { readFile, mkdir, writeFile } from "node:fs/promises";
+import { readFile, mkdir, writeFile, open } from "node:fs/promises";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { createInterface } from "node:readline/promises";
@@ -14,11 +14,11 @@ import * as journalRecords from "./linked-experiment-records";
 import { prepareMutationContext, type PreparedMutationContext } from "./prepared-mutation-context";
 import { ownershipStore } from "./ownership-store";
 import { persistConfirmedSmart } from "./ownership-sqlite";
-import { admitOfflineReconciledExperiment, type OfflineExperimentBinding } from "./repeat-attempt-journal";
+import { admitOfflineReconciledExperiment, readOfflineReconciledExperiment, validReconciledApplyRecords, type ReconciledApplyIntent, type ReconciledApplyClassification, type OfflineExperimentBinding } from "./repeat-attempt-journal";
 import { ownershipFingerprint } from "./ownership-transition";
 import { approveTariffProposal } from "./proposal-approval";
 import { claimExperimentJournal } from "./supervised-journal";
-import { runSupervisedExperiment, interpretWriteResponse, StaleApprovalOrEvidenceError, validateCurrentSupervisedCapture, type ExperimentPorts } from "./supervised-experiment";
+import { runSupervisedExperiment, interpretWriteResponse, StaleApprovalOrEvidenceError, validateCurrentSupervisedCapture, prepareSupervisedExperiment, CAPTURE_TTL_MS, EVIDENCE_TTL_MS, APPROVAL_TTL_MS, MIN_WRITE_REMAINING_MS, type ExperimentPorts } from "./supervised-experiment";
 
 const ROOT = "https://fleet-api.prd.eu.vn.cloud.tesla.com/api/1/energy_sites/";
 // Only these fixed identifiers may cross the CLI boundary. Never emit an
@@ -64,6 +64,103 @@ export function safeExperimentFreshnessDetails(error: unknown): string[] {
 
 async function readBoundary<T>(code: string, read: () => Promise<T>): Promise<T> {
     try { return await read(); } catch { throw new Error(code); }
+}
+
+// Process-local single issuance for a claimed journal; no hydration/reset API.
+// These slots confer journal access only, never execution or receipt authority.
+const continuationClaims = new Set<string>();
+const continuationClaimed = continuationClaims.has.bind(continuationClaims);
+const rememberContinuation = continuationClaims.add.bind(continuationClaims);
+
+/** PRIVATE journal-only continuation. The closed CLI is its only production
+ * caller. No transport, receipt, ownership writer or recovery constructor exists.
+ * Its lexical identity is lost when preparation returns; persisted documents
+ * cannot resume it. Reports remain explicitly unverified even when exact. */
+async function createReconciledApplyContinuation(initialRecord: journalRecords.LinkedInitialRecord,
+    config: Parameters<typeof readOfflineReconciledExperiment>[0],
+    ports: Pick<ExperimentPorts, "now" | "capture"> & { readOwnership: ReturnType<typeof ownershipStore>["read"] }) {
+    const claimKey = path.resolve(config.directory, `site-${config.site}-attempt-${initialRecord.mutationId}.jsonl`);
+    if (continuationClaimed(claimKey)) throw Error("CONTINUATION_ALREADY_CREATED");
+    rememberContinuation(claimKey); // reserve synchronously; uncertainty is never retried
+    const initial = structuredClone(initialRecord);
+    const recovered = await readOfflineReconciledExperiment(config);
+    if (recovered.status !== "consistent-offline-admission") throw Error("CONTINUATION_ADMISSION_INVALID");
+    const markerFile = path.join(config.directory, `site-${config.site}-attempt.active`);
+    const file = path.join(config.directory, `site-${config.site}-attempt-${initial.mutationId}.jsonl`);
+    const markerText = await readFile(markerFile, "utf8"), marker = JSON.parse(markerText);
+    let expectedText = JSON.stringify(initial) + "\n";
+    if (await readFile(file, "utf8") !== expectedText || marker.binding.initialRecordId !== initial.initialRecordId
+        || marker.binding.mutationId !== initial.mutationId || marker.binding.site !== config.site)
+        throw Error("CONTINUATION_BINDING_INVALID");
+    const records: (ReconciledApplyIntent | ReconciledApplyClassification)[] = [];
+    let state: "ready" | "intent-pending" | "intent" | "result-pending" | "consumed" = "ready";
+    const unchanged = async () => {
+        if (await readFile(markerFile, "utf8") !== markerText || await readFile(file, "utf8") !== expectedText)
+            throw Error("CONTINUATION_JOURNAL_CHANGED");
+        for (const prior of marker.prior) {
+            if (path.basename(prior.name) !== prior.name || ownershipFingerprint(await readFile(path.join(config.directory, prior.name), "utf8")) !== prior.digest)
+                throw Error("CONTINUATION_HISTORY_CHANGED");
+        }
+    };
+    const fresh = (at: string, now: string, ttl: number) => Number.isFinite(Date.parse(at)) && Number.isFinite(Date.parse(now))
+        && Date.parse(at) <= Date.parse(now) && Date.parse(now) - Date.parse(at) <= ttl;
+    const deadlines = (capture: Awaited<ReturnType<ExperimentPorts["capture"]>>, at: string) => {
+        if (!fresh(initial.exception.approvedAt, at, APPROVAL_TTL_MS)
+            || !fresh(initial.review.before.source.observedAt, at, CAPTURE_TTL_MS)
+            || !fresh(capture.before.source.observedAt, at, CAPTURE_TTL_MS)
+            || !fresh(capture.kraken.lastSuccessfulUpdate!, at, EVIDENCE_TTL_MS)
+            || !fresh(capture.kraken.importTariff!.observedAt, at, EVIDENCE_TTL_MS)
+            || ![marker.approval, marker.reconciliation].every(a => fresh(a.approvedAt, at, APPROVAL_TTL_MS))
+            || Date.parse(at) + MIN_WRITE_REMAINING_MS >= Date.parse(initial.review.proposal.bound.expiresAt))
+            throw Error("CONTINUATION_EVIDENCE_EXPIRED");
+    };
+    const append = async (record: ReconciledApplyIntent | ReconciledApplyClassification) => {
+        await unchanged();
+        const next = [...records, record];
+        if (!validReconciledApplyRecords(initial, ownershipFingerprint(markerText), next)) throw Error("CONTINUATION_RECORD_INVALID");
+        const handle = await open(file, "a");
+        try { await handle.writeFile(JSON.stringify(record) + "\n", "utf8"); await handle.sync(); }
+        finally { await handle.close(); }
+        expectedText += JSON.stringify(record) + "\n"; records.push(record);
+    };
+    const continuation = Object.freeze({
+        async recordApplyIntent() {
+            if (this !== continuation || state !== "ready") throw Error("CONTINUATION_NOT_LIVE");
+            state = "intent-pending"; // failures/concurrent invocations cannot retry
+            const capture = validateCurrentSupervisedCapture(currentSite, await ports.capture(), ports.now());
+            const ownership = await ports.readOwnership(config.site), at = ports.now();
+            const before = initial.preparedContext.ownership;
+            const expectedOwnership = before.status === "missing" ? { status: "missing" } : { status: "available", snapshot: before.snapshot };
+            const review = prepareSupervisedExperiment(currentSite, initial.review.binding.selection, capture, at);
+            const pricingKey = ownershipFingerprint({ account: capture.kraken.importTariff!.accountRef,
+                agreement: capture.kraken.importTariff!.agreement, version: capture.kraken.importTariff!.version });
+            if (pricingKey !== marker.binding.pricingKey || journalKey(ownership) !== journalKey(expectedOwnership) || review.payloadJson !== initial.review.payloadJson
+                || journalKey(capture.before.tariff) !== journalKey(initial.review.before.tariff)
+                || journalKey(capture.before.representations ?? null) !== journalKey(initial.review.before.representations ?? null)
+                || review.binding.smartEvidenceKey !== initial.review.binding.smartEvidenceKey
+                || review.proposal.bound.economicKey !== initial.review.proposal.bound.economicKey)
+                throw Error("CONTINUATION_EVIDENCE_CHANGED");
+            await unchanged();
+            const attemptedAt = ports.now(); deadlines(capture, attemptedAt);
+            const body = { version: 1 as const, mode: "disabled-supervised-lifecycle" as const, phase: "apply-intent" as const,
+                admissionKey: ownershipFingerprint(markerText), initialRecordId: initial.initialRecordId, mutationId: initial.mutationId,
+                site: config.site, attemptedAt, writeReady: false as const, runtimeConfirmationVerified: false as const };
+            await append({ ...body, recordId: ownershipFingerprint(body) });
+            // A slow durable append never grants a late execution opportunity.
+            deadlines(capture, ports.now()); state = "intent";
+        },
+        async recordApplyClassification(report: journalRecords.LinkedClassifiedRecord) {
+            if (this !== continuation || state !== "intent") throw Error("CONTINUATION_NOT_LIVE");
+            state = "result-pending";
+            if (!Number.isFinite(Date.parse(ports.now())) || Date.parse(report.completedAt) > Date.parse(ports.now()))
+                throw Error("CONTINUATION_REPORT_TIME_INVALID");
+            const body = { version: 1 as const, mode: "disabled-supervised-lifecycle" as const, phase: "apply-classification" as const,
+                intentRecordId: records[0].recordId, classified: structuredClone(report), executionProvenance: "unverified-report" as const,
+                writeReady: false as const, runtimeConfirmationVerified: false as const };
+            await append({ ...body, recordId: ownershipFingerprint(body) }); state = "consumed";
+        },
+    });
+    return continuation;
 }
 
 export async function runLocalExperiment(args: string[]) {
@@ -205,6 +302,11 @@ export async function runLocalExperiment(args: string[]) {
                 disposition: "prior-conflict-reconciled-for-new-experiment", historicalApiRestoration: "not-proved" }),
             approveExperiment: binding => separateApproval("PREPARE", binding),
         });
+        // Establish only a private journal continuation. It is intentionally not
+        // returned/serialized or connected to write(), and expires on this return.
+        await createReconciledApplyContinuation(initial, { mode: "offline", directory,
+            durableRoot: path.join(process.cwd(), ".cache/home-energy-platform"), site: selection.energySiteId },
+        { now, capture, readOwnership: site => ownershipStore().read(site) });
         console.log(JSON.stringify({ status: "reconciled-preparation-recorded", admission,
             blockers: [...new Set([...review.hardBlockers, ...review.restoration.blockers])],
             writeReady: false, executionReady: false, restorationProven: false }, null, 2));
