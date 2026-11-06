@@ -121,3 +121,33 @@ records as a resumable or completed admission. It fails closed, and all uncertai
 or interrupted outcomes retain the exclusive claim. Restoration, terminal claim
 completion, production continuation authority and recovery phase interpretation
 are still absent. Any future versioned reader must preserve these distinctions.
+
+### Mocked restoration and simulation completion
+
+The same private composition now optionally continues a confirmed exact simulated
+apply through separate restore approval, `simulated-restore-intent`,
+`simulated-restore-classified`, and `simulation-complete`. Each record is appended
+and synced to the existing operation journal. Restore intent precedes the second
+in-memory transport invocation; terminal simulation completion follows durable
+exact restoration evidence only. The active production claim is never changed.
+
+Restore approval has a distinct identity and binds the experiment/site, immutable
+original observation, confirmed apply result, fresh pre-restore observation,
+exact original V2 payload and admission marker. Private single-use identity and
+approval-object membership prevent document substitution. Original V2 and legacy
+encodings, including export and metadata, are compared independently; the current
+observation is never substituted for the immutable restoration target.
+
+This reuses `reviewObservedRestoration()`, strict Tesla observation validation,
+`compareObservedTariffReadBack()`, and existing result classification. Linked
+operation validation is reused for apply. Restore records remain explicitly
+simulated wrappers: no V1 apply receipt is fabricated for restoration. Interrupted
+intent/result/completion, unexpected external changes, failed approvals and
+non-exact or ambiguous outcomes cannot reach simulation completion. Matching GET
+fixtures never convert unknown execution into confirmed execution.
+
+Successful simulation does not prove production inverse mapping, API acceptance,
+rollback authority, ownership retirement or safe claim release. Production recovery
+continues rejecting these extra simulation records, with no authority hydration.
+No production executor, journal reader, capability registry or persistence path
+has been changed. All readbacks and approvals here are fixed offline fixtures.

@@ -328,7 +328,7 @@ test('offline admission, recovered record and approvals cannot replace the execu
 
 // Closed, TEST-ONLY continuation. No providers, documents, paths or capability
 // are accepted from a caller or exported. The only transport is local state.
-async function mockedReconciledApply(t, fault = 'valid') {
+async function mockedReconciledApply(t, fault = 'valid', restoreScenario = null) {
  const x = await admissionFixture(t), original = key(x.initial.review.before);
  const admission = await journals.admitOfflineReconciledExperiment(x.config, 'mocked-continuation', x.initial, x.ports);
  noRuntimeAuthority(admission);
@@ -398,7 +398,92 @@ async function mockedReconciledApply(t, fault = 'valid') {
   await append({ version: 1, mode: 'mocked-reconciled-apply', phase: 'simulated-apply-classified',
    intentKey: hash(intent), classified, runtimeConfirmationVerified: false, writeReady: false });
   events.push('durable-result');
-  return { classification, comparison };
+  if (!restoreScenario) return { classification, comparison };
+  if (classification !== 'submitted-representation-preserved' || comparison.outcome !== 'exact-observed-match')
+   throw Error('SIMULATED_APPLY_NOT_CONFIRMED');
+  const restoration = load('src/lib/tesla-tariff/restoration-review.ts');
+  const reviewed = restoration.reviewObservedRestoration({ before: review.before, temporaryProposal: review.proposal,
+   asOf: '2026-10-27T12:00:04Z', maxCaptureAgeMs: api.CAPTURE_TTL_MS });
+  if (!reviewed.structurallyComplete || !reviewed.boundToProposal) throw Error('RESTORE_BASELINE_INVALID');
+  const target = structuredClone(review.before);
+  assert.equal(key(reviewed.documentedEnvelopeCandidate.tou_settings.tariff_content_v2), key(target.tariff));
+  const preRestore = structuredClone(readBack);
+  preRestore.source.observedAt = '2026-10-27T12:00:04Z';
+  if (restoreScenario === 'external-change') preRestore.representations.legacy.name = 'Flatpeak changed';
+  const validateTesla = load('src/lib/tesla-tariff/smart-inspection.ts').validateTeslaInspectionEvidence;
+  if (!validateTesla(preRestore) || key(preRestore.tariff) !== key(readBack.tariff)
+   || key(preRestore.representations) !== key(readBack.representations)) throw Error('RESTORE_CURRENT_STATE_CHANGED');
+  const binding = { experimentId: admission.experimentId, mutationId: x.initial.mutationId, site: '12345',
+   initialRecordId: x.initial.initialRecordId, originalObservationKey: hash(target),
+   appliedResultKey: hash(classified), currentObservationKey: hash(preRestore),
+   payloadJson: JSON.stringify(reviewed.documentedEnvelopeCandidate), admissionKey: hash(markerBytes) };
+  // Independent fixture approval: never reuse either admission approval.
+  const approved = Object.freeze({ approvalId: 'separate-restore-approval', bindingKey: hash(binding),
+   approvedAt: restoreScenario === 'stale-approval' ? '2026-10-27T11:58:00Z' : '2026-10-27T12:00:05Z' });
+  let supplied = approved;
+  if (restoreScenario === 'missing-approval') supplied = null;
+  if (restoreScenario === 'substituted-approval') supplied = { ...approved, bindingKey: hash('other operation') };
+  if (restoreScenario === 'copied-approval') supplied = structuredClone(approved);
+  if (restoreScenario === 'replayed-approval') supplied = JSON.parse(markerBytes).approval;
+  const restoreLive = Object.freeze({}), restoreIdentities = new WeakMap([[restoreLive, { used: false }]]);
+  const restoreOnce = async token => {
+   const active = restoreIdentities.get(token);
+   if (!active || active.used) throw Error('RESTORE_NOT_LIVE');
+   active.used = true;
+   if (supplied !== approved || supplied.bindingKey !== hash(binding)
+    || Date.parse(supplied.approvedAt) < Date.parse(classified.completedAt)
+    || Date.parse(supplied.approvedAt) > Date.parse('2026-10-27T12:00:06Z')
+    || Date.parse('2026-10-27T12:00:06Z') - Date.parse(supplied.approvedAt) > api.APPROVAL_TTL_MS)
+    throw Error('RESTORE_APPROVAL_INVALID');
+   if (await io.readFile(markerFile, 'utf8') !== markerBytes) throw Error('RESTORE_CLAIM_CHANGED');
+   const rows = (await io.readFile(file, 'utf8')).trim().split('\n').map(JSON.parse);
+   if (key(rows.at(-1).classified) !== key(classified)) throw Error('RESTORE_APPLY_RECORD_CHANGED');
+   const restoreIntent = { version: 1, mode: 'mocked-reconciled-apply', phase: 'simulated-restore-intent',
+    binding, approval: supplied, attemptedAt: '2026-10-27T12:00:06Z', writeReady: false, runtimeConfirmationVerified: false };
+   if (restoreScenario === 'intent-failure') { await io.appendFile(file, '{'); throw Error('RESTORE_INTENT_INTERRUPTED'); }
+   await append(restoreIntent); events.push('durable-restore-intent');
+   // Fixed in-memory transport; no caller-selected provider or network function.
+   assert.equal(key(JSON.parse((await io.readFile(file, 'utf8')).trim().split('\n').at(-1))), key(restoreIntent));
+   events.push('simulated-restore-post'); writes++;
+   let restoreWrite;
+   try {
+    if (restoreScenario === 'timeout') throw Error('SIMULATED_RESTORE_TIMEOUT');
+    restoreWrite = api.interpretWriteResponse(restoreScenario === 'rejected' ? 400 : restoreScenario === 'ambiguous' ? 503 : 200,
+     { response: { result: restoreScenario !== 'rejected' } });
+   } catch { restoreWrite = { status: 'unknown', httpStatus: null }; }
+   const restoredV2 = structuredClone(target.representations.v2), restoredLegacy = structuredClone(target.representations.legacy);
+   if (restoreScenario === 'wrong-v2') restoredV2.name = 'Wrong restored metadata';
+   if (restoreScenario === 'wrong-legacy') restoredLegacy.name = 'Wrong legacy';
+   if (restoreScenario === 'wrong-export') { restoredV2.sell_tariff.name = 'Wrong export'; restoredLegacy.sell_tariff.name = 'Wrong export'; }
+   const restored = captureObservedTariff({ installation_time_zone: 'Europe/London', tariff_content_v2: restoredV2,
+    tariff_content: restoredLegacy }, '12345', '2026-10-27T12:00:07Z');
+   const restoreComparison = restoration.compareObservedTariffReadBack({ intended: target, readBack: restored,
+    after: restoreIntent.attemptedAt, dates: [review.date] });
+   const restoreClassification = api.classifyExperimentResult(restoreWrite, target, restored, restoreComparison);
+   const result = { version: 1, mode: 'mocked-reconciled-apply', phase: 'simulated-restore-classified',
+    intentKey: hash(restoreIntent), restoreWrite, observation: restored, comparison: restoreComparison,
+    classification: restoreClassification, completedAt: '2026-10-27T12:00:08Z', writeReady: false, runtimeConfirmationVerified: false };
+   if (restoreScenario === 'classification-failure') { await io.appendFile(file, '{'); throw Error('RESTORE_RESULT_INTERRUPTED'); }
+   await append(result); events.push('durable-restore-result');
+   if (restoreClassification !== 'submitted-representation-preserved' || restoreComparison.outcome !== 'exact-observed-match'
+    || !restoreComparison.exportSubtreeMatches || key(restored.representations) !== key(target.representations))
+    throw Error('RESTORE_NOT_CONFIRMED');
+   const persisted = JSON.parse((await io.readFile(file, 'utf8')).trim().split('\n').at(-1));
+   if (key(persisted) !== key(result)) throw Error('RESTORE_RESULT_NOT_DURABLE');
+   if (restoreScenario === 'completion-failure') { await io.appendFile(file, '{'); throw Error('SIMULATION_COMPLETION_INTERRUPTED'); }
+   await append({ version: 1, mode: 'mocked-reconciled-apply', phase: 'simulation-complete',
+    bindingKey: hash(binding), restoreResultKey: hash(result), originalObservationKey: hash(target),
+    writeReady: false, runtimeConfirmationVerified: false, productionClaimReleased: false });
+   events.push('simulation-complete');
+   return { classification, comparison, restored: true, restoreComparison };
+  };
+  const candidates = restoreScenario === 'concurrent' ? [restoreLive, restoreLive]
+   : [restoreScenario === 'restart' ? await journals.readOfflineReconciledExperiment(x.config) : restoreLive];
+  const restoredResults = await Promise.allSettled(candidates.map(restoreOnce));
+  await assert.rejects(restoreOnce(restoreScenario === 'restart' ? {} : restoreLive), /RESTORE_NOT_LIVE/);
+  if (restoreScenario === 'concurrent') assert.equal(restoredResults.filter(r => r.status === 'fulfilled').length, 1);
+  if (restoredResults[0].status === 'rejected') throw restoredResults[0].reason;
+  return restoredResults[0].value;
  };
  if (fault === 'approval') {
   const marker = JSON.parse(markerBytes); marker.approval.approvalId = 'substituted';
@@ -412,6 +497,10 @@ async function mockedReconciledApply(t, fault = 'valid') {
  assert.equal(await io.readFile(x.root, 'utf8'), x.priorBytes);
  const recovered = await journals.readOfflineReconciledExperiment(x.config);
  assert.ok(['blocked', 'consistent-offline-admission'].includes(recovered.status)); noRuntimeAuthority(recovered);
+ if (restoreScenario) {
+  assert.equal(recovered.status, 'blocked');
+  assert.equal(await io.readFile(markerFile, 'utf8'), markerBytes);
+ }
  assert.equal((await journals.repeatAttemptEligibility(x.config.directory, '12345', { status: 'missing' })).code, 'ATTEMPT_IN_PROGRESS');
  return { results, events, writes, original: x.initial.review.before, rows: await io.readFile(file, 'utf8') };
 }
@@ -444,5 +533,46 @@ test('mocked continuation consumes once under concurrency and retains interrupte
  for (const fault of ['intent-interruption', 'after-write', 'result-interruption']) {
   const r = await mockedReconciledApply(t, fault); assert.equal(r.results[0].status, 'rejected');
   assert.equal(r.writes, fault === 'intent-interruption' ? 0 : 1);
+ }
+});
+
+test('mocked restore completes exact original dual restoration after separate approval without releasing claim', async t => {
+ for (const scenario of ['valid', 'concurrent']) {
+  const r = await mockedReconciledApply(t, 'valid', scenario);
+  assert.equal(r.results[0].status, 'fulfilled'); assert.equal(r.results[0].value.restored, true);
+  assert.equal(r.writes, 2); assert.equal(r.results[0].value.restoreComparison.outcome, 'exact-observed-match');
+  assert.deepEqual(r.events, ['durable-intent', 'simulated-post', 'durable-result', 'durable-restore-intent',
+   'simulated-restore-post', 'durable-restore-result', 'simulation-complete']);
+  const rows = r.rows.trim().split('\n').map(JSON.parse);
+  assert.equal(rows.length, 6); assert.equal(rows.at(-1).productionClaimReleased, false);
+  assert.equal(key(rows[4].observation.representations), key(r.original.representations));
+ }
+});
+test('mocked restore rejects missing stale copied replayed or substituted approval, external changes and recovered identities', async t => {
+ for (const scenario of ['missing-approval', 'stale-approval', 'copied-approval', 'replayed-approval', 'substituted-approval', 'external-change', 'restart']) {
+  const r = await mockedReconciledApply(t, 'valid', scenario);
+  assert.equal(r.results[0].status, 'rejected', scenario); assert.equal(r.writes, 1, scenario);
+  assert.equal(r.events.includes('simulation-complete'), false);
+ }
+});
+test('mocked restore cannot follow rejected ambiguous interrupted or mismatched apply', async t => {
+ for (const fault of ['rejected', 'timeout', 'transformed', 'missing-readback', 'after-write']) {
+  const r = await mockedReconciledApply(t, fault, 'valid');
+  assert.equal(r.results[0].status, 'rejected'); assert.equal(r.writes, 1);
+  assert.equal(r.events.includes('durable-restore-intent'), false);
+ }
+});
+test('mocked restore rejects wrong dual/export readback and rejected timed-out or ambiguous restore without completion', async t => {
+ for (const scenario of ['wrong-v2', 'wrong-legacy', 'wrong-export', 'rejected', 'timeout', 'ambiguous']) {
+  const r = await mockedReconciledApply(t, 'valid', scenario);
+  assert.equal(r.results[0].status, 'rejected', scenario); assert.equal(r.writes, 2);
+  assert.equal(r.events.includes('durable-restore-result'), true); assert.equal(r.events.includes('simulation-complete'), false);
+ }
+});
+test('mocked restore journal intent classification and terminal failures retain blocking claim', async t => {
+ for (const scenario of ['intent-failure', 'classification-failure', 'completion-failure']) {
+  const r = await mockedReconciledApply(t, 'valid', scenario);
+  assert.equal(r.results[0].status, 'rejected', scenario); assert.equal(r.writes, scenario === 'intent-failure' ? 1 : 2);
+  assert.equal(r.events.includes('simulation-complete'), false);
  }
 });
