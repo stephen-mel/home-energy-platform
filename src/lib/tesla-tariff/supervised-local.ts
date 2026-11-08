@@ -14,7 +14,7 @@ import * as journalRecords from "./linked-experiment-records";
 import { prepareMutationContext, type PreparedMutationContext } from "./prepared-mutation-context";
 import { ownershipStore } from "./ownership-store";
 import { persistConfirmedSmart } from "./ownership-sqlite";
-import { admitOfflineReconciledExperiment, readOfflineReconciledExperiment, validReconciledApplyRecords, type ReconciledApplyIntent, type ReconciledApplyClassification, type OfflineExperimentBinding } from "./repeat-attempt-journal";
+import { admitOfflineReconciledExperiment, readOfflineReconciledExperiment, validReconciledApplyRecords, type ReconciledApplyIntent, type ReconciledApplyClassification, type ReconciledAttemptConsumption, type OfflineReconciliationPorts, type OfflineExperimentBinding } from "./repeat-attempt-journal";
 import { ownershipFingerprint } from "./ownership-transition";
 import { approveTariffProposal } from "./proposal-approval";
 import { compareObservedTariffReadBack } from "./restoration-review";
@@ -81,6 +81,7 @@ const rememberContinuation = continuationClaims.add.bind(continuationClaims);
 async function createReconciledApplyContinuation(initialRecord: journalRecords.LinkedInitialRecord,
     config: Parameters<typeof readOfflineReconciledExperiment>[0],
     ports: Pick<ExperimentPorts, "now" | "capture"> & { readOwnership: ReturnType<typeof ownershipStore>["read"] }) {
+    config = structuredClone(config);
     const claimKey = path.resolve(config.directory, `site-${config.site}-attempt-${initialRecord.mutationId}.jsonl`);
     if (continuationClaimed(claimKey)) throw Error("CONTINUATION_ALREADY_CREATED");
     rememberContinuation(claimKey); // reserve synchronously; uncertainty is never retried
@@ -94,11 +95,14 @@ async function createReconciledApplyContinuation(initialRecord: journalRecords.L
     if (await readFile(file, "utf8") !== expectedText || marker.binding.initialRecordId !== initial.initialRecordId
         || marker.binding.mutationId !== initial.mutationId || marker.binding.site !== config.site)
         throw Error("CONTINUATION_BINDING_INVALID");
-    const records: (ReconciledApplyIntent | ReconciledApplyClassification)[] = [];
-    let state: "ready" | "intent-pending" | "intent" | "result-pending" | "consumed" = "ready";
+    const records: (ReconciledApplyIntent | ReconciledAttemptConsumption | ReconciledApplyClassification)[] = [];
+    let state: "ready" | "intent-pending" | "intent" | "result-pending" | "attempt-pending" | "consumed" = "ready";
     const unchanged = async () => {
         if (await readFile(markerFile, "utf8") !== markerText || await readFile(file, "utf8") !== expectedText)
             throw Error("CONTINUATION_JOURNAL_CHANGED");
+        const consumed = records.find(r => r.phase === "attempt-consumed");
+        if (consumed && await readFile(file + ".execution", "utf8") !== JSON.stringify(consumed) + "\n")
+            throw Error("CONTINUATION_ATTEMPT_CHANGED");
         for (const prior of marker.prior) {
             if (path.basename(prior.name) !== prior.name || ownershipFingerprint(await readFile(path.join(config.directory, prior.name), "utf8")) !== prior.digest)
                 throw Error("CONTINUATION_HISTORY_CHANGED");
@@ -119,7 +123,7 @@ async function createReconciledApplyContinuation(initialRecord: journalRecords.L
     const append = async (record: ReconciledApplyIntent | ReconciledApplyClassification) => {
         await unchanged();
         const next = [...records, record];
-        if (!validReconciledApplyRecords(initial, ownershipFingerprint(markerText), next)) throw Error("CONTINUATION_RECORD_INVALID");
+        if (!validReconciledApplyRecords(initial, ownershipFingerprint(markerText), next, marker.binding.experimentId)) throw Error("CONTINUATION_RECORD_INVALID");
         const handle = await open(file, "a");
         try { await handle.writeFile(JSON.stringify(record) + "\n", "utf8"); await handle.sync(); }
         finally { await handle.close(); }
@@ -151,6 +155,34 @@ async function createReconciledApplyContinuation(initialRecord: journalRecords.L
             // A slow durable append never grants a late execution opportunity.
             deadlines(capture, ports.now()); state = "intent";
         },
+        async runSimulatedApply(adapter: SimulatedAttemptAdapter) {
+            if (this !== continuation || state !== "ready") throw Error("CONTINUATION_NOT_LIVE");
+            await continuation.recordApplyIntent();
+            // Recheck after the await; another method must not consume this phase.
+            if ((state as string) !== "intent") throw Error("CONTINUATION_NOT_LIVE");
+            state = "attempt-pending";
+            const producer = await createPrivateAttemptProducer(initial, config, () => ports.now(), adapter);
+            const result = await producer.run();
+            if (result.provenance !== "simulated-injected-transport" || !result.completedAt) throw Error("ATTEMPT_RESULT_INCOMPLETE");
+            const attemptText = await readFile(file, "utf8"), parts = attemptText.trimEnd().split("\n");
+            const attempt = JSON.parse(parts[2]) as ReconciledAttemptConsumption;
+            if (parts.length !== 3 || attemptText !== expectedText + JSON.stringify(attempt) + "\n"
+                || attempt.attemptId !== result.attemptId || attempt.recordId !== result.attemptRecordId
+                || !validReconciledApplyRecords(initial, ownershipFingerprint(markerText), [...records, attempt], marker.binding.experimentId))
+                throw Error("ATTEMPT_RESULT_BINDING_INVALID");
+            expectedText = attemptText; records.push(attempt);
+            const classified = journalRecords.createLinkedClassifiedRecord(initial, { phase: "classified", attemptedAt: result.attemptedAt,
+                completedAt: result.completedAt, exception: initial.exception, apiWrite: result.apiWrite,
+                apiTariffReadBack: { observation: result.observation, comparison: result.comparison }, classification: result.classification,
+                laterTeslaAppObservation: null, laterPowerwallOpticasterObservation: null,
+                rollbackProven: false, productionWriteReady: false, automaticRestoreAttempted: false });
+            state = "result-pending";
+            const body = { version: 1 as const, mode: "disabled-supervised-lifecycle" as const, phase: "apply-classification" as const,
+                intentRecordId: records[0].recordId, attemptRecordId: attempt.recordId, classified,
+                executionProvenance: "simulated-injected-transport" as const, writeReady: false as const, runtimeConfirmationVerified: false as const };
+            await append({ ...body, recordId: ownershipFingerprint(body) }); state = "consumed";
+            return result;
+        },
         async recordApplyClassification(report: journalRecords.LinkedClassifiedRecord) {
             if (this !== continuation || state !== "intent") throw Error("CONTINUATION_NOT_LIVE");
             state = "result-pending";
@@ -176,11 +208,10 @@ const attemptedIntents = new Set<string>();
 const intentAttempted = attemptedIntents.has.bind(attemptedIntents);
 const rememberAttempt = attemptedIntents.add.bind(attemptedIntents);
 
-/** Dormant private producer; not called by the CLI, executor or admission path.
+/** Private producer used only by the non-public simulated continuation.
  * Supplied adapters can exercise causal capture only in the simulated namespace.
  * No transport means no execution, journal completion, or confirmation authority.
  */
-// eslint-disable-next-line @typescript-eslint/no-unused-vars -- Deliberately dormant; VM tests expose it only in their own realm.
 async function createPrivateAttemptProducer(initialRecord: journalRecords.LinkedInitialRecord,
     config: Parameters<typeof readOfflineReconciledExperiment>[0], now: () => string, adapter?: SimulatedAttemptAdapter) {
     config = structuredClone(config);
@@ -228,18 +259,46 @@ async function createPrivateAttemptProducer(initialRecord: journalRecords.Linked
         try { await handle.sync(); } finally { await handle.close(); }
         const parent = await open(config.directory, "r");
         try { await parent.sync(); } finally { await parent.close(); }
-        const attemptedAt = now();
-        const age = (at: string) => Date.parse(attemptedAt) - Date.parse(at);
-        if (!Number.isFinite(Date.parse(attemptedAt)) || Date.parse(attemptedAt) < Date.parse(intent.attemptedAt)
-            || age(initial.exception.approvedAt) < 0 || age(initial.exception.approvedAt) > APPROVAL_TTL_MS
-            || age(initial.review.before.source.observedAt) < 0 || age(initial.review.before.source.observedAt) > CAPTURE_TTL_MS
-            || age(initial.preWriteRecheck.krakenObservedAt) < 0 || age(initial.preWriteRecheck.krakenObservedAt) > EVIDENCE_TTL_MS
-            || ![marker.approval, marker.reconciliation].every(a => age(a.approvedAt) >= 0 && age(a.approvedAt) <= APPROVAL_TTL_MS)
-            || Date.parse(attemptedAt) + MIN_WRITE_REMAINING_MS >= Date.parse(initial.review.proposal.bound.expiresAt))
-            throw Error("ATTEMPT_EVIDENCE_EXPIRED");
+        const assertFresh = (at: string) => {
+            const age = (capturedAt: string) => Date.parse(at) - Date.parse(capturedAt);
+            if (!Number.isFinite(Date.parse(at)) || Date.parse(at) < Date.parse(intent.attemptedAt)
+                || age(initial.exception.approvedAt) < 0 || age(initial.exception.approvedAt) > APPROVAL_TTL_MS
+                || age(initial.review.before.source.observedAt) < 0 || age(initial.review.before.source.observedAt) > CAPTURE_TTL_MS
+                || age(initial.preWriteRecheck.krakenObservedAt) < 0 || age(initial.preWriteRecheck.krakenObservedAt) > EVIDENCE_TTL_MS
+                || ![marker.approval, marker.reconciliation].every(a => age(a.approvedAt) >= 0 && age(a.approvedAt) <= APPROVAL_TTL_MS)
+                || Date.parse(at) + MIN_WRITE_REMAINING_MS >= Date.parse(initial.review.proposal.bound.expiresAt))
+                throw Error("ATTEMPT_EVIDENCE_EXPIRED");
+        };
+        const attemptedAt = now(); assertFresh(attemptedAt);
         if (await readFile(markerFile, "utf8") !== markerText || await readFile(file, "utf8") !== text)
             throw Error("ATTEMPT_JOURNAL_CHANGED");
         const attemptId = randomUUID();
+        const attemptBody = { version: 1 as const, mode: "disabled-supervised-lifecycle" as const, phase: "attempt-consumed" as const,
+            attemptId, attemptedAt, binding, provenance: "simulated-injected-transport" as const,
+            writeReady: false as const, runtimeConfirmationVerified: false as const };
+        const attempt: ReconciledAttemptConsumption = { ...attemptBody, recordId: ownershipFingerprint(attemptBody) };
+        if (!validReconciledApplyRecords(initial, intent.admissionKey, [intent, attempt], marker.binding.experimentId)) throw Error("ATTEMPT_RECORD_INVALID");
+        // Subordinate permanent consumption marker for this operation, NOT another
+        // site admission. wx gives cross-process exclusion, including empty or
+        // partially written markers after a crash. Never removed or reopened.
+        const consumedFile = file + ".execution";
+        const consumed = await open(consumedFile, "wx", 0o600);
+        try { await consumed.writeFile(JSON.stringify(attempt) + "\n", "utf8"); await consumed.sync(); }
+        finally { await consumed.close(); }
+        const directory = await open(config.directory, "r");
+        try { await directory.sync(); } finally { await directory.close(); }
+        if (await readFile(file, "utf8") !== text || await readFile(markerFile, "utf8") !== markerText) throw Error("ATTEMPT_JOURNAL_CHANGED");
+        const append = await open(file, "a");
+        try { await append.writeFile(JSON.stringify(attempt) + "\n", "utf8"); await append.sync(); }
+        finally { await append.close(); }
+        const readyAt = now(); assertFresh(readyAt);
+        if (Date.parse(readyAt) < Date.parse(attemptedAt)) throw Error("ATTEMPT_EVIDENCE_EXPIRED");
+        if (await readFile(file, "utf8") !== text + JSON.stringify(attempt) + "\n"
+            || await readFile(markerFile, "utf8") !== markerText || await readFile(consumedFile, "utf8") !== JSON.stringify(attempt) + "\n")
+            throw Error("ATTEMPT_JOURNAL_CHANGED");
+        // Final clock check follows every asynchronous durability/read check.
+        const dispatchedAt = now(); assertFresh(dispatchedAt);
+        if (Date.parse(dispatchedAt) < Date.parse(readyAt)) throw Error("ATTEMPT_EVIDENCE_EXPIRED");
         let apiWrite: ReturnType<typeof interpretWriteResponse> = { status: "unknown", httpStatus: null };
         try {
             const response = await post(site, initial.review.payloadJson);
@@ -251,22 +310,32 @@ async function createPrivateAttemptProducer(initialRecord: journalRecords.Linked
         let completedAt: string | null = null;
         try {
             const at = now();
-            if (Number.isFinite(Date.parse(at)) && Date.parse(at) >= Date.parse(attemptedAt)) completedAt = at;
+            if (Number.isFinite(Date.parse(at)) && Date.parse(at) >= Date.parse(dispatchedAt)) completedAt = at;
         } catch { /* A failed clock after invocation must not erase the attempted write. */ }
         if (observation && (!completedAt || observation.source.kind !== "tesla-site-info" || observation.source.energySiteId !== site
             || observation.source.timeZone !== initial.review.before.source.timeZone
-            || !Number.isFinite(Date.parse(completedAt)) || Date.parse(completedAt) < Date.parse(attemptedAt)
+            || !Number.isFinite(Date.parse(completedAt)) || Date.parse(completedAt) < Date.parse(dispatchedAt)
             || Date.parse(observation.source.observedAt) > Date.parse(completedAt)
             || Date.parse(completedAt) - Date.parse(observation.source.observedAt) > CAPTURE_TTL_MS)) observation = null;
         const intended = simulatedTariffObservation(initial.review.before, initial.review.proposal.bound.representation);
-        const comparison = compareObservedTariffReadBack({ intended, readBack: observation, after: attemptedAt, dates: [initial.review.date] });
+        const comparison = compareObservedTariffReadBack({ intended, readBack: observation, after: dispatchedAt, dates: [initial.review.date] });
         const classification = classifyExperimentResult(apiWrite, intended, observation, comparison);
         const outcome = apiWrite.status === "unknown" ? "write-outcome-unknown" : apiWrite.status === "rejected" ? "write-rejected"
             : comparison.outcome === "exact-observed-match" && comparison.timelineScope.complete ? "accepted-exact-readback" : "accepted-readback-unverified";
-        return freeze({ ...denied, provenance: "simulated-injected-transport" as const, attemptId, binding,
-            attemptedAt, completedAt, apiWrite, observation, comparison, classification, outcome });
+        return freeze({ ...denied, provenance: "simulated-injected-transport" as const, attemptId, attemptRecordId: attempt.recordId, binding,
+            attemptedAt: dispatchedAt, completedAt, apiWrite, observation, comparison, classification: classification as journalRecords.LinkedClassifiedRecord["classification"], outcome });
     } });
     return producer;
+}
+
+/** Closed composition connection; callers retain live closures only. No record
+ * recovery, JSON approval loading or public execution entry point is provided. */
+async function admitReconciledContinuation(initial: journalRecords.LinkedInitialRecord,
+    config: Parameters<typeof readOfflineReconciledExperiment>[0], experimentId: string, ports: OfflineReconciliationPorts) {
+    const admission = await admitOfflineReconciledExperiment(config, experimentId, initial, ports);
+    const continuation = await createReconciledApplyContinuation(initial, config, { now: () => ports.now(),
+        capture: () => ports.capture(config.site), readOwnership: site => ports.readOwnership(site) });
+    return Object.freeze({ admission, continuation });
 }
 
 export async function runLocalExperiment(args: string[]) {
@@ -400,19 +469,16 @@ export async function runLocalExperiment(args: string[]) {
                 return { approvalId, bindingKey, approvedAt: now() };
             } finally { prompt.close(); }
         };
-        const admission = await admitOfflineReconciledExperiment({ mode: "offline", directory,
-            durableRoot: path.join(process.cwd(), ".cache/home-energy-platform"), site: selection.energySiteId }, experimentId!, initial, {
+        const { admission } = await admitReconciledContinuation(initial, { mode: "offline", directory,
+            durableRoot: path.join(process.cwd(), ".cache/home-energy-platform"), site: selection.energySiteId }, experimentId!, {
             now, capture: async site => { if (site !== selection.energySiteId) throw Error("TARGET_MISMATCH"); return capture(); },
             readOwnership: site => ownershipStore().read(site),
             approveReconciliation: async binding => ({ ...await separateApproval("RECONCILE", binding),
                 disposition: "prior-conflict-reconciled-for-new-experiment", historicalApiRestoration: "not-proved" }),
             approveExperiment: binding => separateApproval("PREPARE", binding),
         });
-        // Establish only a private journal continuation. It is intentionally not
-        // returned/serialized or connected to write(), and expires on this return.
-        await createReconciledApplyContinuation(initial, { mode: "offline", directory,
-            durableRoot: path.join(process.cwd(), ".cache/home-energy-platform"), site: selection.energySiteId },
-        { now, capture, readOwnership: site => ownershipStore().read(site) });
+        // The private continuation is deliberately discarded here. No CLI flag
+        // or transport binding can execute it; CURRENT_EVIDENCE_PREPARATION_ONLY remains.
         console.log(JSON.stringify({ status: "reconciled-preparation-recorded", admission,
             blockers: [...new Set([...review.hardBlockers, ...review.restoration.blockers])],
             writeReady: false, executionReady: false, restorationProven: false }, null, 2));

@@ -186,9 +186,9 @@ implemented here. `CURRENT_EVIDENCE_PREPARATION_ONLY` remains mandatory.
 
 ## Private execution-attempt capture prerequisite
 
-`createPrivateAttemptProducer()` is a dormant, unexported function in the closed
-local adapter. It is not called by the CLI, existing executor or reconciled
-admission. There is no new switch, endpoint, public factory or runtime registry.
+`createPrivateAttemptProducer()` is an unexported function in the closed local
+adapter. The private continuation can now call it for injected simulation only;
+the CLI never invokes that method. There is no new switch, endpoint, public factory or runtime registry.
 Without an adapter it returns `disabled-production` / `not-attempted`, with no
 attempt identity or transport invocation. Every supplied adapter is categorically
 `simulated-injected-transport`; no authentication flag or callback can change that.
@@ -201,8 +201,8 @@ directory, and enforces the existing approval/evidence deadlines. Its private,
 single-use closure captures the transport response itself, then invokes readback
 itself. Method replacement, external result arguments, copied handles, concurrent
 invocations and process-local intent reuse do not supply execution authority. Raw response bodies
-and exception messages are not retained. No journal record is appended or claim
-released by this producer.
+and exception messages are not retained. The producer now durably consumes the
+attempt before transport; it never releases the admission claim.
 
 Results distinguish not attempted, unknown outcome, rejected, accepted with
 unverified readback, and accepted with exact readback. Existing response parsing,
@@ -219,6 +219,50 @@ reconciled continuation, durable confirmed completion, restoration and ownership
 disposition remains future work. The Fleet POST closure, preparation-only gate,
 pricing policy, receipt registry and historical journals are unchanged.
 
-The process-local attempt guard is not restart-proof mutation admission. No
-recovery entry point exists; the existing durable exclusive claim remains blocking.
-A future production connection must preserve durable uncertain-attempt handling.
+The process-local attempt guard is supplemented by durable operation-specific
+consumption below. No recovery entry point exists; the existing durable exclusive
+claim remains blocking.
+
+
+## Integrated disabled supervised apply path
+
+The existing CLI still uses `runSupervisedExperiment()` in dry-run mode for exact
+preparation. Its closed approval composition now calls private
+`admitReconciledContinuation()`, which joins the existing reconciled admission and
+continuation without a second site claim. The CLI discards the private handle;
+there is no argument, route or recovered-document API that invokes simulation.
+
+Only the private `runSimulatedApply()` method connects the live continuation to
+the existing attempt producer. Tests instrument this method in their VM realm.
+It rechecks current evidence/ownership and retains the exact approved initial
+record, immutable dual original observation and export subtree. It does not call
+the existing live POST closure or bypass `CURRENT_EVIDENCE_PREPARATION_ONLY`.
+
+Durable ordering in the existing distinct operation journal is now:
+`apply-intent` → `attempt-consumed` → `apply-classification`. A subordinate
+`<operation-journal>.execution` marker uses exclusive creation and file/directory
+sync before transport. It binds a new attempt ID to the exact operation, payload,
+original observation, ownership and admission marker. This consumes that admitted
+operation's attempt; it is not another site admission, authority source or journal
+system. Empty/truncated markers remain consumed. The marker is never removed,
+renamed, reopened for writing or used to hydrate a capability. Cross-process
+racing producers cannot both create it. The consumption record is also synced to
+the original operation journal before any simulated POST. A second deadline and
+exact-byte recheck follows these durable writes. Classification uses the final
+dispatch timestamp; readback must follow dispatch, not merely consumption.
+
+The continuation records the producer's own result, not a caller-supplied result.
+Its simulated classification links the exact durable attempt record and validated
+V1 classification. Legacy unverified-report chains retain their documentary
+interpretation. New chains require independent expected experiment identity and
+strict attempt/payload/ownership/original/journal bindings. Every result remains
+explicitly simulated, unverified for production and ineligible for receipts,
+ownership finalisation or claim release. A failed post, mismatched readback,
+interrupted append or invalid clock leaves the durable claim/attempt blocking.
+
+Fresh-VM tests discard the process-local guards and demonstrate that both a
+consumed marker without a complete appended record and a complete attempted
+journal prevent another transport invocation. Existing recovery deliberately
+rejects these extra records/artifacts; it never resumes execution. Restoration,
+authenticated transport origin, durable production confirmation, ownership
+disposition and terminal claim completion remain out of scope.

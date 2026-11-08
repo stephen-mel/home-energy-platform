@@ -775,13 +775,20 @@ export type ReconciledApplyIntent = {
 export type ReconciledApplyClassification = {
     version: 1; mode: "disabled-supervised-lifecycle"; phase: "apply-classification";
     intentRecordId: string; classified: LinkedClassifiedRecord;
-    executionProvenance: "unverified-report"; writeReady: false; runtimeConfirmationVerified: false; recordId: string;
+    executionProvenance: "unverified-report" | "simulated-injected-transport"; attemptRecordId?: string; writeReady: false; runtimeConfirmationVerified: false; recordId: string;
 };
-export function validReconciledApplyRecords(initial: LinkedInitialRecord, admissionKey: string, records: unknown[]): boolean {
+export type ReconciledAttemptConsumption = {
+    version: 1; mode: "disabled-supervised-lifecycle"; phase: "attempt-consumed";
+    attemptId: string; attemptedAt: string;
+    binding: { site: string; mutationId: string; experimentId: string; initialRecordId: string; intentRecordId: string;
+        admissionKey: string; payloadKey: string; ownershipKey: string; originalObservationKey: string };
+    provenance: "simulated-injected-transport"; writeReady: false; runtimeConfirmationVerified: false; recordId: string;
+};
+export function validReconciledApplyRecords(initial: LinkedInitialRecord, admissionKey: string, records: unknown[], experimentId?: string): boolean {
     try {
         if (!validLinkedInitialRecord(initial, initial.review.before.source.energySiteId)
             || !initial.review.hardBlockers.includes("CURRENT_EVIDENCE_PREPARATION_ONLY")
-            || !/^[a-f0-9]{64}$/.test(admissionKey) || !Array.isArray(records) || records.length < 1 || records.length > 2) return false;
+            || !/^[a-f0-9]{64}$/.test(admissionKey) || !Array.isArray(records) || records.length < 1 || records.length > 3) return false;
         const intent = records[0] as ReconciledApplyIntent;
         const { recordId, ...body } = intent;
         if (!validJournalEvidenceJson(intent) || !sameKeys(intent, ["version", "mode", "phase", "admissionKey", "initialRecordId", "mutationId", "site", "attemptedAt", "writeReady", "runtimeConfirmationVerified", "recordId"])
@@ -793,12 +800,34 @@ export function validReconciledApplyRecords(initial: LinkedInitialRecord, admiss
             || !currentTime(initial.review.before.source.observedAt, intent.attemptedAt, CAPTURE_TTL_MS)
             || Date.parse(intent.attemptedAt) + MIN_WRITE_REMAINING_MS >= Date.parse(initial.review.proposal.bound.expiresAt)) return false;
         if (records.length === 1) return true;
-        const result = records[1] as ReconciledApplyClassification;
+        const hasAttempt = (records[1] as ReconciledAttemptConsumption)?.phase === "attempt-consumed";
+        const attempt = hasAttempt ? records[1] as ReconciledAttemptConsumption : null;
+        if (attempt) {
+            const { recordId: attemptRecordId, ...attemptBody } = attempt;
+            const expected = { site: intent.site, mutationId: initial.mutationId, experimentId,
+                initialRecordId: initial.initialRecordId, intentRecordId: intent.recordId, admissionKey,
+                payloadKey: ownershipFingerprint(initial.review.payloadJson), ownershipKey: ownershipFingerprint(initial.preparedContext.ownership),
+                originalObservationKey: ownershipFingerprint(initial.review.before) };
+            if (!identifier(experimentId) || !validJournalEvidenceJson(attempt)
+                || !sameKeys(attempt, ["version", "mode", "phase", "attemptId", "attemptedAt", "binding", "provenance", "writeReady", "runtimeConfirmationVerified", "recordId"])
+                || attempt.version !== 1 || attempt.mode !== "disabled-supervised-lifecycle" || !identifier(attempt.attemptId)
+                || attempt.provenance !== "simulated-injected-transport" || attempt.writeReady !== false || attempt.runtimeConfirmationVerified !== false
+                || attemptRecordId !== ownershipFingerprint(attemptBody) || ownershipFingerprint(attempt.binding) !== ownershipFingerprint(expected)
+                || !validOwnershipTimestamp(attempt.attemptedAt) || Date.parse(attempt.attemptedAt) < Date.parse(intent.attemptedAt)
+                || !currentTime(initial.exception.approvedAt, attempt.attemptedAt, APPROVAL_TTL_MS)
+                || !currentTime(initial.preWriteRecheck.krakenObservedAt, attempt.attemptedAt, EVIDENCE_TTL_MS)
+                || Date.parse(attempt.attemptedAt) + MIN_WRITE_REMAINING_MS >= Date.parse(initial.review.proposal.bound.expiresAt)) return false;
+            if (records.length === 2) return true;
+        } else if (records.length !== 2) return false;
+        const result = records[attempt ? 2 : 1] as ReconciledApplyClassification;
         const { recordId: resultId, ...resultBody } = result;
-        return validJournalEvidenceJson(result) && sameKeys(result, ["version", "mode", "phase", "intentRecordId", "classified", "executionProvenance", "writeReady", "runtimeConfirmationVerified", "recordId"])
+        const resultKeys = ["version", "mode", "phase", "intentRecordId", "classified", "executionProvenance", "writeReady", "runtimeConfirmationVerified", "recordId"];
+        if (attempt) resultKeys.push("attemptRecordId");
+        return validJournalEvidenceJson(result) && sameKeys(result, resultKeys)
             && result.version === 1 && result.mode === "disabled-supervised-lifecycle" && result.phase === "apply-classification"
-            && result.executionProvenance === "unverified-report" && result.writeReady === false && result.runtimeConfirmationVerified === false
+            && result.executionProvenance === (attempt ? "simulated-injected-transport" : "unverified-report")
+            && (!attempt || result.attemptRecordId === attempt.recordId) && result.writeReady === false && result.runtimeConfirmationVerified === false
             && resultId === ownershipFingerprint(resultBody) && result.intentRecordId === intent.recordId
-            && validLinkedClassifiedRecord(result.classified, initial) && result.classified.attemptedAt === intent.attemptedAt;
+            && validLinkedClassifiedRecord(result.classified, initial) && (attempt ? Date.parse(result.classified.attemptedAt) >= Date.parse(attempt.attemptedAt) : result.classified.attemptedAt === intent.attemptedAt);
     } catch { return false; }
 }

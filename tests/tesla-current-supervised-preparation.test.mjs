@@ -264,9 +264,19 @@ async function reconciledCliHarness(t,fault){
      await target.sync();if(fault==='continuation-slow-sync')x.ports.now=()=> '2026-10-27T12:01:01Z';
     };const v=target[k];return typeof v==='function'?v.bind(target):v;}});
    }
+   if(file.endsWith('.execution')&&flags==='wx'&&fault==='integrated-marker-crash')return new Proxy(handle,{get(target,k){if(k==='writeFile')return async()=>{throw Error('SIMULATED_MARKER_CRASH');};const v=target[k];return typeof v==='function'?v.bind(target):v;}});
+   if(flags==='a'&&['integrated-attempt-crash','integrated-result-crash'].includes(fault)){
+    const number=++continuationAppends;
+    if(number===(fault==='integrated-attempt-crash'?2:3))return new Proxy(handle,{get(target,k){if(k==='sync')return async()=>{throw Error('SIMULATED_INTEGRATED_CRASH');};const v=target[k];return typeof v==='function'?v.bind(target):v;}});
+   }
    if(fault==='attempt-sync-failure'&&flags==='r')return new Proxy(handle,{get(target,k){if(k==='sync')return async()=>{throw Error('ATTEMPT_SYNC_FAILURE');};const v=target[k];return typeof v==='function'?v.bind(target):v;}});
    return handle;
-  },readFile:async(file,...args)=>file===path.join(cwd,'.tesla-tokens.json')?JSON.stringify({access_token:'offline-only'}):io.readFile(file,...args)},
+  },readFile:async(file,...args)=>{
+   if(file===path.join(cwd,'.tesla-tokens.json'))return JSON.stringify({access_token:'offline-only'});
+   const text=await io.readFile(file,...args);
+   if(fault==='integrated-dispatch-expired'&&file.endsWith('.execution'))x.ports.now=()=> '2026-10-27T12:01:01Z';
+   return text;
+  }},
   'node:path':path,'node:crypto':{...crypto,randomUUID:()=>`fixture-identity-${++uuid}-${hash(cwd).slice(0,8)}`},
   'node:readline/promises':{createInterface:()=>({close(){},async question(message){calls.questions++;
    if(message==='Type AUTOMATIC ROLLBACK IS UNPROVEN: ')return 'AUTOMATIC ROLLBACK IS UNPROVEN';
@@ -287,9 +297,10 @@ async function reconciledCliHarness(t,fault){
   './ownership-sqlite':{persistConfirmedSmart:blocked},'./supervised-journal':{claimExperimentJournal:blocked},'./supervised-experiment':api,
  };
  class FixedDate extends Date{constructor(...a){super(...(a.length?a:[now]));}}
+ const evaluatePrivateRealm=()=>{
  const exports={};
  // Test-realm-only instrumentation; no application export or runtime switch.
- vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/lib/tesla-tariff/supervised-local.ts','utf8')+'\nexport { createReconciledApplyContinuation as testPrivateContinuation, createPrivateAttemptProducer as testPrivateAttemptProducer };',{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,
+ vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/lib/tesla-tariff/supervised-local.ts','utf8')+'\nexport { createReconciledApplyContinuation as testPrivateContinuation, createPrivateAttemptProducer as testPrivateAttemptProducer, admitReconciledContinuation as testComposeReconciled };',{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,
  {exports,structuredClone,Date:FixedDate,AbortSignal,process:{cwd:()=>cwd,env:{},stdin:{isTTY:fault!=='noninteractive'},stdout:{isTTY:true},stderr:{isTTY:true}},
  console:{log:value=>calls.output.push(value)},fetch:async(_url,options)=>{
   if(options.method!=='GET'){calls.posts++;throw Error('POST_FORBIDDEN');}calls.gets++;
@@ -298,7 +309,12 @@ async function reconciledCliHarness(t,fault){
   if(fault==='substituted'&&calls.gets>=2)v.name='changed';
   return{ok:true,json:async()=>({response:{energy_site_id:'12345',installation_time_zone:'Europe/London',tariff_content_v2:v,tariff_content:legacy(v)}})};
  },require:n=>{assert.ok(n in dependencies,n);return dependencies[n];}});
+ return exports;
+ };
+ const exports=evaluatePrivateRealm();
  return {x,calls,config:{mode:'offline',directory,durableRoot:root,site:'12345'},historical,
+  compose:()=>exports.testComposeReconciled(x.initial,x.config,'integrated-simulation',x.ports),
+  restartAttempt:adapter=>evaluatePrivateRealm().testPrivateAttemptProducer(x.initial,x.config,()=>x.ports.now(),adapter),
   createPrivate:()=>exports.testPrivateContinuation(x.initial,x.config,x.ports),
   createAttempt:adapter=>exports.testPrivateAttemptProducer(x.initial,x.config,()=>x.ports.now(),adapter),
   run:(extra=[])=>exports.runLocalExperiment(['--site','12345','--vehicle','fixture-ev','--dispatch-start',x.f.selection.dispatchStart,'--prepare-reconciled','--experiment-id','cli-independent',...extra])};
@@ -620,7 +636,7 @@ function privateApplyReport(x, status = 'accepted') {
 }
 test('private production continuation records intent and unverified classification on the original claim without execution authority', async t => {
  const h = await privateContinuationFixture(t);
- assert.deepEqual(Object.keys(h.handle).sort(), ['recordApplyClassification', 'recordApplyIntent']);
+ assert.deepEqual(Object.keys(h.handle).sort(), ['recordApplyClassification', 'recordApplyIntent', 'runSimulatedApply']);
  await h.handle.recordApplyIntent();
  let rows = (await io.readFile(h.file, 'utf8')).trim().split('\n').map(JSON.parse);
  assert.equal(rows.length, 2); assert.equal(rows[1].phase, 'apply-intent');
@@ -718,7 +734,7 @@ async function attemptProducerFixture(t, fault = 'valid') {
   async post(site, payload) {
    calls.push('post'); assert.equal(site, '12345'); assert.equal(payload, h.x.initial.review.payloadJson);
    const rows = (await io.readFile(h.file, 'utf8')).trim().split('\n').map(JSON.parse);
-   assert.equal(rows[1].phase, 'apply-intent'); assert.equal(rows.length, 2);
+   assert.equal(rows[1].phase, 'apply-intent'); assert.equal(rows.length, 3); assert.equal(rows[2].phase, 'attempt-consumed');
    if (fault === 'timeout') throw Error('OFFLINE_TIMEOUT');
    return { httpStatus: fault === 'rejected' ? 400 : fault === 'ambiguous' ? 503 : 200,
     body: { response: { result: fault !== 'rejected' }, secret: 'DO_NOT_RETAIN_RESPONSE_BODY' } };
@@ -813,5 +829,129 @@ test('private attempt producer cannot invoke transport after intent durability u
   readBack: async () => { calls++; throw Error('FORBIDDEN'); } });
  await assert.rejects(producer.run(), /ATTEMPT_SYNC_FAILURE/); assert.equal(calls, 0);
  await assert.rejects(producer.run(), /ATTEMPT_NOT_LIVE/);
+ assert.equal(await io.readFile(h.marker, 'utf8'), h.markerBytes);
+});
+
+async function integratedApplyFixture(t, fault) {
+ const h = await reconciledCliHarness(t, fault), x = h.x;
+ const context = await load('src/lib/tesla-tariff/prepared-mutation-context.ts').prepareMutationContext(x.f,
+  { now: () => now, readOwnership: x.ports.readOwnership, newMutationId: () => x.initial.mutationId });
+ const prepared = await api.runSupervisedExperiment({ site: x.f.site, selection: x.f.selection, mode: 'dry-run', authority: 'observe' },
+  { capture: x.ports.capture, prepareContext: async () => context, journalRecords: linked,
+   claim: async () => { throw Error('SECOND_SITE_CLAIM_FORBIDDEN'); }, write: async () => { throw Error('LIVE_WRITE_FORBIDDEN'); } });
+ assert.equal(key(prepared.review), key(x.initial.review));
+ const composed = await h.compose(); noRuntimeAuthority(composed.admission);
+ const file = path.join(x.config.directory, `site-12345-attempt-${x.initial.mutationId}.jsonl`);
+ const marker = path.join(x.config.directory, 'site-12345-attempt.active'), markerBytes = await io.readFile(marker, 'utf8');
+ const calls = [], expectedPayload = x.initial.review.payloadJson;
+ const adapter = {
+  async post(site, payload) {
+   calls.push('post'); assert.equal(site, '12345'); assert.equal(payload, expectedPayload);
+   const rows = (await io.readFile(file, 'utf8')).trim().split('\n').map(JSON.parse);
+   assert.equal(rows.length, 3); assert.equal(rows[2].phase, 'attempt-consumed');
+   assert.equal(key(JSON.parse(await io.readFile(file + '.execution', 'utf8'))), key(rows[2]));
+   if (fault === 'timeout') throw Error('SIMULATED_TIMEOUT');
+   return { httpStatus: fault === 'rejected' ? 400 : fault === 'ambiguous' ? 503 : 200, body: { response: { result: fault !== 'rejected' } } };
+  },
+  async readBack() {
+   calls.push('readback'); x.ports.now = () => '2026-10-27T12:00:02Z';
+   const observation = privateApplyReport(x).apiTariffReadBack.observation;
+   if (fault === 'mismatch') observation.representations.legacy.sell_tariff.name = 'Changed';
+   return observation;
+  },
+ };
+ return { ...h, ...composed, adapter, file, marker, markerBytes, events: calls };
+}
+test('integrated closed preparation admission intent attempt readback and classification share one durable operation', async t => {
+ const h = await integratedApplyFixture(t), original = key(h.x.initial.review.before);
+ const result = await h.continuation.runSimulatedApply(h.adapter);
+ assert.equal(result.outcome, 'accepted-exact-readback'); assert.equal(result.productionConfirmation, false);
+ assert.deepEqual(h.events, ['post', 'readback']);
+ const rows = (await io.readFile(h.file, 'utf8')).trim().split('\n').map(JSON.parse);
+ assert.deepEqual(rows.slice(1).map(r => r.phase), ['apply-intent', 'attempt-consumed', 'apply-classification']);
+ assert.equal(journals.validReconciledApplyRecords(h.x.initial, hash(h.markerBytes), rows.slice(1), 'integrated-simulation'), true);
+ assert.equal(rows[3].attemptRecordId, rows[2].recordId); assert.equal(rows[2].attemptId, result.attemptId);
+ assert.equal(rows[3].executionProvenance, 'simulated-injected-transport'); assert.equal(rows[3].runtimeConfirmationVerified, false);
+ assert.equal(key(h.x.initial.review.before), original); assert.equal(await io.readFile(h.marker, 'utf8'), h.markerBytes);
+ assert.equal(await io.readFile(h.x.root, 'utf8'), h.x.priorBytes); assert.equal(h.calls.posts + h.calls.gets, 0);
+ assert.equal((await journals.readOfflineReconciledExperiment(h.x.config)).status, 'blocked');
+ await assert.rejects(h.restartAttempt(h.adapter));
+ const issuer = load('src/lib/tesla-tariff/confirmed-smart-receipt-issuer.ts');
+ assert.equal(issuer.issueConfirmedSmartReceipt(result, h.x.initial, rows[3].classified).code, 'JOURNAL_COMPLETION_NOT_BOUND');
+});
+test('integrated apply cannot replay or concurrently use copied continuation authority', async t => {
+ const h = await integratedApplyFixture(t);
+ await assert.rejects(({ ...h.continuation }).runSimulatedApply(h.adapter), /CONTINUATION_NOT_LIVE/);
+ const outcomes = await Promise.allSettled([h.continuation.runSimulatedApply(h.adapter), h.continuation.runSimulatedApply(h.adapter)]);
+ assert.equal(outcomes.filter(r => r.status === 'fulfilled').length, 1); assert.deepEqual(h.events, ['post', 'readback']);
+ await assert.rejects(h.continuation.runSimulatedApply(h.adapter), /CONTINUATION_NOT_LIVE/);
+ await assert.rejects(h.restartAttempt(h.adapter));
+});
+test('integrated apply classifies ambiguous rejected and mismatched outcomes without confirmation or retry', async t => {
+ for (const [fault, classification] of [['timeout', 'write-outcome-unknown'], ['ambiguous', 'write-outcome-unknown'],
+  ['rejected', 'request-rejected'], ['mismatch', 'read-back-unavailable-or-insufficient']]) {
+  const h = await integratedApplyFixture(t, fault), result = await h.continuation.runSimulatedApply(h.adapter);
+  assert.equal(result.classification, classification); assert.equal(result.productionConfirmation, false);
+  const rows = (await io.readFile(h.file, 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.equal(rows[3].classified.classification, classification);
+  await assert.rejects(h.restartAttempt(h.adapter));
+  assert.equal((await journals.readOfflineReconciledExperiment(h.x.config)).status, 'blocked');
+  assert.equal(await io.readFile(h.marker, 'utf8'), h.markerBytes);
+ }
+});
+test('integrated attempt consumption survives empty markers interrupted attempt append and uncertain result durability', async t => {
+ for (const fault of ['integrated-marker-crash', 'integrated-attempt-crash', 'integrated-result-crash']) {
+  const h = await integratedApplyFixture(t, fault);
+  await assert.rejects(h.continuation.runSimulatedApply(h.adapter));
+  assert.equal(h.events.filter(e => e === 'post').length, fault === 'integrated-result-crash' ? 1 : 0);
+  await io.access(h.file + '.execution');
+  // A fresh VM has empty private Sets. The durable consumption evidence alone
+  // still prevents a second invocation; it never hydrates authority.
+  const restarted = await Promise.allSettled([h.restartAttempt(h.adapter)]);
+  if (restarted[0].status === 'fulfilled') await assert.rejects(restarted[0].value.run(), /EEXIST|ATTEMPT_/);
+  else assert.match(String(restarted[0].reason), /ATTEMPT_INTENT_INVALID/);
+  assert.equal(h.events.filter(e => e === 'post').length, fault === 'integrated-result-crash' ? 1 : 0);
+  assert.equal((await journals.readOfflineReconciledExperiment(h.x.config)).status, 'blocked');
+  assert.equal((await journals.repeatAttemptEligibility(h.x.config.directory, '12345', { status: 'missing' })).code, 'ATTEMPT_IN_PROGRESS');
+  assert.equal(await io.readFile(h.marker, 'utf8'), h.markerBytes);
+ }
+});
+test('integrated apply rejects wrong site payload and baseline substitution before transport and rehashed attempt substitution', async t => {
+ for (const fault of ['site', 'payload', 'baseline']) {
+  const h = await integratedApplyFixture(t);
+  if (fault === 'site') h.x.f.capture.before.source.energySiteId = '54321';
+  if (fault === 'baseline') h.x.f.capture.before.representations.legacy.sell_tariff.name = 'Altered';
+  if (fault === 'payload') { const initial = structuredClone(h.x.initial); initial.review.payloadJson = '{}'; await io.writeFile(h.file, JSON.stringify(initial) + '\n'); }
+  await assert.rejects(h.continuation.runSimulatedApply(h.adapter)); assert.deepEqual(h.events, []);
+  await assert.rejects(io.access(h.file + '.execution'), { code: 'ENOENT' });
+ }
+ const h = await integratedApplyFixture(t); await h.continuation.runSimulatedApply(h.adapter);
+ const rows = (await io.readFile(h.file, 'utf8')).trim().split('\n').map(JSON.parse).slice(1);
+ for (const change of [r => { r[1].binding.site = '54321'; }, r => { r[1].binding.payloadKey = hash('{}'); },
+  r => { r[1].binding.experimentId = 'different'; }, r => { r[2].attemptRecordId = hash('different'); },
+  r => { r[1].provenance = 'authenticated'; }]) {
+  const altered = structuredClone(rows); change(altered);
+  for (const r of altered) { const { recordId: _id, ...body } = r; void _id; r.recordId = hash(body); }
+  assert.equal(journals.validReconciledApplyRecords(h.x.initial, hash(h.markerBytes), altered, 'integrated-simulation'), false);
+ }
+});
+
+test('integrated durable attempt marker excludes concurrent independent runtimes without shared process guards', async t => {
+ const h = await attemptProducerFixture(t), independent = await h.restartAttempt(h.adapter);
+ const attempts = await Promise.allSettled([h.producer.run(), independent.run()]);
+ assert.equal(attempts.filter(r => r.status === 'fulfilled').length, 1);
+ assert.deepEqual(h.calls, ['post', 'readback']);
+ const rows = (await io.readFile(h.file, 'utf8')).trim().split('\n').map(JSON.parse);
+ assert.equal(rows.length, 3); assert.equal(rows[2].phase, 'attempt-consumed');
+ assert.equal(key(JSON.parse(await io.readFile(h.file + '.execution', 'utf8'))), key(rows[2]));
+ await assert.rejects(h.restartAttempt(h.adapter));
+ assert.equal((await journals.readOfflineReconciledExperiment(h.x.config)).status, 'blocked');
+});
+
+test('integrated apply revalidates freshness after the final asynchronous consumption check', async t => {
+ const h = await integratedApplyFixture(t, 'integrated-dispatch-expired');
+ await assert.rejects(h.continuation.runSimulatedApply(h.adapter), /ATTEMPT_EVIDENCE_EXPIRED/);
+ assert.deepEqual(h.events, []); await io.access(h.file + '.execution');
+ await assert.rejects(h.restartAttempt(h.adapter));
  assert.equal(await io.readFile(h.marker, 'utf8'), h.markerBytes);
 });
