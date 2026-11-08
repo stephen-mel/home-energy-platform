@@ -20,6 +20,9 @@ import { validateConfirmedOperationEvidence, validateOperationInitialRecord, val
     type SmartOperationInitialRecord, type SmartOperationCompletionRecord, type ConfirmedOperationEvidence,
     type ConfirmedOperationValidationContext } from "./confirmed-operation-evidence";
 import { validJournalEvidenceJson } from "./journal-evidence-json";
+import { reviewObservedRestoration, compareObservedTariffReadBack } from "./restoration-review";
+import { classifyExperimentResult } from "./supervised-experiment";
+import { representationKey } from "./rollback-evidence";
 import { EVIDENCE_TTL_MS } from "./smart-evidence";
 
 type CompletedAttempt = {
@@ -829,5 +832,99 @@ export function validReconciledApplyRecords(initial: LinkedInitialRecord, admiss
             && (!attempt || result.attemptRecordId === attempt.recordId) && result.writeReady === false && result.runtimeConfirmationVerified === false
             && resultId === ownershipFingerprint(resultBody) && result.intentRecordId === intent.recordId
             && validLinkedClassifiedRecord(result.classified, initial) && (attempt ? Date.parse(result.classified.attemptedAt) >= Date.parse(attempt.attemptedAt) : result.classified.attemptedAt === intent.attemptedAt);
+    } catch { return false; }
+}
+
+
+export type ReconciledRestoreIntent = {
+    version: 1; mode: "disabled-supervised-lifecycle"; phase: "restore-intent";
+    binding: { experimentId: string; mutationId: string; site: string; initialRecordId: string; admissionKey: string;
+        applyRecordId: string; ownershipKey: string; originalObservationKey: string;
+        before: Capture["before"]; kraken: Capture["kraken"]; payloadJson: string; challengeId: string; preparedAt: string; expiresAt: string };
+    approval: RehearsalApproval; writeReady: false; runtimeConfirmationVerified: false; recordId: string;
+};
+export type ReconciledRestoreAttempt = Omit<ReconciledAttemptConsumption, "phase"> & { phase: "restore-attempt-consumed" };
+export type ReconciledRestoreClassification = {
+    version: 1; mode: "disabled-supervised-lifecycle"; phase: "restore-classification";
+    intentRecordId: string; attemptRecordId: string;
+    attemptedAt: string; completedAt: string; apiWrite: CaptureWriteResult;
+    observation: Capture["before"] | null; comparison: ReturnType<typeof compareObservedTariffReadBack>;
+    classification: LinkedClassifiedRecord["classification"];
+    executionProvenance: "simulated-injected-transport"; writeReady: false; runtimeConfirmationVerified: false; recordId: string;
+};
+type CaptureWriteResult = LinkedClassifiedRecord["apiWrite"];
+/** Complete documentary chain, never restoration authority or terminal retirement. */
+export function validReconciledLifecycleRecords(initial: LinkedInitialRecord, admissionKey: string, records: unknown[], experimentId: string): boolean {
+    try {
+        if (!Array.isArray(records) || records.length <= 3) return validReconciledApplyRecords(initial, admissionKey, records, experimentId);
+        if (records.length > 6 || !validReconciledApplyRecords(initial, admissionKey, records.slice(0, 3), experimentId)) return false;
+        const applied = records[2] as ReconciledApplyClassification, a = applied.classified;
+        if (applied.executionProvenance !== "simulated-injected-transport" || a.apiWrite.status !== "accepted"
+            || a.classification !== "submitted-representation-preserved" || !a.apiTariffReadBack.observation
+            || a.apiTariffReadBack.comparison.outcome !== "exact-observed-match" || !a.apiTariffReadBack.comparison.timelineScope.complete) return false;
+        const intent = records[3] as ReconciledRestoreIntent, b = intent.binding, approval = intent.approval;
+        const { recordId, ...body } = intent;
+        if (!validJournalEvidenceJson(intent) || !sameKeys(intent, ["version", "mode", "phase", "binding", "approval", "writeReady", "runtimeConfirmationVerified", "recordId"])
+            || intent.version !== 1 || intent.mode !== "disabled-supervised-lifecycle" || intent.phase !== "restore-intent"
+            || intent.writeReady !== false || intent.runtimeConfirmationVerified !== false || recordId !== ownershipFingerprint(body)
+            || !sameKeys(b, ["experimentId", "mutationId", "site", "initialRecordId", "admissionKey", "applyRecordId", "ownershipKey", "originalObservationKey", "before", "kraken", "payloadJson", "challengeId", "preparedAt", "expiresAt"])
+            || b.experimentId !== experimentId || b.mutationId !== initial.mutationId || b.site !== initial.review.before.source.energySiteId
+            || b.initialRecordId !== initial.initialRecordId || b.admissionKey !== admissionKey || b.applyRecordId !== applied.recordId
+            || b.ownershipKey !== ownershipFingerprint(initial.preparedContext.ownership) || b.originalObservationKey !== ownershipFingerprint(initial.review.before)
+            || !identifier(b.challengeId) || !validOwnershipTimestamp(b.preparedAt) || !validOwnershipTimestamp(b.expiresAt)
+            || Date.parse(b.preparedAt) < Date.parse(a.completedAt) || Date.parse(b.expiresAt) !== Date.parse(b.preparedAt) + APPROVAL_TTL_MS
+            || !validateTeslaInspectionEvidence(b.before) || b.before.source.kind !== "tesla-site-info" || b.before.source.energySiteId !== b.site
+            || b.before.source.timeZone !== initial.review.before.source.timeZone || !currentTime(b.before.source.observedAt, b.preparedAt, CAPTURE_TTL_MS)
+            || representationKey(b.before.tariff) !== representationKey(a.apiTariffReadBack.observation.tariff)
+            || representationKey(b.before.representations ?? null) !== representationKey(a.apiTariffReadBack.observation.representations ?? null)
+            || !validateKrakenInspectionEvidence(b.kraken) || b.kraken.stale
+            || !Array.isArray(b.kraken.vehicles) || b.kraken.vehicles.some(v => !v || typeof v.id !== "string" || typeof v.name !== "string"
+                || parseDispatchResponse({ flexPlannedDispatches: v.plannedDispatches }).status !== "complete") || !currentTime(b.kraken.lastSuccessfulUpdate!, b.preparedAt, EVIDENCE_TTL_MS)
+            || !b.kraken.importTariff || !currentTime(b.kraken.importTariff.observedAt, b.preparedAt, EVIDENCE_TTL_MS)) return false;
+        const review = reviewObservedRestoration({ before: initial.review.before, temporaryProposal: initial.review.proposal, asOf: b.preparedAt, maxCaptureAgeMs: CAPTURE_TTL_MS });
+        if (!review.structurallyComplete || !review.boundToProposal || b.payloadJson !== representationKey(review.documentedEnvelopeCandidate)
+            || !sameKeys(approval, ["fingerprint", "baselineKey", "payloadKey", "approvedAt", "acknowledgedBlockers", "manualRecoveryAcknowledged"])
+            || approval.fingerprint !== ownershipFingerprint(b) || approval.baselineKey !== ownershipFingerprint(b.before.tariff)
+            || approval.payloadKey !== ownershipFingerprint(b.payloadJson) || approval.manualRecoveryAcknowledged !== true
+            || !currentTime(approval.approvedAt, approval.approvedAt, APPROVAL_TTL_MS) || Date.parse(approval.approvedAt) < Date.parse(b.preparedAt)
+            || Date.parse(approval.approvedAt) + MIN_WRITE_REMAINING_MS >= Date.parse(b.expiresAt)
+            || !currentTime(b.before.source.observedAt, approval.approvedAt, CAPTURE_TTL_MS)
+            || representationKey([...new Set(approval.acknowledgedBlockers)].sort()) !== representationKey([...new Set(review.blockers)].sort())) return false;
+        if (records.length === 4) return true;
+        const attempt = records[4] as ReconciledRestoreAttempt, { recordId: attemptId, ...attemptBody } = attempt;
+        const binding = { site: b.site, mutationId: b.mutationId, experimentId, initialRecordId: b.initialRecordId,
+            intentRecordId: intent.recordId, admissionKey, payloadKey: ownershipFingerprint(b.payloadJson), ownershipKey: b.ownershipKey, originalObservationKey: b.originalObservationKey };
+        if (!validJournalEvidenceJson(attempt) || !sameKeys(attempt, ["version", "mode", "phase", "attemptId", "attemptedAt", "binding", "provenance", "writeReady", "runtimeConfirmationVerified", "recordId"])
+            || attempt.version !== 1 || attempt.mode !== "disabled-supervised-lifecycle" || attempt.phase !== "restore-attempt-consumed"
+            || !identifier(attempt.attemptId) || attempt.attemptId === (records[1] as ReconciledAttemptConsumption).attemptId
+            || attempt.provenance !== "simulated-injected-transport" || attempt.writeReady !== false || attempt.runtimeConfirmationVerified !== false
+            || attemptId !== ownershipFingerprint(attemptBody) || ownershipFingerprint(attempt.binding) !== ownershipFingerprint(binding)
+            || !currentTime(approval.approvedAt, attempt.attemptedAt, APPROVAL_TTL_MS)
+            || !currentTime(b.before.source.observedAt, attempt.attemptedAt, CAPTURE_TTL_MS)
+            || !currentTime(b.kraken.lastSuccessfulUpdate!, attempt.attemptedAt, EVIDENCE_TTL_MS)
+            || !currentTime(b.kraken.importTariff!.observedAt, attempt.attemptedAt, EVIDENCE_TTL_MS)
+            || Date.parse(attempt.attemptedAt) + MIN_WRITE_REMAINING_MS >= Date.parse(b.expiresAt)) return false;
+        if (records.length === 5) return true;
+        const result = records[5] as ReconciledRestoreClassification, { recordId: resultId, ...resultBody } = result;
+        const observation = result.observation, write = result.apiWrite;
+        if (!validJournalEvidenceJson(result) || !sameKeys(result, ["version", "mode", "phase", "intentRecordId", "attemptRecordId", "attemptedAt", "completedAt", "apiWrite", "observation", "comparison", "classification", "executionProvenance", "writeReady", "runtimeConfirmationVerified", "recordId"])
+            || result.version !== 1 || result.mode !== "disabled-supervised-lifecycle" || result.phase !== "restore-classification"
+            || result.executionProvenance !== "simulated-injected-transport" || result.writeReady !== false || result.runtimeConfirmationVerified !== false
+            || resultId !== ownershipFingerprint(resultBody) || result.intentRecordId !== intent.recordId || result.attemptRecordId !== attempt.recordId
+            || !validOwnershipTimestamp(result.attemptedAt) || !validOwnershipTimestamp(result.completedAt)
+            || Date.parse(result.attemptedAt) < Date.parse(attempt.attemptedAt) || Date.parse(result.completedAt) < Date.parse(result.attemptedAt)
+            || !currentTime(approval.approvedAt, result.attemptedAt, APPROVAL_TTL_MS)
+            || !currentTime(b.before.source.observedAt, result.attemptedAt, CAPTURE_TTL_MS)
+            || !currentTime(b.kraken.lastSuccessfulUpdate!, result.attemptedAt, EVIDENCE_TTL_MS)
+            || !currentTime(b.kraken.importTariff!.observedAt, result.attemptedAt, EVIDENCE_TTL_MS)
+            || Date.parse(result.attemptedAt) + MIN_WRITE_REMAINING_MS >= Date.parse(b.expiresAt)
+            || !sameKeys(write, ["status", "httpStatus"]) || !["accepted", "rejected", "unknown"].includes(write.status)
+            || !(write.httpStatus === null || Number.isInteger(write.httpStatus) && write.httpStatus >= 100 && write.httpStatus <= 599)
+            || write.status === "accepted" && !(write.httpStatus! >= 200 && write.httpStatus! < 300)
+            || observation && (!validateTeslaInspectionEvidence(observation) || observation.source.kind !== "tesla-site-info" || observation.source.energySiteId !== b.site
+                || observation.source.timeZone !== b.before.source.timeZone || !currentTime(observation.source.observedAt, result.completedAt, CAPTURE_TTL_MS))) return false;
+        const compared = compareObservedTariffReadBack({ intended: initial.review.before, readBack: observation, after: result.attemptedAt, dates: [initial.review.date] });
+        return representationKey(compared) === representationKey(result.comparison)
+            && result.classification === classifyExperimentResult(write, initial.review.before, observation, compared);
     } catch { return false; }
 }

@@ -7,6 +7,7 @@ import path from 'node:path';
 import vm from 'node:vm';
 import ts from 'typescript';
 import * as crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 const modules=new Map();
 function load(file){file=path.resolve(file);if(modules.has(file))return modules.get(file);const exports={};modules.set(file,exports);
  vm.runInNewContext(ts.transpileModule(fs.readFileSync(file,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,
@@ -264,6 +265,11 @@ async function reconciledCliHarness(t,fault){
      await target.sync();if(fault==='continuation-slow-sync')x.ports.now=()=> '2026-10-27T12:01:01Z';
     };const v=target[k];return typeof v==='function'?v.bind(target):v;}});
    }
+   if(file.endsWith('.restore.execution')&&flags==='wx'&&fault==='restore-marker-crash')return new Proxy(handle,{get(target,k){if(k==='writeFile')return async()=>{throw Error('RESTORE_MARKER_CRASH');};const v=target[k];return typeof v==='function'?v.bind(target):v;}});
+   if(flags==='a'&&['restore-intent-crash','restore-attempt-crash','restore-result-crash'].includes(fault)){
+    const number=++continuationAppends;const target={ 'restore-intent-crash':4,'restore-attempt-crash':5,'restore-result-crash':6 }[fault];
+    if(number===target)return new Proxy(handle,{get(target,k){if(k==='sync')return async()=>{throw Error('RESTORE_JOURNAL_CRASH');};const v=target[k];return typeof v==='function'?v.bind(target):v;}});
+   }
    if(file.endsWith('.execution')&&flags==='wx'&&fault==='integrated-marker-crash')return new Proxy(handle,{get(target,k){if(k==='writeFile')return async()=>{throw Error('SIMULATED_MARKER_CRASH');};const v=target[k];return typeof v==='function'?v.bind(target):v;}});
    if(flags==='a'&&['integrated-attempt-crash','integrated-result-crash'].includes(fault)){
     const number=++continuationAppends;
@@ -314,7 +320,8 @@ async function reconciledCliHarness(t,fault){
  const exports=evaluatePrivateRealm();
  return {x,calls,config:{mode:'offline',directory,durableRoot:root,site:'12345'},historical,
   compose:()=>exports.testComposeReconciled(x.initial,x.config,'integrated-simulation',x.ports),
-  restartAttempt:adapter=>evaluatePrivateRealm().testPrivateAttemptProducer(x.initial,x.config,()=>x.ports.now(),adapter),
+  restartAttempt:(adapter,kind='apply')=>evaluatePrivateRealm().testPrivateAttemptProducer(x.initial,x.config,()=>x.ports.now(),adapter,kind),
+  restartCompose:()=>evaluatePrivateRealm().testComposeReconciled(x.initial,x.config,'recovered',x.ports),
   createPrivate:()=>exports.testPrivateContinuation(x.initial,x.config,x.ports),
   createAttempt:adapter=>exports.testPrivateAttemptProducer(x.initial,x.config,()=>x.ports.now(),adapter),
   run:(extra=[])=>exports.runLocalExperiment(['--site','12345','--vehicle','fixture-ev','--dispatch-start',x.f.selection.dispatchStart,'--prepare-reconciled','--experiment-id','cli-independent',...extra])};
@@ -636,7 +643,7 @@ function privateApplyReport(x, status = 'accepted') {
 }
 test('private production continuation records intent and unverified classification on the original claim without execution authority', async t => {
  const h = await privateContinuationFixture(t);
- assert.deepEqual(Object.keys(h.handle).sort(), ['recordApplyClassification', 'recordApplyIntent', 'runSimulatedApply']);
+ assert.deepEqual(Object.keys(h.handle).sort(), ['recordApplyClassification', 'recordApplyIntent', 'runSimulatedApply', 'runSimulatedRestore']);
  await h.handle.recordApplyIntent();
  let rows = (await io.readFile(h.file, 'utf8')).trim().split('\n').map(JSON.parse);
  assert.equal(rows.length, 2); assert.equal(rows[1].phase, 'apply-intent');
@@ -832,7 +839,7 @@ test('private attempt producer cannot invoke transport after intent durability u
  assert.equal(await io.readFile(h.marker, 'utf8'), h.markerBytes);
 });
 
-async function integratedApplyFixture(t, fault) {
+async function integratedApplyFixture(t, fault, approveRestoration) {
  const h = await reconciledCliHarness(t, fault), x = h.x;
  const context = await load('src/lib/tesla-tariff/prepared-mutation-context.ts').prepareMutationContext(x.f,
   { now: () => now, readOwnership: x.ports.readOwnership, newMutationId: () => x.initial.mutationId });
@@ -840,6 +847,7 @@ async function integratedApplyFixture(t, fault) {
   { capture: x.ports.capture, prepareContext: async () => context, journalRecords: linked,
    claim: async () => { throw Error('SECOND_SITE_CLAIM_FORBIDDEN'); }, write: async () => { throw Error('LIVE_WRITE_FORBIDDEN'); } });
  assert.equal(key(prepared.review), key(x.initial.review));
+ if (approveRestoration) x.ports.approveRestoration = approveRestoration;
  const composed = await h.compose(); noRuntimeAuthority(composed.admission);
  const file = path.join(x.config.directory, `site-12345-attempt-${x.initial.mutationId}.jsonl`);
  const marker = path.join(x.config.directory, 'site-12345-attempt.active'), markerBytes = await io.readFile(marker, 'utf8');
@@ -953,5 +961,145 @@ test('integrated apply revalidates freshness after the final asynchronous consum
  await assert.rejects(h.continuation.runSimulatedApply(h.adapter), /ATTEMPT_EVIDENCE_EXPIRED/);
  assert.deepEqual(h.events, []); await io.access(h.file + '.execution');
  await assert.rejects(h.restartAttempt(h.adapter));
+ assert.equal(await io.readFile(h.marker, 'utf8'), h.markerBytes);
+});
+
+async function integratedRestoreFixture(t, fault = 'valid', applyFault) {
+ let h;
+ const approve = async view => {
+  h.restoreApprovals.push(structuredClone(view)); h.x.ports.now = () => '2026-10-27T12:00:04Z';
+  const approval = { fingerprint: view.fingerprint, baselineKey: view.baselineKey, payloadKey: view.payloadKey,
+   approvedAt: '2026-10-27T12:00:04Z', acknowledgedBlockers: view.blockers, manualRecoveryAcknowledged: true };
+  if (fault === 'forged-approval') approval.fingerprint = hash('other experiment');
+  if (fault === 'stale-approval') approval.approvedAt = '2026-10-27T11:58:00Z';
+  if (fault === 'replayed-approval') return h.x.initial.exception.approval;
+  if (fault === 'approval-intervention') {
+   h.x.f.capture.before.tariff.name = 'External change'; h.x.f.capture.before.representations.v2.name = 'External change';
+   h.x.f.capture.before.representations.legacy.name = 'External change';
+  }
+  return approval;
+ };
+ h = await integratedApplyFixture(t, applyFault ?? fault, fault === 'missing-approval' ? undefined : approve);
+ h.restoreApprovals = [];
+ const applied = await h.continuation.runSimulatedApply(h.adapter);
+ if (applied.observation) h.x.f.capture.before = structuredClone(applied.observation);
+ h.x.f.capture.before.source.observedAt = '2026-10-27T12:00:03Z';
+ h.x.ports.now = () => '2026-10-27T12:00:03Z';
+ if (fault === 'external-change') {
+  h.x.f.capture.before.tariff.name = 'Flatpeak changed'; h.x.f.capture.before.representations.v2.name = 'Flatpeak changed';
+  h.x.f.capture.before.representations.legacy.name = 'Flatpeak changed';
+ }
+ if (fault === 'ownership-change') h.x.ports.readOwnership = async () => ({ status: 'unavailable' });
+ const events = [], original = structuredClone(h.x.initial.review.before);
+ const adapter = {
+  async post(site, payload) {
+   events.push('restore-post'); assert.equal(site, '12345');
+   assert.equal(payload, key({ tou_settings: { tariff_content_v2: original.tariff } }));
+   const rows = (await io.readFile(h.file, 'utf8')).trim().split('\n').map(JSON.parse);
+   assert.equal(rows.length, 6); assert.equal(rows[4].phase, 'restore-intent'); assert.equal(rows[5].phase, 'restore-attempt-consumed');
+   assert.equal(key(JSON.parse(await io.readFile(h.file + '.restore.execution', 'utf8'))), key(rows[5]));
+   if (fault === 'restore-timeout') throw Error('SIMULATED_RESTORE_TIMEOUT');
+   return { httpStatus: fault === 'restore-rejected' ? 400 : fault === 'restore-ambiguous' ? 503 : 200,
+    body: { response: { result: fault !== 'restore-rejected' } } };
+  },
+  async readBack() {
+   events.push('restore-readback'); h.x.ports.now = () => '2026-10-27T12:00:06Z';
+   if (fault === 'missing-readback') throw Error('SIMULATED_READ_FAILURE');
+   const v = structuredClone(original.representations.v2), l = structuredClone(original.representations.legacy);
+   if (fault === 'wrong-v2') v.name = 'Wrong import metadata';
+   if (fault === 'wrong-legacy') l.name = 'Wrong legacy';
+   if (fault === 'wrong-export') { v.sell_tariff.name = 'Wrong export'; l.sell_tariff.name = 'Wrong export'; }
+   return captureObservedTariff({ installation_time_zone: 'Europe/London', tariff_content_v2: v, tariff_content: l }, '12345', '2026-10-27T12:00:05Z');
+  },
+ };
+ return { ...h, original, restoreEvents: events, restoreAdapter: adapter };
+}
+test('integrated restore uses separate approval and the exact immutable dual original with no terminal authority', async t => {
+ const h = await integratedRestoreFixture(t), result = await h.continuation.runSimulatedRestore(h.restoreAdapter);
+ assert.equal(result.outcome, 'accepted-exact-readback'); assert.equal(result.productionConfirmation, false);
+ assert.deepEqual(h.restoreEvents, ['restore-post', 'restore-readback']); assert.equal(h.restoreApprovals.length, 1);
+ assert.equal(key(result.observation.representations), key(h.original.representations));
+ const rows = (await io.readFile(h.file, 'utf8')).trim().split('\n').map(JSON.parse);
+ assert.deepEqual(rows.slice(4).map(r => r.phase), ['restore-intent', 'restore-attempt-consumed', 'restore-classification']);
+ assert.notEqual(rows[2].attemptId, rows[5].attemptId);
+ assert.equal(journals.validReconciledLifecycleRecords(h.x.initial, hash(h.markerBytes), rows.slice(1), 'integrated-simulation'), true);
+ assert.equal(await io.readFile(h.marker, 'utf8'), h.markerBytes); assert.equal(await io.readFile(h.x.root, 'utf8'), h.x.priorBytes);
+ assert.equal(h.calls.posts + h.calls.gets, 0);
+ await assert.rejects(h.continuation.runSimulatedRestore(h.restoreAdapter), /RESTORE_NOT_LIVE/);
+ assert.equal((await journals.readOfflineReconciledExperiment(h.x.config)).status, 'blocked');
+});
+test('integrated restore rejects missing stale forged replayed approvals and external tariff changes', async t => {
+ for (const fault of ['missing-approval', 'stale-approval', 'forged-approval', 'replayed-approval', 'external-change', 'approval-intervention', 'ownership-change']) {
+  const h = await integratedRestoreFixture(t, fault);
+  await assert.rejects(h.continuation.runSimulatedRestore(h.restoreAdapter), undefined, fault);
+  assert.deepEqual(h.restoreEvents, []); await assert.rejects(io.access(h.file + '.restore.execution'), { code: 'ENOENT' });
+  await assert.rejects(h.continuation.runSimulatedRestore(h.restoreAdapter), /RESTORE_NOT_LIVE/);
+ }
+});
+test('integrated restore is unavailable after ambiguous rejected or mismatched apply and excludes concurrent restoration', async t => {
+ for (const fault of ['timeout', 'rejected', 'mismatch']) {
+  const h = await integratedRestoreFixture(t, 'valid', fault);
+  await assert.rejects(h.continuation.runSimulatedRestore(h.restoreAdapter), /RESTORE_NOT_LIVE/);
+  assert.equal(h.restoreApprovals.length, 0); assert.deepEqual(h.restoreEvents, []);
+ }
+ const h = await integratedRestoreFixture(t);
+ const outcomes = await Promise.allSettled([h.continuation.runSimulatedRestore(h.restoreAdapter), h.continuation.runSimulatedRestore(h.restoreAdapter)]);
+ assert.equal(outcomes.filter(r => r.status === 'fulfilled').length, 1); assert.deepEqual(h.restoreEvents, ['restore-post', 'restore-readback']);
+});
+test('integrated restore records wrong original metadata legacy export and uncertain responses without production confirmation', async t => {
+ for (const fault of ['wrong-v2', 'wrong-legacy', 'wrong-export', 'restore-timeout', 'restore-rejected', 'restore-ambiguous', 'missing-readback']) {
+  const h = await integratedRestoreFixture(t, fault), result = await h.continuation.runSimulatedRestore(h.restoreAdapter);
+  assert.notEqual(result.outcome, 'accepted-exact-readback', fault); assert.equal(result.productionConfirmation, false);
+  const rows = (await io.readFile(h.file, 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.equal(rows.at(-1).phase, 'restore-classification'); assert.equal(rows.at(-1).runtimeConfirmationVerified, false);
+  await assert.rejects(h.restartAttempt(h.restoreAdapter, 'restore'));
+ }
+});
+test('integrated restore preserves blocking through interrupted intent consumption and classification across fresh runtimes', async t => {
+ for (const fault of ['restore-intent-crash', 'restore-marker-crash', 'restore-attempt-crash', 'restore-result-crash']) {
+  const h = await integratedRestoreFixture(t, fault);
+  await assert.rejects(h.continuation.runSimulatedRestore(h.restoreAdapter));
+  const posts = fault === 'restore-result-crash' ? 1 : 0; assert.equal(h.restoreEvents.filter(x => x === 'restore-post').length, posts);
+  await assert.rejects(h.restartCompose(), /ATTEMPT_IN_PROGRESS|INDEPENDENT_EVIDENCE_INVALID/);
+  assert.equal((await journals.repeatAttemptEligibility(h.x.config.directory, '12345', { status: 'missing' })).code, 'ATTEMPT_IN_PROGRESS');
+  if (fault !== 'restore-intent-crash') {
+   const fresh = await Promise.allSettled([h.restartAttempt(h.restoreAdapter, 'restore')]);
+   if (fresh[0].status === 'fulfilled') await assert.rejects(fresh[0].value.run(), /EEXIST|ATTEMPT_/);
+   else assert.match(String(fresh[0].reason), /ATTEMPT_INTENT_INVALID/);
+  }
+  assert.equal(h.restoreEvents.filter(x => x === 'restore-post').length, posts);
+  assert.equal(await io.readFile(h.marker, 'utf8'), h.markerBytes);
+ }
+});
+test('integrated restore rejects rehashed forged original ownership approval and readback evidence', async t => {
+ const h = await integratedRestoreFixture(t); await h.continuation.runSimulatedRestore(h.restoreAdapter);
+ const records = (await io.readFile(h.file, 'utf8')).trim().split('\n').map(JSON.parse).slice(1);
+ for (const mutate of [r => { r[3].binding.originalObservationKey = hash('other'); }, r => { r[3].binding.ownershipKey = hash('other'); },
+  r => { r[3].approval.fingerprint = hash('other'); }, r => { r[4].binding.payloadKey = hash('{}'); },
+  r => { r[5].observation.representations.legacy.sell_tariff.name = 'forged'; }, r => { r[5].runtimeConfirmationVerified = true; }]) {
+  const changed = structuredClone(records); mutate(changed);
+  const approvalTampered = changed[3].approval.fingerprint !== records[3].approval.fingerprint;
+  if (!approvalTampered) changed[3].approval.fingerprint = hash(changed[3].binding);
+  const rehash = r => { const { recordId: _id, ...body } = r; void _id; r.recordId = hash(body); };
+  rehash(changed[3]);
+  changed[4].binding.intentRecordId = changed[3].recordId;
+  changed[4].binding.originalObservationKey = changed[3].binding.originalObservationKey;
+  changed[4].binding.ownershipKey = changed[3].binding.ownershipKey;
+  rehash(changed[4]); changed[5].intentRecordId = changed[3].recordId; changed[5].attemptRecordId = changed[4].recordId; rehash(changed[5]);
+  assert.equal(journals.validReconciledLifecycleRecords(h.x.initial, hash(h.markerBytes), changed, 'integrated-simulation'), false);
+ }
+});
+test('integrated restore remains blocking in a separate process with no surviving private runtime guards', async t => {
+ const h = await integratedRestoreFixture(t); await h.continuation.runSimulatedRestore(h.restoreAdapter);
+ const script = `import fs from 'node:fs'; import * as io from 'node:fs/promises'; import path from 'node:path';
+ import vm from 'node:vm'; import ts from 'typescript'; import * as crypto from 'node:crypto';
+ const modules=new Map();const load=${load.toString()};
+ const journals=load('src/lib/tesla-tariff/repeat-attempt-journal.ts');
+ const state=await journals.readOfflineReconciledExperiment(JSON.parse(process.argv[1]));
+ if(state.status!=='blocked'||state.grantsAdmissionAuthority!==false)process.exit(2);
+ try{await io.open(process.argv[2],'wx');process.exit(3);}catch(e){if(e.code!=='EEXIST')throw e;}
+ console.log('BLOCKED_NO_AUTHORITY');`;
+ const child = spawnSync(process.execPath, ['--input-type=module', '-e', script, JSON.stringify(h.x.config), h.file + '.restore.execution'], { encoding: 'utf8' });
+ assert.equal(child.status, 0, child.stderr); assert.equal(child.stdout.trim(), 'BLOCKED_NO_AUTHORITY');
  assert.equal(await io.readFile(h.marker, 'utf8'), h.markerBytes);
 });

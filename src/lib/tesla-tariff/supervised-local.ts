@@ -14,10 +14,11 @@ import * as journalRecords from "./linked-experiment-records";
 import { prepareMutationContext, type PreparedMutationContext } from "./prepared-mutation-context";
 import { ownershipStore } from "./ownership-store";
 import { persistConfirmedSmart } from "./ownership-sqlite";
-import { admitOfflineReconciledExperiment, readOfflineReconciledExperiment, validReconciledApplyRecords, type ReconciledApplyIntent, type ReconciledApplyClassification, type ReconciledAttemptConsumption, type OfflineReconciliationPorts, type OfflineExperimentBinding } from "./repeat-attempt-journal";
+import { admitOfflineReconciledExperiment, readOfflineReconciledExperiment, validReconciledApplyRecords, validReconciledLifecycleRecords, type ReconciledRestoreIntent, type ReconciledRestoreAttempt, type ReconciledRestoreClassification, type ReconciledApplyIntent, type ReconciledApplyClassification, type ReconciledAttemptConsumption, type OfflineReconciliationPorts, type OfflineExperimentBinding } from "./repeat-attempt-journal";
 import { ownershipFingerprint } from "./ownership-transition";
 import { approveTariffProposal } from "./proposal-approval";
-import { compareObservedTariffReadBack } from "./restoration-review";
+import type { RehearsalApproval } from "./smart-lifecycle-rehearsal";
+import { reviewObservedRestoration, compareObservedTariffReadBack } from "./restoration-review";
 import { validateTeslaInspectionEvidence } from "./smart-inspection";
 import { claimExperimentJournal } from "./supervised-journal";
 import { runSupervisedExperiment, interpretWriteResponse, StaleApprovalOrEvidenceError, validateCurrentSupervisedCapture, prepareSupervisedExperiment, classifyExperimentResult, CAPTURE_TTL_MS, EVIDENCE_TTL_MS, APPROVAL_TTL_MS, MIN_WRITE_REMAINING_MS, type ExperimentPorts } from "./supervised-experiment";
@@ -74,13 +75,17 @@ const continuationClaims = new Set<string>();
 const continuationClaimed = continuationClaims.has.bind(continuationClaims);
 const rememberContinuation = continuationClaims.add.bind(continuationClaims);
 
+type RestoreApprovalPort = { approveRestoration?: (review: {
+    binding: ReconciledRestoreIntent["binding"]; fingerprint: string; baselineKey: string; payloadKey: string; blockers: string[];
+}) => Promise<RehearsalApproval> };
+
 /** PRIVATE journal-only continuation. The closed CLI is its only production
  * caller. No transport, receipt, ownership writer or recovery constructor exists.
  * Its lexical identity is lost when preparation returns; persisted documents
  * cannot resume it. Reports remain explicitly unverified even when exact. */
 async function createReconciledApplyContinuation(initialRecord: journalRecords.LinkedInitialRecord,
     config: Parameters<typeof readOfflineReconciledExperiment>[0],
-    ports: Pick<ExperimentPorts, "now" | "capture"> & { readOwnership: ReturnType<typeof ownershipStore>["read"] }) {
+    ports: Pick<ExperimentPorts, "now" | "capture"> & RestoreApprovalPort & { readOwnership: ReturnType<typeof ownershipStore>["read"] }) {
     config = structuredClone(config);
     const claimKey = path.resolve(config.directory, `site-${config.site}-attempt-${initialRecord.mutationId}.jsonl`);
     if (continuationClaimed(claimKey)) throw Error("CONTINUATION_ALREADY_CREATED");
@@ -95,13 +100,17 @@ async function createReconciledApplyContinuation(initialRecord: journalRecords.L
     if (await readFile(file, "utf8") !== expectedText || marker.binding.initialRecordId !== initial.initialRecordId
         || marker.binding.mutationId !== initial.mutationId || marker.binding.site !== config.site)
         throw Error("CONTINUATION_BINDING_INVALID");
-    const records: (ReconciledApplyIntent | ReconciledAttemptConsumption | ReconciledApplyClassification)[] = [];
-    let state: "ready" | "intent-pending" | "intent" | "result-pending" | "attempt-pending" | "consumed" = "ready";
+    const records: (ReconciledApplyIntent | ReconciledAttemptConsumption | ReconciledApplyClassification | ReconciledRestoreIntent | ReconciledRestoreAttempt | ReconciledRestoreClassification)[] = [];
+    let state: "ready" | "intent-pending" | "intent" | "result-pending" | "attempt-pending" | "applied" | "restore-pending" | "consumed" = "ready";
+    let applied: ReconciledApplyClassification | null = null;
     const unchanged = async () => {
         if (await readFile(markerFile, "utf8") !== markerText || await readFile(file, "utf8") !== expectedText)
             throw Error("CONTINUATION_JOURNAL_CHANGED");
         const consumed = records.find(r => r.phase === "attempt-consumed");
         if (consumed && await readFile(file + ".execution", "utf8") !== JSON.stringify(consumed) + "\n")
+            throw Error("CONTINUATION_ATTEMPT_CHANGED");
+        const restored = records.find(r => r.phase === "restore-attempt-consumed");
+        if (restored && await readFile(file + ".restore.execution", "utf8") !== JSON.stringify(restored) + "\n")
             throw Error("CONTINUATION_ATTEMPT_CHANGED");
         for (const prior of marker.prior) {
             if (path.basename(prior.name) !== prior.name || ownershipFingerprint(await readFile(path.join(config.directory, prior.name), "utf8")) !== prior.digest)
@@ -120,10 +129,10 @@ async function createReconciledApplyContinuation(initialRecord: journalRecords.L
             || Date.parse(at) + MIN_WRITE_REMAINING_MS >= Date.parse(initial.review.proposal.bound.expiresAt))
             throw Error("CONTINUATION_EVIDENCE_EXPIRED");
     };
-    const append = async (record: ReconciledApplyIntent | ReconciledApplyClassification) => {
+    const append = async (record: ReconciledApplyIntent | ReconciledApplyClassification | ReconciledRestoreIntent | ReconciledRestoreClassification) => {
         await unchanged();
         const next = [...records, record];
-        if (!validReconciledApplyRecords(initial, ownershipFingerprint(markerText), next, marker.binding.experimentId)) throw Error("CONTINUATION_RECORD_INVALID");
+        if (!validReconciledLifecycleRecords(initial, ownershipFingerprint(markerText), next, marker.binding.experimentId)) throw Error("CONTINUATION_RECORD_INVALID");
         const handle = await open(file, "a");
         try { await handle.writeFile(JSON.stringify(record) + "\n", "utf8"); await handle.sync(); }
         finally { await handle.close(); }
@@ -180,8 +189,59 @@ async function createReconciledApplyContinuation(initialRecord: journalRecords.L
             const body = { version: 1 as const, mode: "disabled-supervised-lifecycle" as const, phase: "apply-classification" as const,
                 intentRecordId: records[0].recordId, attemptRecordId: attempt.recordId, classified,
                 executionProvenance: "simulated-injected-transport" as const, writeReady: false as const, runtimeConfirmationVerified: false as const };
-            await append({ ...body, recordId: ownershipFingerprint(body) }); state = "consumed";
+            const recorded = { ...body, recordId: ownershipFingerprint(body) };
+            await append(recorded);
+            applied = recorded;
+            state = result.outcome === "accepted-exact-readback" ? "applied" : "consumed";
             return result;
+        },
+        async runSimulatedRestore(adapter: SimulatedAttemptAdapter) {
+            if (this !== continuation || state !== "applied" || !applied) throw Error("RESTORE_NOT_LIVE");
+            state = "restore-pending"; // failed approval or interrupted I/O never retries
+            if (!ports.approveRestoration) throw Error("RESTORE_APPROVAL_REQUIRED");
+            const capture = validateCurrentSupervisedCapture(currentSite, await ports.capture(), ports.now());
+            const ownership = initial.preparedContext.ownership;
+            const expectedOwnership = ownership.status === "missing" ? { status: "missing" } : { status: "available", snapshot: ownership.snapshot };
+            const matches = (current: typeof capture) => journalKey(current.before.tariff) === journalKey(applied!.classified.apiTariffReadBack.observation!.tariff)
+                && journalKey(current.before.representations ?? null) === journalKey(applied!.classified.apiTariffReadBack.observation!.representations ?? null);
+            if (!matches(capture) || journalKey(await ports.readOwnership(config.site)) !== journalKey(expectedOwnership)) throw Error("RESTORE_CURRENT_STATE_CHANGED");
+            const preparedAt = ports.now();
+            const review = reviewObservedRestoration({ before: initial.review.before, temporaryProposal: initial.review.proposal,
+                asOf: preparedAt, maxCaptureAgeMs: CAPTURE_TTL_MS });
+            if (!review.structurallyComplete || !review.boundToProposal) throw Error("RESTORE_BASELINE_INVALID");
+            const binding: ReconciledRestoreIntent["binding"] = { experimentId: marker.binding.experimentId, mutationId: initial.mutationId,
+                site: config.site, initialRecordId: initial.initialRecordId, admissionKey: ownershipFingerprint(markerText),
+                applyRecordId: applied.recordId, ownershipKey: ownershipFingerprint(ownership), originalObservationKey: ownershipFingerprint(initial.review.before),
+                before: structuredClone(capture.before), kraken: structuredClone(capture.kraken), payloadJson: journalKey(review.documentedEnvelopeCandidate),
+                challengeId: randomUUID(), preparedAt, expiresAt: new Date(Date.parse(preparedAt) + APPROVAL_TTL_MS).toISOString() };
+            const approval = structuredClone(await ports.approveRestoration({ binding: structuredClone(binding), fingerprint: ownershipFingerprint(binding),
+                baselineKey: ownershipFingerprint(binding.before.tariff), payloadKey: ownershipFingerprint(binding.payloadJson), blockers: [...review.blockers] }));
+            const checked = validateCurrentSupervisedCapture(currentSite, await ports.capture(), ports.now());
+            if (!matches(checked) || journalKey(checked.kraken) !== journalKey(capture.kraken)
+                || journalKey(await ports.readOwnership(config.site)) !== journalKey(expectedOwnership)) throw Error("RESTORE_CURRENT_STATE_CHANGED");
+            const body = { version: 1 as const, mode: "disabled-supervised-lifecycle" as const, phase: "restore-intent" as const,
+                binding, approval, writeReady: false as const, runtimeConfirmationVerified: false as const };
+            const intent: ReconciledRestoreIntent = { ...body, recordId: ownershipFingerprint(body) };
+            const at = ports.now();
+            if (!fresh(approval.approvedAt, at, APPROVAL_TTL_MS) || !fresh(binding.before.source.observedAt, at, CAPTURE_TTL_MS)
+                || !fresh(binding.kraken.lastSuccessfulUpdate!, at, EVIDENCE_TTL_MS)
+                || Date.parse(at) + MIN_WRITE_REMAINING_MS >= Date.parse(binding.expiresAt)) throw Error("RESTORE_APPROVAL_EXPIRED");
+            await append(intent);
+            const producer = await createPrivateAttemptProducer(initial, config, () => ports.now(), adapter, "restore");
+            const result = await producer.run();
+            if (result.provenance !== "simulated-injected-transport" || !result.completedAt) throw Error("ATTEMPT_RESULT_INCOMPLETE");
+            const text = await readFile(file, "utf8"), parts = text.trimEnd().split("\n");
+            const attempt = JSON.parse(parts[5]) as ReconciledRestoreAttempt;
+            if (parts.length !== 6 || text !== expectedText + JSON.stringify(attempt) + "\n" || attempt.attemptId !== result.attemptId
+                || attempt.recordId !== result.attemptRecordId || !validReconciledLifecycleRecords(initial, ownershipFingerprint(markerText), [...records, attempt], marker.binding.experimentId))
+                throw Error("RESTORE_ATTEMPT_BINDING_INVALID");
+            expectedText = text; records.push(attempt);
+            const classified = { version: 1 as const, mode: "disabled-supervised-lifecycle" as const, phase: "restore-classification" as const,
+                intentRecordId: intent.recordId, attemptRecordId: attempt.recordId, attemptedAt: result.attemptedAt, completedAt: result.completedAt,
+                apiWrite: result.apiWrite, observation: result.observation, comparison: result.comparison, classification: result.classification,
+                executionProvenance: "simulated-injected-transport" as const, writeReady: false as const, runtimeConfirmationVerified: false as const };
+            await append({ ...classified, recordId: ownershipFingerprint(classified) }); state = "consumed";
+            return result; // Exact simulation is NOT terminal production retirement.
         },
         async recordApplyClassification(report: journalRecords.LinkedClassifiedRecord) {
             if (this !== continuation || state !== "intent") throw Error("CONTINUATION_NOT_LIVE");
@@ -213,24 +273,28 @@ const rememberAttempt = attemptedIntents.add.bind(attemptedIntents);
  * No transport means no execution, journal completion, or confirmation authority.
  */
 async function createPrivateAttemptProducer(initialRecord: journalRecords.LinkedInitialRecord,
-    config: Parameters<typeof readOfflineReconciledExperiment>[0], now: () => string, adapter?: SimulatedAttemptAdapter) {
+    config: Parameters<typeof readOfflineReconciledExperiment>[0], now: () => string, adapter?: SimulatedAttemptAdapter, kind: "apply" | "restore" = "apply") {
     config = structuredClone(config);
     const initial = structuredClone(initialRecord);
     const site = config.site, file = path.join(config.directory, `site-${site}-attempt-${initial.mutationId}.jsonl`);
     const markerFile = path.join(config.directory, `site-${site}-attempt.active`);
     const markerText = await readFile(markerFile, "utf8"), marker = JSON.parse(markerText);
     const text = await readFile(file, "utf8"), rows = text.trimEnd().split("\n").map(line => JSON.parse(line));
-    const intent = rows[1] as ReconciledApplyIntent;
+    if (!["apply", "restore"].includes(kind) || kind === "restore" && rows[4]?.phase !== "restore-intent") throw Error("ATTEMPT_INTENT_INVALID");
+    const restore = kind === "restore" ? rows[4] as ReconciledRestoreIntent : null;
+    const intent = restore ?? rows[1] as ReconciledApplyIntent;
+    const payloadJson = restore ? restore.binding.payloadJson : initial.review.payloadJson;
+    const validate = (chain: unknown[]) => validReconciledLifecycleRecords(initial, ownershipFingerprint(markerText), chain, marker.binding.experimentId);
     const { checksum, ...markerBody } = marker;
-    if (rows.length !== 2 || journalKey(rows[0]) !== journalKey(initial)
-        || !validReconciledApplyRecords(initial, ownershipFingerprint(markerText), [intent])
+    if (rows.length !== (restore ? 5 : 2) || journalKey(rows[0]) !== journalKey(initial)
+        || !validate(rows.slice(1))
         || marker.version !== 3 || marker.mode !== "offline-reconciled-experiment"
         || checksum !== ownershipFingerprint(markerBody) || marker.binding.site !== site
         || marker.binding.initialRecordId !== initial.initialRecordId || marker.binding.mutationId !== initial.mutationId)
         throw Error("ATTEMPT_INTENT_INVALID");
     const binding = Object.freeze({ site, mutationId: initial.mutationId, experimentId: marker.binding.experimentId,
-        initialRecordId: initial.initialRecordId, intentRecordId: intent.recordId, admissionKey: intent.admissionKey,
-        payloadKey: ownershipFingerprint(initial.review.payloadJson), ownershipKey: ownershipFingerprint(initial.preparedContext.ownership),
+        initialRecordId: initial.initialRecordId, intentRecordId: intent.recordId, admissionKey: ownershipFingerprint(markerText),
+        payloadKey: ownershipFingerprint(payloadJson), ownershipKey: ownershipFingerprint(initial.preparedContext.ownership),
         originalObservationKey: ownershipFingerprint(initial.review.before) });
     // Capture methods once. Replacing an adapter after construction cannot change
     // the transport paired with this attempt. No results/flags are accepted by run.
@@ -261,7 +325,16 @@ async function createPrivateAttemptProducer(initialRecord: journalRecords.Linked
         try { await parent.sync(); } finally { await parent.close(); }
         const assertFresh = (at: string) => {
             const age = (capturedAt: string) => Date.parse(at) - Date.parse(capturedAt);
-            if (!Number.isFinite(Date.parse(at)) || Date.parse(at) < Date.parse(intent.attemptedAt)
+            if (restore) {
+                if (!Number.isFinite(Date.parse(at)) || Date.parse(at) < Date.parse(restore.binding.preparedAt)
+                    || age(restore.approval.approvedAt) < 0 || age(restore.approval.approvedAt) > APPROVAL_TTL_MS
+                    || age(restore.binding.before.source.observedAt) < 0 || age(restore.binding.before.source.observedAt) > CAPTURE_TTL_MS
+                    || age(restore.binding.kraken.lastSuccessfulUpdate!) < 0 || age(restore.binding.kraken.lastSuccessfulUpdate!) > EVIDENCE_TTL_MS
+                    || age(restore.binding.kraken.importTariff!.observedAt) < 0 || age(restore.binding.kraken.importTariff!.observedAt) > EVIDENCE_TTL_MS
+                    || Date.parse(at) + MIN_WRITE_REMAINING_MS >= Date.parse(restore.binding.expiresAt)) throw Error("ATTEMPT_EVIDENCE_EXPIRED");
+                return;
+            }
+            if (!Number.isFinite(Date.parse(at)) || Date.parse(at) < Date.parse((intent as ReconciledApplyIntent).attemptedAt)
                 || age(initial.exception.approvedAt) < 0 || age(initial.exception.approvedAt) > APPROVAL_TTL_MS
                 || age(initial.review.before.source.observedAt) < 0 || age(initial.review.before.source.observedAt) > CAPTURE_TTL_MS
                 || age(initial.preWriteRecheck.krakenObservedAt) < 0 || age(initial.preWriteRecheck.krakenObservedAt) > EVIDENCE_TTL_MS
@@ -273,15 +346,15 @@ async function createPrivateAttemptProducer(initialRecord: journalRecords.Linked
         if (await readFile(markerFile, "utf8") !== markerText || await readFile(file, "utf8") !== text)
             throw Error("ATTEMPT_JOURNAL_CHANGED");
         const attemptId = randomUUID();
-        const attemptBody = { version: 1 as const, mode: "disabled-supervised-lifecycle" as const, phase: "attempt-consumed" as const,
+        const attemptBody = { version: 1 as const, mode: "disabled-supervised-lifecycle" as const, phase: restore ? "restore-attempt-consumed" as const : "attempt-consumed" as const,
             attemptId, attemptedAt, binding, provenance: "simulated-injected-transport" as const,
             writeReady: false as const, runtimeConfirmationVerified: false as const };
-        const attempt: ReconciledAttemptConsumption = { ...attemptBody, recordId: ownershipFingerprint(attemptBody) };
-        if (!validReconciledApplyRecords(initial, intent.admissionKey, [intent, attempt], marker.binding.experimentId)) throw Error("ATTEMPT_RECORD_INVALID");
+        const attempt: ReconciledAttemptConsumption | ReconciledRestoreAttempt = { ...attemptBody, recordId: ownershipFingerprint(attemptBody) };
+        if (!validate([...rows.slice(1), attempt])) throw Error("ATTEMPT_RECORD_INVALID");
         // Subordinate permanent consumption marker for this operation, NOT another
         // site admission. wx gives cross-process exclusion, including empty or
         // partially written markers after a crash. Never removed or reopened.
-        const consumedFile = file + ".execution";
+        const consumedFile = file + (restore ? ".restore.execution" : ".execution");
         const consumed = await open(consumedFile, "wx", 0o600);
         try { await consumed.writeFile(JSON.stringify(attempt) + "\n", "utf8"); await consumed.sync(); }
         finally { await consumed.close(); }
@@ -301,7 +374,7 @@ async function createPrivateAttemptProducer(initialRecord: journalRecords.Linked
         if (Date.parse(dispatchedAt) < Date.parse(readyAt)) throw Error("ATTEMPT_EVIDENCE_EXPIRED");
         let apiWrite: ReturnType<typeof interpretWriteResponse> = { status: "unknown", httpStatus: null };
         try {
-            const response = await post(site, initial.review.payloadJson);
+            const response = await post(site, payloadJson);
             if (Number.isInteger(response.httpStatus) && response.httpStatus >= 100 && response.httpStatus <= 599)
                 apiWrite = interpretWriteResponse(response.httpStatus, response.body);
         } catch { /* Invocation may have mutated state; never retry or infer acceptance from GET. */ }
@@ -317,7 +390,7 @@ async function createPrivateAttemptProducer(initialRecord: journalRecords.Linked
             || !Number.isFinite(Date.parse(completedAt)) || Date.parse(completedAt) < Date.parse(dispatchedAt)
             || Date.parse(observation.source.observedAt) > Date.parse(completedAt)
             || Date.parse(completedAt) - Date.parse(observation.source.observedAt) > CAPTURE_TTL_MS)) observation = null;
-        const intended = simulatedTariffObservation(initial.review.before, initial.review.proposal.bound.representation);
+        const intended = restore ? initial.review.before : simulatedTariffObservation(initial.review.before, initial.review.proposal.bound.representation);
         const comparison = compareObservedTariffReadBack({ intended, readBack: observation, after: dispatchedAt, dates: [initial.review.date] });
         const classification = classifyExperimentResult(apiWrite, intended, observation, comparison);
         const outcome = apiWrite.status === "unknown" ? "write-outcome-unknown" : apiWrite.status === "rejected" ? "write-rejected"
@@ -331,10 +404,10 @@ async function createPrivateAttemptProducer(initialRecord: journalRecords.Linked
 /** Closed composition connection; callers retain live closures only. No record
  * recovery, JSON approval loading or public execution entry point is provided. */
 async function admitReconciledContinuation(initial: journalRecords.LinkedInitialRecord,
-    config: Parameters<typeof readOfflineReconciledExperiment>[0], experimentId: string, ports: OfflineReconciliationPorts) {
+    config: Parameters<typeof readOfflineReconciledExperiment>[0], experimentId: string, ports: OfflineReconciliationPorts & RestoreApprovalPort) {
     const admission = await admitOfflineReconciledExperiment(config, experimentId, initial, ports);
     const continuation = await createReconciledApplyContinuation(initial, config, { now: () => ports.now(),
-        capture: () => ports.capture(config.site), readOwnership: site => ports.readOwnership(site) });
+        capture: () => ports.capture(config.site), readOwnership: site => ports.readOwnership(site), approveRestoration: ports.approveRestoration });
     return Object.freeze({ admission, continuation });
 }
 

@@ -266,3 +266,41 @@ journal prevent another transport invocation. Existing recovery deliberately
 rejects these extra records/artifacts; it never resumes execution. Restoration,
 authenticated transport origin, durable production confirmation, ownership
 disposition and terminal claim completion remain out of scope.
+
+## Integrated simulation-only restoration
+
+The same private continuation now has `runSimulatedRestore()`. It is available
+only after that live continuation has durably recorded an accepted, exact
+simulated apply. Unverified documentary reports, ambiguous/rejected apply results
+and reconstructed records cannot activate it. The CLI still discards the handle
+and supplies no restoration approval port; no execution argument or API is added.
+
+A separate approval uses the existing `RehearsalApproval` contract. Its fresh
+challenge fingerprint binds restore purpose, experiment/site/mutation, ownership,
+immutable original observation, confirmed simulated apply record, fresh current
+observation and exact original V2 payload. All existing restoration-review
+blockers must be acknowledged. Current tariff and ownership are rechecked after
+approval; an intervening Flatpeak/external change aborts. The historical original
+is never replaced with the current applied observation, and its historical
+capture time or ownership validity is never renewed. Approval freshness applies
+to the restore review/current observation, independently of the expired apply
+approval. This does not weaken production gates or establish inverse-write proof.
+
+The existing producer supports exactly apply and restore; it retains one transport
+invocation/readback loop. For restore it sends the lossless original candidate and
+compares against the complete original observation, requiring original legacy and
+export subtrees and metadata. The existing operation journal gains
+`restore-intent` → `restore-attempt-consumed` → `restore-classification`.
+A distinct permanent `.restore.execution` consumption marker is flushed before
+transport. It cannot reuse the apply attempt identity/marker. Empty markers and
+uncertain appends stay blocking across fresh runtimes and process restart.
+`validReconciledLifecycleRecords()` reuses the apply-prefix validator and existing
+restoration review/comparison/classification logic for strict documentary linkage.
+
+Wrong or incomplete readback and rejected/unknown responses are classified and
+retained, never retried automatically. Even exact restoration remains explicitly
+simulated, with production confirmation false. No terminal-completion record,
+receipt, ownership retirement/persistence, claim deletion or reopening is added.
+The original site claim remains permanently blocking. Authenticated execution,
+real V2/legacy inverse-write acceptance and terminal ownership disposition remain
+separately reviewed future work. September evidence is unchanged.
