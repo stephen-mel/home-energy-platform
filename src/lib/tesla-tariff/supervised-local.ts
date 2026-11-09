@@ -264,6 +264,90 @@ type SimulatedAttemptAdapter = {
     post(site: string, payload: string): Promise<{ httpStatus: number; body: unknown }>;
     readBack(site: string): Promise<ObservedTariff>;
 };
+type AuthenticatedAttemptAdapter = SimulatedAttemptAdapter & {
+    readonly authenticatedTransport: true;
+    readonly bindingKey: string;
+};
+// This capability has no export and no CLI/runtime caller. Increment 1 can prove
+// the closed transport connection without making a Fleet API POST reachable.
+const authenticatedTransportFoundation = Symbol("authenticated-tesla-tariff-transport-foundation");
+const TESLA_TARIFF_WRITE_TIMEOUT_MS = 5_000;
+
+/** Tesla's authenticated site_info envelope independently identifies the site in
+ * response.energy_site_id. The requested endpoint is not identity evidence. */
+function authenticatedTeslaSiteMatches(raw: unknown, approvedSite: string): boolean {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw) || !("response" in raw)) return false;
+    const response = (raw as { response?: unknown }).response;
+    if (!response || typeof response !== "object" || Array.isArray(response) || !("energy_site_id" in response)) return false;
+    const candidate = (response as { energy_site_id?: unknown }).energy_site_id;
+    const identity = typeof candidate === "string" && /^\d+$/.test(candidate) ? candidate
+        : typeof candidate === "number" && Number.isSafeInteger(candidate) && candidate >= 0 ? candidate.toString(10) : null;
+    return identity !== null && identity === approvedSite;
+}
+
+/** Private fixed-purpose Fleet API adapter. Read authentication is deliberately
+ * completed before this returns, so token/scope failures precede attempt
+ * consumption. The POST is one-shot and never refreshes or retries a mutation. */
+async function createAuthenticatedTeslaAttemptAdapter(site: string, payloadJson: string,
+    binding: object, now: () => string): Promise<AuthenticatedAttemptAdapter> {
+    if (!/^\d+$/.test(site) || ownershipFingerprint(payloadJson) !== (binding as { payloadKey?: unknown }).payloadKey)
+        throw Error("TESLA_TARIFF_TRANSPORT_BINDING_INVALID");
+    const [{ getTeslaSiteInfo }, { readTeslaTokens, tokenNeedsRefresh }, { inspectTeslaScopes }] = await Promise.all([
+        import("../tesla/client"), import("../tesla/tokens"), import("../tesla/inspect-scopes"),
+    ]);
+    // The authenticated GET owns coordinated refresh/retry. A write never does.
+    let preflight: ObservedTariff | null = null;
+    try {
+        const raw = await getTeslaSiteInfo(Number(site));
+        if (!authenticatedTeslaSiteMatches(raw, site)) throw Error();
+        preflight = validateTeslaInspectionEvidence(captureObservedTariff(raw, site, now()));
+    } catch { throw Error("TESLA_TARIFF_TOKEN_READINESS_FAILED"); }
+    if (!preflight || preflight.source.energySiteId !== site) throw Error("TESLA_TARIFF_TOKEN_READINESS_FAILED");
+    const tokens = await readTeslaTokens().catch(() => { throw Error("TESLA_TARIFF_TOKEN_READINESS_FAILED"); });
+    if (tokenNeedsRefresh(tokens)) throw Error("TESLA_TARIFF_TOKEN_READINESS_FAILED");
+    const scope = inspectTeslaScopes(tokens.access_token);
+    if (!scope.success || !scope.hasEnergyCommands) throw Error("TESLA_TARIFF_PERMISSION_REQUIRED");
+    const accessToken = tokens.access_token;
+    const expectedBindingKey = ownershipFingerprint(binding);
+    let posted = false;
+    return Object.freeze({
+        authenticatedTransport: true as const,
+        bindingKey: expectedBindingKey,
+        async post(requestSite: string, exactPayload: string) {
+            if (posted || requestSite !== site || exactPayload !== payloadJson
+                || ownershipFingerprint(binding) !== expectedBindingKey) throw Error("TESLA_TARIFF_TRANSPORT_BINDING_INVALID");
+            posted = true;
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), TESLA_TARIFF_WRITE_TIMEOUT_MS);
+            try {
+                const response = await fetch(`https://fleet-api.prd.eu.vn.cloud.tesla.com/api/1/energy_sites/${site}/time_of_use_settings`, {
+                    method: "POST", redirect: "error", cache: "no-store", signal: controller.signal,
+                    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" }, body: exactPayload,
+                });
+                let value: unknown = null;
+                try {
+                    const raw: unknown = await response.json();
+                    const result = raw && typeof raw === "object" && !Array.isArray(raw)
+                        && "response" in raw && raw.response && typeof raw.response === "object" && !Array.isArray(raw.response)
+                        && "result" in raw.response && typeof raw.response.result === "boolean" ? raw.response.result : undefined;
+                    if (result !== undefined) value = { response: { result } };
+                } catch { /* An undecodable acknowledgement remains ambiguous. */ }
+                return { httpStatus: response.status, body: value };
+            } catch { throw Error("TESLA_TARIFF_WRITE_UNAVAILABLE"); }
+            finally { clearTimeout(timer); controller.abort(); }
+        },
+        async readBack(requestSite: string) {
+            if (requestSite !== site) throw Error("TESLA_TARIFF_TRANSPORT_BINDING_INVALID");
+            try {
+                const raw = await getTeslaSiteInfo(Number(site));
+                if (!authenticatedTeslaSiteMatches(raw, site)) throw Error();
+                const observation = validateTeslaInspectionEvidence(captureObservedTariff(raw, site, now()));
+                if (!observation || observation.source.energySiteId !== site) throw Error();
+                return observation;
+            } catch { throw Error("TESLA_TARIFF_READBACK_UNAVAILABLE"); }
+        },
+    });
+}
 const attemptedIntents = new Set<string>();
 const intentAttempted = attemptedIntents.has.bind(attemptedIntents);
 const rememberAttempt = attemptedIntents.add.bind(attemptedIntents);
@@ -273,7 +357,8 @@ const rememberAttempt = attemptedIntents.add.bind(attemptedIntents);
  * No transport means no execution, journal completion, or confirmation authority.
  */
 async function createPrivateAttemptProducer(initialRecord: journalRecords.LinkedInitialRecord,
-    config: Parameters<typeof readOfflineReconciledExperiment>[0], now: () => string, adapter?: SimulatedAttemptAdapter, kind: "apply" | "restore" = "apply") {
+    config: Parameters<typeof readOfflineReconciledExperiment>[0], now: () => string,
+    adapter?: SimulatedAttemptAdapter | typeof authenticatedTransportFoundation, kind: "apply" | "restore" = "apply") {
     config = structuredClone(config);
     const initial = structuredClone(initialRecord);
     const site = config.site, file = path.join(config.directory, `site-${site}-attempt-${initial.mutationId}.jsonl`);
@@ -296,9 +381,14 @@ async function createPrivateAttemptProducer(initialRecord: journalRecords.Linked
         initialRecordId: initial.initialRecordId, intentRecordId: intent.recordId, admissionKey: ownershipFingerprint(markerText),
         payloadKey: ownershipFingerprint(payloadJson), ownershipKey: ownershipFingerprint(initial.preparedContext.ownership),
         originalObservationKey: ownershipFingerprint(initial.review.before) });
+    const authenticated = adapter === authenticatedTransportFoundation
+        ? await createAuthenticatedTeslaAttemptAdapter(site, payloadJson, binding, now) : null;
+    const selected = authenticated ?? adapter as SimulatedAttemptAdapter | undefined;
     // Capture methods once. Replacing an adapter after construction cannot change
     // the transport paired with this attempt. No results/flags are accepted by run.
-    const post = adapter?.post.bind(adapter), read = adapter?.readBack.bind(adapter);
+    const post = selected?.post.bind(selected), read = selected?.readBack.bind(selected);
+    const provenance = authenticated ? "authenticated-tesla-fleet-api" as const : "simulated-injected-transport" as const;
+    if (authenticated && authenticated.bindingKey !== ownershipFingerprint(binding)) throw Error("TESLA_TARIFF_TRANSPORT_BINDING_INVALID");
     let used = false;
     const freeze = <T>(value: T): T => {
         if (value && typeof value === "object") { Object.values(value).forEach(freeze); Object.freeze(value); }
@@ -347,7 +437,7 @@ async function createPrivateAttemptProducer(initialRecord: journalRecords.Linked
             throw Error("ATTEMPT_JOURNAL_CHANGED");
         const attemptId = randomUUID();
         const attemptBody = { version: 1 as const, mode: "disabled-supervised-lifecycle" as const, phase: restore ? "restore-attempt-consumed" as const : "attempt-consumed" as const,
-            attemptId, attemptedAt, binding, provenance: "simulated-injected-transport" as const,
+            attemptId, attemptedAt, binding, provenance,
             writeReady: false as const, runtimeConfirmationVerified: false as const };
         const attempt: ReconciledAttemptConsumption | ReconciledRestoreAttempt = { ...attemptBody, recordId: ownershipFingerprint(attemptBody) };
         if (!validate([...rows.slice(1), attempt])) throw Error("ATTEMPT_RECORD_INVALID");
@@ -395,7 +485,7 @@ async function createPrivateAttemptProducer(initialRecord: journalRecords.Linked
         const classification = classifyExperimentResult(apiWrite, intended, observation, comparison);
         const outcome = apiWrite.status === "unknown" ? "write-outcome-unknown" : apiWrite.status === "rejected" ? "write-rejected"
             : comparison.outcome === "exact-observed-match" && comparison.timelineScope.complete ? "accepted-exact-readback" : "accepted-readback-unverified";
-        return freeze({ ...denied, provenance: "simulated-injected-transport" as const, attemptId, attemptRecordId: attempt.recordId, binding,
+        return freeze({ ...denied, provenance, attemptId, attemptRecordId: attempt.recordId, binding,
             attemptedAt: dispatchedAt, completedAt, apiWrite, observation, comparison, classification: classification as journalRecords.LinkedClassifiedRecord["classification"], outcome });
     } });
     return producer;

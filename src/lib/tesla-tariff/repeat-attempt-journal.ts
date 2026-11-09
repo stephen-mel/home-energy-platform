@@ -778,14 +778,14 @@ export type ReconciledApplyIntent = {
 export type ReconciledApplyClassification = {
     version: 1; mode: "disabled-supervised-lifecycle"; phase: "apply-classification";
     intentRecordId: string; classified: LinkedClassifiedRecord;
-    executionProvenance: "unverified-report" | "simulated-injected-transport"; attemptRecordId?: string; writeReady: false; runtimeConfirmationVerified: false; recordId: string;
+    executionProvenance: "unverified-report" | "simulated-injected-transport" | "authenticated-tesla-fleet-api"; attemptRecordId?: string; writeReady: false; runtimeConfirmationVerified: false; recordId: string;
 };
 export type ReconciledAttemptConsumption = {
     version: 1; mode: "disabled-supervised-lifecycle"; phase: "attempt-consumed";
     attemptId: string; attemptedAt: string;
     binding: { site: string; mutationId: string; experimentId: string; initialRecordId: string; intentRecordId: string;
         admissionKey: string; payloadKey: string; ownershipKey: string; originalObservationKey: string };
-    provenance: "simulated-injected-transport"; writeReady: false; runtimeConfirmationVerified: false; recordId: string;
+    provenance: "simulated-injected-transport" | "authenticated-tesla-fleet-api"; writeReady: false; runtimeConfirmationVerified: false; recordId: string;
 };
 export function validReconciledApplyRecords(initial: LinkedInitialRecord, admissionKey: string, records: unknown[], experimentId?: string): boolean {
     try {
@@ -814,7 +814,8 @@ export function validReconciledApplyRecords(initial: LinkedInitialRecord, admiss
             if (!identifier(experimentId) || !validJournalEvidenceJson(attempt)
                 || !sameKeys(attempt, ["version", "mode", "phase", "attemptId", "attemptedAt", "binding", "provenance", "writeReady", "runtimeConfirmationVerified", "recordId"])
                 || attempt.version !== 1 || attempt.mode !== "disabled-supervised-lifecycle" || !identifier(attempt.attemptId)
-                || attempt.provenance !== "simulated-injected-transport" || attempt.writeReady !== false || attempt.runtimeConfirmationVerified !== false
+                || !["simulated-injected-transport", "authenticated-tesla-fleet-api"].includes(attempt.provenance)
+                || attempt.writeReady !== false || attempt.runtimeConfirmationVerified !== false
                 || attemptRecordId !== ownershipFingerprint(attemptBody) || ownershipFingerprint(attempt.binding) !== ownershipFingerprint(expected)
                 || !validOwnershipTimestamp(attempt.attemptedAt) || Date.parse(attempt.attemptedAt) < Date.parse(intent.attemptedAt)
                 || !currentTime(initial.exception.approvedAt, attempt.attemptedAt, APPROVAL_TTL_MS)
@@ -828,7 +829,7 @@ export function validReconciledApplyRecords(initial: LinkedInitialRecord, admiss
         if (attempt) resultKeys.push("attemptRecordId");
         return validJournalEvidenceJson(result) && sameKeys(result, resultKeys)
             && result.version === 1 && result.mode === "disabled-supervised-lifecycle" && result.phase === "apply-classification"
-            && result.executionProvenance === (attempt ? "simulated-injected-transport" : "unverified-report")
+            && result.executionProvenance === (attempt ? attempt.provenance : "unverified-report")
             && (!attempt || result.attemptRecordId === attempt.recordId) && result.writeReady === false && result.runtimeConfirmationVerified === false
             && resultId === ownershipFingerprint(resultBody) && result.intentRecordId === intent.recordId
             && validLinkedClassifiedRecord(result.classified, initial) && (attempt ? Date.parse(result.classified.attemptedAt) >= Date.parse(attempt.attemptedAt) : result.classified.attemptedAt === intent.attemptedAt);
@@ -850,7 +851,7 @@ export type ReconciledRestoreClassification = {
     attemptedAt: string; completedAt: string; apiWrite: CaptureWriteResult;
     observation: Capture["before"] | null; comparison: ReturnType<typeof compareObservedTariffReadBack>;
     classification: LinkedClassifiedRecord["classification"];
-    executionProvenance: "simulated-injected-transport"; writeReady: false; runtimeConfirmationVerified: false; recordId: string;
+    executionProvenance: "simulated-injected-transport" | "authenticated-tesla-fleet-api"; writeReady: false; runtimeConfirmationVerified: false; recordId: string;
 };
 type CaptureWriteResult = LinkedClassifiedRecord["apiWrite"];
 /** Complete documentary chain, never restoration authority or terminal retirement. */
@@ -897,7 +898,8 @@ export function validReconciledLifecycleRecords(initial: LinkedInitialRecord, ad
         if (!validJournalEvidenceJson(attempt) || !sameKeys(attempt, ["version", "mode", "phase", "attemptId", "attemptedAt", "binding", "provenance", "writeReady", "runtimeConfirmationVerified", "recordId"])
             || attempt.version !== 1 || attempt.mode !== "disabled-supervised-lifecycle" || attempt.phase !== "restore-attempt-consumed"
             || !identifier(attempt.attemptId) || attempt.attemptId === (records[1] as ReconciledAttemptConsumption).attemptId
-            || attempt.provenance !== "simulated-injected-transport" || attempt.writeReady !== false || attempt.runtimeConfirmationVerified !== false
+            || !["simulated-injected-transport", "authenticated-tesla-fleet-api"].includes(attempt.provenance)
+            || attempt.writeReady !== false || attempt.runtimeConfirmationVerified !== false
             || attemptId !== ownershipFingerprint(attemptBody) || ownershipFingerprint(attempt.binding) !== ownershipFingerprint(binding)
             || !currentTime(approval.approvedAt, attempt.attemptedAt, APPROVAL_TTL_MS)
             || !currentTime(b.before.source.observedAt, attempt.attemptedAt, CAPTURE_TTL_MS)

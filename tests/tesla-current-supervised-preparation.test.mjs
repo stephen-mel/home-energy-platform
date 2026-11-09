@@ -253,7 +253,7 @@ async function reconciledCliHarness(t,fault){
  await io.mkdir(directory,{recursive:true,mode:0o700});
  const historical=path.join(directory,'site-12345.jsonl');await io.writeFile(historical,x.priorBytes);
  if(fault==='conflict')await io.writeFile(path.join(directory,'site-12345-attempt.active'),'already-pending');
- const calls={gets:0,posts:0,acquisitions:0,questions:0,output:[]};let uuid=0,lastReconciliation='',continuationAppends=0;
+ const calls={gets:0,posts:0,authReads:0,acquisitions:0,questions:0,output:[]};let uuid=0,lastReconciliation='',continuationAppends=0;
  const blocked=()=>{throw Error('UNEXPECTED_EXECUTION');};
  const dependencies={
   'node:fs/promises':{...io,open:async(file,flags,...args)=>{
@@ -293,6 +293,18 @@ async function reconciledCliHarness(t,fault){
    return expected;
   }})},
   '@next/env':{loadEnvConfig(){}},'../site/current-site':{currentSite:x.f.site},
+  '../tesla/client':{async getTeslaSiteInfo(){
+   calls.authReads++;if(fault==='authenticated-token-readiness')throw Error('PRIVATE_TOKEN_MARKER');
+   if(calls.authReads>1)x.ports.now=()=> '2026-10-27T12:00:02Z';
+   const tariff=calls.authReads===1?x.f.capture.before.representations.v2:x.initial.review.proposal.bound.representation;
+   const preflight=calls.authReads===1;
+   const missing=preflight?fault==='authenticated-preflight-missing-site':fault==='authenticated-readback-missing-site';
+   const malformed=preflight?fault==='authenticated-preflight-malformed-site':fault==='authenticated-readback-malformed-site';
+   const wrong=preflight?fault==='authenticated-preflight-wrong-site':fault==='authenticated-readback-wrong-site';
+   return{response:{...(!missing?{energy_site_id:malformed?{}:wrong?'99999':'12345'}:{}),installation_time_zone:'Europe/London',tariff_content_v2:structuredClone(tariff),tariff_content:legacy(tariff)}};
+  }},
+  '../tesla/tokens':{async readTeslaTokens(){return{access_token:'synthetic.jwt.value'};},tokenNeedsRefresh(){return fault==='authenticated-token-expired';}},
+  '../tesla/inspect-scopes':{inspectTeslaScopes(){return{success:true,scopes:fault==='authenticated-permission'?[]:['energy_cmds'],hasEnergyCommands:fault!=='authenticated-permission'};}},
   '../site/kraken-refresh':{async getRecordedKrakenStateForInspection(){calls.acquisitions++;return{state:fault==='missing'?null:structuredClone(x.f.capture.kraken),acquisition:{freshEvidenceObtained:fault!=='stale',staleFallbackUsed:fault==='stale'}};}},
   './observed-tariff':load('src/lib/tesla-tariff/observed-tariff.ts'),'./rollback-evidence':load('src/lib/tesla-tariff/rollback-evidence.ts'),
   './restoration-review':load('src/lib/tesla-tariff/restoration-review.ts'),
@@ -306,10 +318,16 @@ async function reconciledCliHarness(t,fault){
  const evaluatePrivateRealm=()=>{
  const exports={};
  // Test-realm-only instrumentation; no application export or runtime switch.
- vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/lib/tesla-tariff/supervised-local.ts','utf8')+'\nexport { createReconciledApplyContinuation as testPrivateContinuation, createPrivateAttemptProducer as testPrivateAttemptProducer, admitReconciledContinuation as testComposeReconciled };',{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,
- {exports,structuredClone,Date:FixedDate,AbortSignal,process:{cwd:()=>cwd,env:{},stdin:{isTTY:fault!=='noninteractive'},stdout:{isTTY:true},stderr:{isTTY:true}},
+ vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/lib/tesla-tariff/supervised-local.ts','utf8')+'\nexport { createReconciledApplyContinuation as testPrivateContinuation, createPrivateAttemptProducer as testPrivateAttemptProducer, authenticatedTransportFoundation as testAuthenticatedTransportFoundation, admitReconciledContinuation as testComposeReconciled };',{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,
+ {exports,structuredClone,Date:FixedDate,AbortController,AbortSignal,setTimeout,clearTimeout,process:{cwd:()=>cwd,env:{},stdin:{isTTY:fault!=='noninteractive'},stdout:{isTTY:true},stderr:{isTTY:true}},
  console:{log:value=>calls.output.push(value)},fetch:async(_url,options)=>{
-  if(options.method!=='GET'){calls.posts++;throw Error('POST_FORBIDDEN');}calls.gets++;
+  if(options.method==='POST'){
+   calls.posts++;assert.match(_url,/\/energy_sites\/12345\/time_of_use_settings$/);
+   assert.equal(options.headers.Authorization,'Bearer synthetic.jwt.value');assert.equal(options.body,x.initial.review.payloadJson);
+   if(fault==='authenticated-transport')throw Error('PRIVATE_TRANSPORT_MARKER');
+   return{status:fault==='authenticated-rejected'?400:fault==='authenticated-ambiguous'?503:200,
+    json:async()=>({response:{result:fault!=='authenticated-rejected'},private:'DO_NOT_RETAIN'})};
+  }calls.gets++;
   if(fault==='interrupted'&&calls.gets===4)throw Error('INTERRUPTED');
   const v=structuredClone(x.f.capture.before.representations.v2);
   if(fault==='substituted'&&calls.gets>=2)v.name='changed';
@@ -324,6 +342,7 @@ async function reconciledCliHarness(t,fault){
   restartCompose:()=>evaluatePrivateRealm().testComposeReconciled(x.initial,x.config,'recovered',x.ports),
   createPrivate:()=>exports.testPrivateContinuation(x.initial,x.config,x.ports),
   createAttempt:adapter=>exports.testPrivateAttemptProducer(x.initial,x.config,()=>x.ports.now(),adapter),
+  createAuthenticated:()=>exports.testPrivateAttemptProducer(x.initial,x.config,()=>x.ports.now(),exports.testAuthenticatedTransportFoundation),
   run:(extra=[])=>exports.runLocalExperiment(['--site','12345','--vehicle','fixture-ev','--dispatch-start',x.f.selection.dispatchStart,'--prepare-reconciled','--experiment-id','cli-independent',...extra])};
 }
 test('closed CLI connects acquisition, exact review, separate approvals, durable claim and supervised dry-run only',async t=>{
@@ -782,6 +801,64 @@ test('private attempt producer captures exact simulated response/readback causal
  await assert.rejects(h.producer.run(), /ATTEMPT_NOT_LIVE/);
  const other = await attemptProducerFixture(t); const next = await other.producer.run();
  assert.notEqual(result.attemptId, next.attemptId);
+});
+test('authenticated tariff foundation preflights token and permission before durable attempt consumption', async t => {
+ for(const [fault,code] of [['authenticated-token-readiness','TESLA_TARIFF_TOKEN_READINESS_FAILED'],
+  ['authenticated-token-expired','TESLA_TARIFF_TOKEN_READINESS_FAILED'],['authenticated-permission','TESLA_TARIFF_PERMISSION_REQUIRED'],
+  ['authenticated-preflight-wrong-site','TESLA_TARIFF_TOKEN_READINESS_FAILED'],['authenticated-preflight-missing-site','TESLA_TARIFF_TOKEN_READINESS_FAILED'],
+  ['authenticated-preflight-malformed-site','TESLA_TARIFF_TOKEN_READINESS_FAILED']]){
+  const h=await privateContinuationFixture(t,fault);await h.handle.recordApplyIntent();
+  await assert.rejects(h.createAuthenticated(),new RegExp(code));
+  assert.equal(h.calls.posts,0);assert.equal((await io.readFile(h.file,'utf8')).trim().split('\n').length,2);
+  await assert.rejects(io.access(h.file+'.execution'),{code:'ENOENT'});
+ }
+});
+test('authenticated tariff foundation performs one exact POST and strict authenticated readback without granting authority',async t=>{
+ const h=await privateContinuationFixture(t);await h.handle.recordApplyIntent();const producer=await h.createAuthenticated();
+ assert.equal(h.calls.authReads,1);assert.equal(h.calls.posts,0);
+ const result=await producer.run();
+ assert.equal(h.calls.posts,1);assert.equal(h.calls.authReads,2);assert.equal(result.provenance,'authenticated-tesla-fleet-api');
+ assert.equal(result.outcome,'accepted-exact-readback');assert.equal(result.comparison.outcome,'exact-observed-match');
+ assert.equal(result.binding.site,'12345');assert.equal(result.binding.experimentId,'private-journal-continuation');
+ assert.equal(result.binding.mutationId,h.x.initial.mutationId);assert.equal(result.binding.payloadKey,hash(h.x.initial.review.payloadJson));
+ for(const field of ['productionConfirmation','runtimeConfirmationVerified','writeReady','executionReady','grantsCompletionAuthority'])assert.equal(result[field],false,field);
+ await assert.rejects(producer.run(),/ATTEMPT_NOT_LIVE/);assert.equal(h.calls.posts,1);
+ const rows=(await io.readFile(h.file,'utf8')).trim().split('\n').map(JSON.parse);
+ assert.equal(rows.at(-1).provenance,'authenticated-tesla-fleet-api');
+ assert.equal(journals.validReconciledApplyRecords(h.x.initial,hash(h.markerBytes),rows.slice(1),'private-journal-continuation'),true);
+});
+test('authenticated tariff foundation never retries rejected or ambiguous mutation outcomes',async t=>{
+ for(const [fault,outcome] of [['authenticated-rejected','write-rejected'],['authenticated-ambiguous','write-outcome-unknown'],
+  ['authenticated-transport','write-outcome-unknown']]){
+  const h=await privateContinuationFixture(t,fault);await h.handle.recordApplyIntent();const producer=await h.createAuthenticated();
+  const result=await producer.run();assert.equal(result.outcome,outcome,fault);assert.equal(h.calls.posts,1,fault);
+  assert.equal(h.calls.authReads,2,fault);await assert.rejects(producer.run(),/ATTEMPT_NOT_LIVE/);assert.equal(h.calls.posts,1,fault);
+ }
+});
+test('authenticated tariff foundation leaves consumed attempts unresolved on wrong or absent readback identity',async t=>{
+ for(const fault of ['authenticated-readback-wrong-site','authenticated-readback-missing-site','authenticated-readback-malformed-site']){
+  const h=await privateContinuationFixture(t,fault);await h.handle.recordApplyIntent();const producer=await h.createAuthenticated();
+  const result=await producer.run();assert.equal(h.calls.posts,1,fault);assert.equal(result.observation,null,fault);
+  assert.equal(result.outcome,'accepted-readback-unverified',fault);assert.notEqual(result.outcome,'accepted-exact-readback',fault);
+  assert.equal(result.productionConfirmation,false);await io.access(h.file+'.execution');
+  await assert.rejects(producer.run(),/ATTEMPT_NOT_LIVE/);assert.equal(h.calls.posts,1,fault);
+ }
+});
+test('caller-assigned observation identity cannot substitute for authenticated raw site identity',async t=>{
+ const h=await privateContinuationFixture(t,'authenticated-preflight-wrong-site');await h.handle.recordApplyIntent();
+ // The raw response contains an otherwise complete tariff. Relabelling happens
+ // only after the provider identity gate, so construction fails before capture.
+ await assert.rejects(h.createAuthenticated(),/TESLA_TARIFF_TOKEN_READINESS_FAILED/);
+ assert.equal(h.calls.posts,0);assert.equal((await io.readFile(h.file,'utf8')).trim().split('\n').length,2);
+ await assert.rejects(io.access(h.file+'.execution'),{code:'ENOENT'});
+});
+test('authenticated tariff foundation cannot POST when journal durability fails and has no application export or CLI path',async t=>{
+ const h=await privateContinuationFixture(t,'attempt-sync-failure');await h.handle.recordApplyIntent();const producer=await h.createAuthenticated();
+ await assert.rejects(producer.run(),/ATTEMPT_SYNC_FAILURE/);assert.equal(h.calls.posts,0);
+ const source=fs.readFileSync('src/lib/tesla-tariff/supervised-local.ts','utf8');
+ assert.doesNotMatch(source,/export\s+(?:async\s+)?function\s+createAuthenticatedTeslaAttemptAdapter/);
+ assert.doesNotMatch(source,/runAuthenticated|--execute-authenticated|HEP_ENABLE_AUTHENTICATED/);
+ assert.equal(Object.keys(h.handle).some(k=>/authenticated/i.test(k)),false);
 });
 test('private attempt producer disabled production path invokes no transport and external evidence never supplies authority', async t => {
  const h = await privateContinuationFixture(t);
