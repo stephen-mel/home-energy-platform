@@ -253,7 +253,7 @@ async function reconciledCliHarness(t,fault){
  await io.mkdir(directory,{recursive:true,mode:0o700});
  const historical=path.join(directory,'site-12345.jsonl');await io.writeFile(historical,x.priorBytes);
  if(fault==='conflict')await io.writeFile(path.join(directory,'site-12345-attempt.active'),'already-pending');
- const calls={gets:0,posts:0,authReads:0,acquisitions:0,questions:0,output:[]};let uuid=0,lastReconciliation='',continuationAppends=0;
+ const calls={gets:0,posts:0,productReads:0,authReads:0,acquisitions:0,questions:0,output:[]};let uuid=0,lastReconciliation='',continuationAppends=0;
  const blocked=()=>{throw Error('UNEXPECTED_EXECUTION');};
  const dependencies={
   'node:fs/promises':{...io,open:async(file,flags,...args)=>{
@@ -293,7 +293,15 @@ async function reconciledCliHarness(t,fault){
    return expected;
   }})},
   '@next/env':{loadEnvConfig(){}},'../site/current-site':{currentSite:x.f.site},
-  '../tesla/client':{async getTeslaSiteInfo(){
+  '../tesla/client':{async getTeslaProducts(){
+   calls.productReads++;if(fault==='authenticated-product-discovery')throw Error('PRIVATE_DISCOVERY_MARKER');
+   const product={energy_site_id:fault==='authenticated-product-wrong'?99999:12345,resource_type:'battery',components:{battery:true},battery_type:'ac_powerwall'};
+   if(fault==='authenticated-product-conflicting')product.vin='PRIVATE_VIN_MARKER';
+   if(fault==='authenticated-product-malformed')return{response:[null]};
+   if(fault==='authenticated-product-bad-shape')product.components=[];
+   return{response:[product,...(fault==='authenticated-product-duplicate'?[structuredClone(product)]:[]),
+    ...(fault==='authenticated-product-ambiguous'?[{resource_type:'unknown'}]:[])]};
+  },async getTeslaSiteInfo(){
    calls.authReads++;if(fault==='authenticated-token-readiness')throw Error('PRIVATE_TOKEN_MARKER');
    if(calls.authReads>1)x.ports.now=()=> '2026-10-27T12:00:02Z';
    const tariff=calls.authReads===1?x.f.capture.before.representations.v2:x.initial.review.proposal.bound.representation;
@@ -805,7 +813,7 @@ test('private attempt producer captures exact simulated response/readback causal
 test('authenticated tariff foundation preflights token and permission before durable attempt consumption', async t => {
  for(const [fault,code] of [['authenticated-token-readiness','TESLA_TARIFF_TOKEN_READINESS_FAILED'],
   ['authenticated-token-expired','TESLA_TARIFF_TOKEN_READINESS_FAILED'],['authenticated-permission','TESLA_TARIFF_PERMISSION_REQUIRED'],
-  ['authenticated-preflight-wrong-site','TESLA_TARIFF_TOKEN_READINESS_FAILED'],['authenticated-preflight-missing-site','TESLA_TARIFF_TOKEN_READINESS_FAILED'],
+  ['authenticated-preflight-wrong-site','TESLA_TARIFF_TOKEN_READINESS_FAILED'],
   ['authenticated-preflight-malformed-site','TESLA_TARIFF_TOKEN_READINESS_FAILED']]){
   const h=await privateContinuationFixture(t,fault);await h.handle.recordApplyIntent();
   await assert.rejects(h.createAuthenticated(),new RegExp(code));
@@ -813,9 +821,19 @@ test('authenticated tariff foundation preflights token and permission before dur
   await assert.rejects(io.access(h.file+'.execution'),{code:'ENOENT'});
  }
 });
+test('authenticated tariff foundation rejects malformed ambiguous duplicate or wrong product discovery before consumption',async t=>{
+ for(const fault of ['authenticated-product-discovery','authenticated-product-wrong','authenticated-product-duplicate',
+  'authenticated-product-malformed','authenticated-product-bad-shape','authenticated-product-conflicting','authenticated-product-ambiguous']){
+  const h=await privateContinuationFixture(t,fault);await h.handle.recordApplyIntent();
+  await assert.rejects(h.createAuthenticated(),/TESLA_TARIFF_PRODUCT_IDENTITY_REQUIRED/,fault);
+  assert.equal(h.calls.productReads,1,fault);assert.equal(h.calls.authReads,0,fault);assert.equal(h.calls.posts,0,fault);
+  assert.equal((await io.readFile(h.file,'utf8')).trim().split('\n').length,2,fault);
+  await assert.rejects(io.access(h.file+'.execution'),{code:'ENOENT'});
+ }
+});
 test('authenticated tariff foundation performs one exact POST and strict authenticated readback without granting authority',async t=>{
  const h=await privateContinuationFixture(t);await h.handle.recordApplyIntent();const producer=await h.createAuthenticated();
- assert.equal(h.calls.authReads,1);assert.equal(h.calls.posts,0);
+ assert.equal(h.calls.productReads,1);assert.equal(h.calls.authReads,1);assert.equal(h.calls.posts,0);
  const result=await producer.run();
  assert.equal(h.calls.posts,1);assert.equal(h.calls.authReads,2);assert.equal(result.provenance,'authenticated-tesla-fleet-api');
  assert.equal(result.outcome,'accepted-exact-readback');assert.equal(result.comparison.outcome,'exact-observed-match');
@@ -835,8 +853,15 @@ test('authenticated tariff foundation never retries rejected or ambiguous mutati
   assert.equal(h.calls.authReads,2,fault);await assert.rejects(producer.run(),/ATTEMPT_NOT_LIVE/);assert.equal(h.calls.posts,1,fault);
  }
 });
-test('authenticated tariff foundation leaves consumed attempts unresolved on wrong or absent readback identity',async t=>{
- for(const fault of ['authenticated-readback-wrong-site','authenticated-readback-missing-site','authenticated-readback-malformed-site']){
+test('authenticated tariff foundation accepts omitted site_info identity only through product binding',async t=>{
+ for(const fault of ['authenticated-preflight-missing-site','authenticated-readback-missing-site']){
+  const h=await privateContinuationFixture(t,fault);await h.handle.recordApplyIntent();const producer=await h.createAuthenticated();
+  const result=await producer.run();assert.equal(result.outcome,'accepted-exact-readback',fault);
+  assert.equal(result.binding.site,'12345');assert.equal(h.calls.productReads,1);assert.equal(h.calls.posts,1);
+ }
+});
+test('authenticated tariff foundation leaves consumed attempts unresolved on contradictory readback identity',async t=>{
+ for(const fault of ['authenticated-readback-wrong-site','authenticated-readback-malformed-site']){
   const h=await privateContinuationFixture(t,fault);await h.handle.recordApplyIntent();const producer=await h.createAuthenticated();
   const result=await producer.run();assert.equal(h.calls.posts,1,fault);assert.equal(result.observation,null,fault);
   assert.equal(result.outcome,'accepted-readback-unverified',fault);assert.notEqual(result.outcome,'accepted-exact-readback',fault);
@@ -844,11 +869,9 @@ test('authenticated tariff foundation leaves consumed attempts unresolved on wro
   await assert.rejects(producer.run(),/ATTEMPT_NOT_LIVE/);assert.equal(h.calls.posts,1,fault);
  }
 });
-test('caller-assigned observation identity cannot substitute for authenticated raw site identity',async t=>{
- const h=await privateContinuationFixture(t,'authenticated-preflight-wrong-site');await h.handle.recordApplyIntent();
- // The raw response contains an otherwise complete tariff. Relabelling happens
- // only after the provider identity gate, so construction fails before capture.
- await assert.rejects(h.createAuthenticated(),/TESLA_TARIFF_TOKEN_READINESS_FAILED/);
+test('caller-approved identity cannot substitute for authenticated product discovery',async t=>{
+ const h=await privateContinuationFixture(t,'authenticated-product-wrong');await h.handle.recordApplyIntent();
+ await assert.rejects(h.createAuthenticated(),/TESLA_TARIFF_PRODUCT_IDENTITY_REQUIRED/);
  assert.equal(h.calls.posts,0);assert.equal((await io.readFile(h.file,'utf8')).trim().split('\n').length,2);
  await assert.rejects(io.access(h.file+'.execution'),{code:'ENOENT'});
 });

@@ -273,16 +273,58 @@ type AuthenticatedAttemptAdapter = SimulatedAttemptAdapter & {
 const authenticatedTransportFoundation = Symbol("authenticated-tesla-tariff-transport-foundation");
 const TESLA_TARIFF_WRITE_TIMEOUT_MS = 5_000;
 
-/** Tesla's authenticated site_info envelope independently identifies the site in
- * response.energy_site_id. The requested endpoint is not identity evidence. */
-function authenticatedTeslaSiteMatches(raw: unknown, approvedSite: string): boolean {
+/** Closed validation of Tesla's authenticated product discovery. Every product
+ * must have unambiguous membership; only a unique provider-supplied numeric site
+ * identity can bind the approved household site. */
+function authenticatedTeslaProductSite(raw: unknown, approvedSite: string): string | null {
+    if (!/^\d+$/.test(approvedSite) || !Number.isSafeInteger(Number(approvedSite))
+        || Number(approvedSite).toString(10) !== approvedSite
+        || !raw || typeof raw !== "object" || Array.isArray(raw) || !("response" in raw)) return null;
+    const response = (raw as { response?: unknown }).response;
+    if (!Array.isArray(response)) return null;
+    const sites = new Set<string>();
+    let match: string | null = null, matches = 0;
+    for (const product of response) {
+        if (!product || typeof product !== "object" || Array.isArray(product)) return null;
+        const item = product as Record<string, unknown>;
+        const energy = Object.hasOwn(item, "energy_site_id");
+        const vehicle = Object.hasOwn(item, "vin") || Object.hasOwn(item, "vehicle_id");
+        if (energy === vehicle) return null; // conflicting or unidentified product
+        if (energy) {
+            if (!Number.isSafeInteger(item.energy_site_id) || (item.energy_site_id as number) < 0
+                || typeof item.resource_type !== "string" || !item.resource_type
+                || !item.components || typeof item.components !== "object" || Array.isArray(item.components)
+                || typeof item.battery_type !== "string" || !item.battery_type) return null;
+            const identity = (item.energy_site_id as number).toString(10);
+            if (sites.has(identity)) return null;
+            sites.add(identity);
+            if (identity === approvedSite) { match = identity; matches++; }
+        } else if (typeof item.vin !== "string" || !item.vin
+            || !(typeof item.vehicle_id === "string" && item.vehicle_id || Number.isSafeInteger(item.vehicle_id))) return null;
+    }
+    return matches === 1 ? match : null;
+}
+
+/** site_info does not document an identity field. Product discovery supplies the
+ * binding; an optional response identity may corroborate it but never conflict. */
+function authenticatedTeslaSiteInfoCompatible(raw: unknown, boundSite: string): boolean {
     if (!raw || typeof raw !== "object" || Array.isArray(raw) || !("response" in raw)) return false;
     const response = (raw as { response?: unknown }).response;
-    if (!response || typeof response !== "object" || Array.isArray(response) || !("energy_site_id" in response)) return false;
+    if (!response || typeof response !== "object" || Array.isArray(response)) return false;
+    if (!("energy_site_id" in response)) return true;
     const candidate = (response as { energy_site_id?: unknown }).energy_site_id;
     const identity = typeof candidate === "string" && /^\d+$/.test(candidate) ? candidate
         : typeof candidate === "number" && Number.isSafeInteger(candidate) && candidate >= 0 ? candidate.toString(10) : null;
-    return identity !== null && identity === approvedSite;
+    return identity !== null && identity === boundSite;
+}
+
+async function discoverAuthenticatedTeslaSite(approvedSite: string): Promise<string> {
+    try {
+        const { getTeslaProducts } = await import("../tesla/client");
+        const site = authenticatedTeslaProductSite(await getTeslaProducts(), approvedSite);
+        if (!site) throw Error();
+        return site;
+    } catch { throw Error("TESLA_TARIFF_PRODUCT_IDENTITY_REQUIRED"); }
 }
 
 /** Private fixed-purpose Fleet API adapter. Read authentication is deliberately
@@ -299,7 +341,7 @@ async function createAuthenticatedTeslaAttemptAdapter(site: string, payloadJson:
     let preflight: ObservedTariff | null = null;
     try {
         const raw = await getTeslaSiteInfo(Number(site));
-        if (!authenticatedTeslaSiteMatches(raw, site)) throw Error();
+        if (!authenticatedTeslaSiteInfoCompatible(raw, site)) throw Error();
         preflight = validateTeslaInspectionEvidence(captureObservedTariff(raw, site, now()));
     } catch { throw Error("TESLA_TARIFF_TOKEN_READINESS_FAILED"); }
     if (!preflight || preflight.source.energySiteId !== site) throw Error("TESLA_TARIFF_TOKEN_READINESS_FAILED");
@@ -340,7 +382,7 @@ async function createAuthenticatedTeslaAttemptAdapter(site: string, payloadJson:
             if (requestSite !== site) throw Error("TESLA_TARIFF_TRANSPORT_BINDING_INVALID");
             try {
                 const raw = await getTeslaSiteInfo(Number(site));
-                if (!authenticatedTeslaSiteMatches(raw, site)) throw Error();
+                if (!authenticatedTeslaSiteInfoCompatible(raw, site)) throw Error();
                 const observation = validateTeslaInspectionEvidence(captureObservedTariff(raw, site, now()));
                 if (!observation || observation.source.energySiteId !== site) throw Error();
                 return observation;
@@ -377,12 +419,14 @@ async function createPrivateAttemptProducer(initialRecord: journalRecords.Linked
         || checksum !== ownershipFingerprint(markerBody) || marker.binding.site !== site
         || marker.binding.initialRecordId !== initial.initialRecordId || marker.binding.mutationId !== initial.mutationId)
         throw Error("ATTEMPT_INTENT_INVALID");
-    const binding = Object.freeze({ site, mutationId: initial.mutationId, experimentId: marker.binding.experimentId,
+    const authenticatedRequest = adapter === authenticatedTransportFoundation;
+    const providerSite = authenticatedRequest ? await discoverAuthenticatedTeslaSite(site) : site;
+    const binding = Object.freeze({ site: providerSite, mutationId: initial.mutationId, experimentId: marker.binding.experimentId,
         initialRecordId: initial.initialRecordId, intentRecordId: intent.recordId, admissionKey: ownershipFingerprint(markerText),
         payloadKey: ownershipFingerprint(payloadJson), ownershipKey: ownershipFingerprint(initial.preparedContext.ownership),
         originalObservationKey: ownershipFingerprint(initial.review.before) });
-    const authenticated = adapter === authenticatedTransportFoundation
-        ? await createAuthenticatedTeslaAttemptAdapter(site, payloadJson, binding, now) : null;
+    const authenticated = authenticatedRequest
+        ? await createAuthenticatedTeslaAttemptAdapter(providerSite, payloadJson, binding, now) : null;
     const selected = authenticated ?? adapter as SimulatedAttemptAdapter | undefined;
     // Capture methods once. Replacing an adapter after construction cannot change
     // the transport paired with this attempt. No results/flags are accepted by run.
