@@ -14,7 +14,7 @@ import * as journalRecords from "./linked-experiment-records";
 import { prepareMutationContext, type PreparedMutationContext } from "./prepared-mutation-context";
 import { ownershipStore } from "./ownership-store";
 import { persistConfirmedSmart } from "./ownership-sqlite";
-import { admitOfflineReconciledExperiment, readOfflineReconciledExperiment, validReconciledApplyRecords, validReconciledLifecycleRecords, type ReconciledRestoreIntent, type ReconciledRestoreAttempt, type ReconciledRestoreClassification, type ReconciledApplyIntent, type ReconciledApplyClassification, type ReconciledAttemptConsumption, type OfflineReconciliationPorts, type OfflineExperimentBinding } from "./repeat-attempt-journal";
+import { admitOfflineReconciledExperiment, readOfflineReconciledExperiment, verifyOfflineReconciledPriorEvidence, validReconciledApplyRecords, validReconciledLifecycleRecords, type ReconciledRestoreIntent, type ReconciledRestoreAttempt, type ReconciledRestoreClassification, type ReconciledApplyIntent, type ReconciledApplyClassification, type ReconciledAttemptConsumption, type OfflineReconciliationPorts, type OfflineExperimentBinding } from "./repeat-attempt-journal";
 import { ownershipFingerprint } from "./ownership-transition";
 import { approveTariffProposal } from "./proposal-approval";
 import type { RehearsalApproval } from "./smart-lifecycle-rehearsal";
@@ -389,6 +389,71 @@ async function createAuthenticatedTeslaAttemptAdapter(site: string, payloadJson:
             } catch { throw Error("TESLA_TARIFF_READBACK_UNAVAILABLE"); }
         },
     });
+}
+
+type AuthenticatedRecoveryClassification = "proposed-exact" | "original-exact" | "external-conflict" | "unknown";
+
+/** Private read-only recovery for an already consumed authenticated attempt.
+ * The operation and both comparison targets come only from the immutable journal.
+ * A GET can classify observed state, but can never prove that the earlier POST ran. */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- intentionally unreachable production foundation; exercised by test-realm instrumentation only
+async function classifyConsumedAuthenticatedAttemptRecovery(
+    config: Parameters<typeof readOfflineReconciledExperiment>[0], now: () => string) {
+    const denied = { postProven: false as const, productionConfirmation: false as const,
+        runtimeConfirmationVerified: false as const, writeReady: false as const, executionReady: false as const,
+        grantsCompletionAuthority: false as const, grantsSuccessorAuthority: false as const,
+        releasesOwnership: false as const, closesOperation: false as const,
+        attemptConsumed: true as const, siteClaimRetained: true as const, restorationRequired: true as const };
+    const unknown = (code: string) => Object.freeze({ ...denied, classification: "unknown" as const,
+        code, observation: null, proposedComparison: null, originalComparison: null });
+    try {
+        if (config.mode !== "offline" || !/^\d+$/.test(config.site)) return unknown("RECOVERY_JOURNAL_INVALID");
+        const markerFile = path.join(config.directory, `site-${config.site}-attempt.active`);
+        const markerText = await readFile(markerFile, "utf8"), marker = JSON.parse(markerText);
+        if (!marker || typeof marker !== "object" || Array.isArray(marker)) return unknown("RECOVERY_JOURNAL_INVALID");
+        const { checksum, ...markerBody } = marker as Record<string, unknown>;
+        const binding = (marker as { binding?: Record<string, unknown> }).binding;
+        if (checksum !== ownershipFingerprint(markerBody) || !binding || binding.site !== config.site
+            || typeof binding.mutationId !== "string" || !binding.mutationId
+            || typeof binding.experimentId !== "string" || !binding.experimentId) return unknown("RECOVERY_JOURNAL_INVALID");
+        if (!await verifyOfflineReconciledPriorEvidence(config, marker)) return unknown("RECOVERY_PRIOR_EVIDENCE_INVALID");
+        const file = path.join(config.directory, `site-${config.site}-attempt-${binding.mutationId}.jsonl`);
+        const text = await readFile(file, "utf8");
+        if (!text.endsWith("\n") || !text.trim()) return unknown("RECOVERY_JOURNAL_INVALID");
+        const rows: unknown[] = text.trimEnd().split("\n").map(line => JSON.parse(line));
+        const initial = rows[0] as journalRecords.LinkedInitialRecord;
+        const records = rows.slice(1), attempt = records[1] as ReconciledAttemptConsumption | undefined;
+        if (!attempt || attempt.phase !== "attempt-consumed" || attempt.provenance !== "authenticated-tesla-fleet-api"
+            || binding.initialRecordId !== initial?.initialRecordId || binding.mutationId !== initial?.mutationId
+            || !validReconciledApplyRecords(initial, ownershipFingerprint(markerText), records, binding.experimentId as string))
+            return unknown("RECOVERY_JOURNAL_INVALID");
+        const consumedText = await readFile(file + ".execution", "utf8");
+        if (consumedText !== JSON.stringify(attempt) + "\n") return unknown("RECOVERY_CONSUMPTION_INVALID");
+
+        const site = await discoverAuthenticatedTeslaSite(config.site);
+        const { getTeslaSiteInfo } = await import("../tesla/client");
+        const raw = await getTeslaSiteInfo(Number(site));
+        if (!authenticatedTeslaSiteInfoCompatible(raw, site)) return unknown("RECOVERY_SITE_IDENTITY_INVALID");
+        const observedAt = now();
+        if (!Number.isFinite(Date.parse(observedAt)) || Date.parse(observedAt) <= Date.parse(attempt.attemptedAt))
+            return unknown("RECOVERY_TIME_INVALID");
+        const observation = validateTeslaInspectionEvidence(captureObservedTariff(raw, site, observedAt));
+        if (!observation || observation.source.energySiteId !== site || observation.source.timeZone !== initial.review.before.source.timeZone)
+            return unknown("RECOVERY_READBACK_INVALID");
+        const proposed = simulatedTariffObservation(initial.review.before, initial.review.proposal.bound.representation);
+        const compare = (intended: ObservedTariff) => compareObservedTariffReadBack({ intended, readBack: observation,
+            after: attempt.attemptedAt, dates: [initial.review.date] });
+        const proposedComparison = compare(proposed), originalComparison = compare(initial.review.before);
+        const proposedExact = proposedComparison.outcome === "exact-observed-match" && proposedComparison.timelineScope.complete;
+        const originalExact = originalComparison.outcome === "exact-observed-match" && originalComparison.timelineScope.complete;
+        const classification: AuthenticatedRecoveryClassification = proposedExact === originalExact
+            ? proposedExact ? "unknown" : proposedComparison.outcome === "different-observed-representation"
+                && originalComparison.outcome === "different-observed-representation" ? "external-conflict" : "unknown"
+            : proposedExact ? "proposed-exact" : "original-exact";
+        return Object.freeze({ ...denied, classification,
+            code: classification === "unknown" ? "RECOVERY_EVIDENCE_INCOMPLETE" : null,
+            observation: structuredClone(observation), proposedComparison, originalComparison });
+    } catch { return unknown("RECOVERY_UNAVAILABLE"); }
 }
 const attemptedIntents = new Set<string>();
 const intentAttempted = attemptedIntents.has.bind(attemptedIntents);

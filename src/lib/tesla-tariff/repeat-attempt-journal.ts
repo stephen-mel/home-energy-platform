@@ -614,6 +614,37 @@ const baselineKey = (capture: Capture) => ownershipFingerprint({ source: { kind:
 const pricingKey = (capture: Capture) => ownershipFingerprint({ account: capture.kraken.importTariff?.accountRef,
     agreement: capture.kraken.importTariff?.agreement, version: capture.kraken.importTariff?.version });
 
+/** Shared physical validation for immutable journals retained by a V3 admission.
+ * This verifies the complete prior-file set and raw-byte digests without
+ * interpreting or reclassifying the historical evidence. */
+export async function verifyOfflineReconciledPriorEvidence(config: OfflineExperimentConfig, candidate: unknown): Promise<boolean> {
+    try {
+        if (config.mode !== "offline" || !/^\d+$/.test(config.site) || !candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+        await assertPhysicalChain(config.directory, config.durableRoot);
+        const marker = candidate as { prior?: unknown; binding?: { mutationId?: unknown; priorHistoryKey?: unknown } };
+        if (!Array.isArray(marker.prior) || typeof marker.binding?.mutationId !== "string"
+            || typeof marker.binding.priorHistoryKey !== "string" || ownershipFingerprint(marker.prior) !== marker.binding.priorHistoryKey) return false;
+        const current = journalName(config.site, marker.binding.mutationId), active = activeName(config.site);
+        const references = marker.prior as PriorFile[], names = new Set<string>();
+        for (const reference of references) {
+            if (!reference || typeof reference !== "object" || Array.isArray(reference)
+                || !sameKeys(reference, ["name", "digest"]) || typeof reference.name !== "string"
+                || typeof reference.digest !== "string" || !/^[a-f0-9]{64}$/.test(reference.digest)
+                || path.basename(reference.name) !== reference.name || names.has(reference.name)
+                || !(reference.name === legacyName(config.site) || reference.name.startsWith(`site-${config.site}-`))
+                || [active, current, current + ".execution", current + ".restore.execution"].includes(reference.name)) return false;
+            names.add(reference.name);
+        }
+        const relevant = (await readdir(config.directory)).filter(name => name === legacyName(config.site) || name.startsWith(`site-${config.site}-`));
+        const currentFiles = new Set([active, current, current + ".execution", current + ".restore.execution"]);
+        const physicalPrior = relevant.filter(name => !currentFiles.has(name));
+        if (physicalPrior.length !== names.size || physicalPrior.some(name => !names.has(name))) return false;
+        for (const reference of references)
+            if (ownershipFingerprint(await physicalJournalText(path.join(config.directory, reference.name))) !== reference.digest) return false;
+        return true;
+    } catch { return false; }
+}
+
 async function independentCapture(ports: OfflineReconciliationPorts, initial: LinkedInitialRecord, site: string) {
     const capture = structuredClone(await ports.capture(site)), ownership = structuredClone(await ports.readOwnership(site)), now = ports.now();
     if (!validOwnershipTimestamp(now) || !ownershipSafe(ownership, site) || !capturedOwnershipMatches(initial, ownership)) throw Error("OWNERSHIP_UNRESOLVED");
@@ -756,13 +787,7 @@ export async function readOfflineReconciledExperiment(config: OfflineExperimentC
         if (!evidence || !admissionCaptureMatches(evidence.capture, rows[0], config.site, marker.admittedAt)
             || !ownershipSafe(evidence.ownership, config.site) || !capturedOwnershipMatches(rows[0], evidence.ownership)
             || baselineKey(evidence.capture) !== marker.binding.baselineKey || pricingKey(evidence.capture) !== marker.binding.pricingKey) throw Error();
-        const names = (await readdir(config.directory)).filter(n => n === legacyName(config.site) || n.startsWith(`site-${config.site}-`));
-        const expected = new Set([...marker.prior.map((p: PriorFile) => p.name), activeName(config.site), journalName(config.site, marker.binding.mutationId)]);
-        if (names.length !== expected.size || names.some(n => !expected.has(n))) throw Error();
-        for (const p of marker.prior as PriorFile[]) {
-            if (!expected.has(p.name) || path.basename(p.name) !== p.name
-                || ownershipFingerprint(await physicalJournalText(path.join(config.directory, p.name))) !== p.digest) throw Error();
-        }
+        if (!await verifyOfflineReconciledPriorEvidence(config, marker)) throw Error();
         return Object.freeze({ status: "consistent-offline-admission" as const, experimentId: marker.binding.experimentId,
             blocked: true as const, ...offlineAdmissionOnly });
     } catch { return Object.freeze({ status: "blocked" as const, code: "OFFLINE_ADMISSION_INCOMPLETE_OR_CONFLICTING", ...offlineAdmissionOnly }); }

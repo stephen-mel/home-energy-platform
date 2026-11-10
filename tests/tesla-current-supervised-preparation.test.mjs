@@ -295,6 +295,7 @@ async function reconciledCliHarness(t,fault){
   '@next/env':{loadEnvConfig(){}},'../site/current-site':{currentSite:x.f.site},
   '../tesla/client':{async getTeslaProducts(){
    calls.productReads++;if(fault==='authenticated-product-discovery')throw Error('PRIVATE_DISCOVERY_MARKER');
+   if(fault==='recovery-product-missing'&&calls.productReads>1)return{response:[{vin:'synthetic-vin',vehicle_id:1}]};
    const product={energy_site_id:fault==='authenticated-product-wrong'?99999:12345,resource_type:'battery',components:{battery:true},battery_type:'ac_powerwall'};
    if(fault==='authenticated-product-conflicting')product.vin='PRIVATE_VIN_MARKER';
    if(fault==='authenticated-product-malformed')return{response:[null]};
@@ -304,12 +305,18 @@ async function reconciledCliHarness(t,fault){
   },async getTeslaSiteInfo(){
    calls.authReads++;if(fault==='authenticated-token-readiness')throw Error('PRIVATE_TOKEN_MARKER');
    if(calls.authReads>1)x.ports.now=()=> '2026-10-27T12:00:02Z';
-   const tariff=calls.authReads===1?x.f.capture.before.representations.v2:x.initial.review.proposal.bound.representation;
+   const recovering=calls.authReads>2;
+   const tariff=calls.authReads===1||recovering&&fault==='recovery-original'?x.f.capture.before.representations.v2
+    :x.initial.review.proposal.bound.representation;
+   if(recovering&&fault==='recovery-external')tariff.name='external-change';
    const preflight=calls.authReads===1;
    const missing=preflight?fault==='authenticated-preflight-missing-site':fault==='authenticated-readback-missing-site';
    const malformed=preflight?fault==='authenticated-preflight-malformed-site':fault==='authenticated-readback-malformed-site';
    const wrong=preflight?fault==='authenticated-preflight-wrong-site':fault==='authenticated-readback-wrong-site';
-   return{response:{...(!missing?{energy_site_id:malformed?{}:wrong?'99999':'12345'}:{}),installation_time_zone:'Europe/London',tariff_content_v2:structuredClone(tariff),tariff_content:legacy(tariff)}};
+   const recoveryWrong=recovering&&fault==='recovery-wrong-site';
+   const response={...(!missing?{energy_site_id:malformed?{}:wrong||recoveryWrong?'99999':'12345'}:{}),installation_time_zone:'Europe/London',tariff_content_v2:structuredClone(tariff),tariff_content:legacy(tariff)};
+   if(recovering&&fault==='recovery-malformed')delete response.tariff_content_v2;
+   return{response};
   }},
   '../tesla/tokens':{async readTeslaTokens(){return{access_token:'synthetic.jwt.value'};},tokenNeedsRefresh(){return fault==='authenticated-token-expired';}},
   '../tesla/inspect-scopes':{inspectTeslaScopes(){return{success:true,scopes:fault==='authenticated-permission'?[]:['energy_cmds'],hasEnergyCommands:fault!=='authenticated-permission'};}},
@@ -326,7 +333,7 @@ async function reconciledCliHarness(t,fault){
  const evaluatePrivateRealm=()=>{
  const exports={};
  // Test-realm-only instrumentation; no application export or runtime switch.
- vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/lib/tesla-tariff/supervised-local.ts','utf8')+'\nexport { createReconciledApplyContinuation as testPrivateContinuation, createPrivateAttemptProducer as testPrivateAttemptProducer, authenticatedTransportFoundation as testAuthenticatedTransportFoundation, admitReconciledContinuation as testComposeReconciled };',{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,
+ vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/lib/tesla-tariff/supervised-local.ts','utf8')+'\nexport { createReconciledApplyContinuation as testPrivateContinuation, createPrivateAttemptProducer as testPrivateAttemptProducer, authenticatedTransportFoundation as testAuthenticatedTransportFoundation, classifyConsumedAuthenticatedAttemptRecovery as testAuthenticatedRecovery, admitReconciledContinuation as testComposeReconciled };',{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,
  {exports,structuredClone,Date:FixedDate,AbortController,AbortSignal,setTimeout,clearTimeout,process:{cwd:()=>cwd,env:{},stdin:{isTTY:fault!=='noninteractive'},stdout:{isTTY:true},stderr:{isTTY:true}},
  console:{log:value=>calls.output.push(value)},fetch:async(_url,options)=>{
   if(options.method==='POST'){
@@ -351,6 +358,7 @@ async function reconciledCliHarness(t,fault){
   createPrivate:()=>exports.testPrivateContinuation(x.initial,x.config,x.ports),
   createAttempt:adapter=>exports.testPrivateAttemptProducer(x.initial,x.config,()=>x.ports.now(),adapter),
   createAuthenticated:()=>exports.testPrivateAttemptProducer(x.initial,x.config,()=>x.ports.now(),exports.testAuthenticatedTransportFoundation),
+  recoverAuthenticated:()=>evaluatePrivateRealm().testAuthenticatedRecovery(x.config,()=>x.ports.now()),
   run:(extra=[])=>exports.runLocalExperiment(['--site','12345','--vehicle','fixture-ev','--dispatch-start',x.f.selection.dispatchStart,'--prepare-reconciled','--experiment-id','cli-independent',...extra])};
 }
 test('closed CLI connects acquisition, exact review, separate approvals, durable claim and supervised dry-run only',async t=>{
@@ -867,6 +875,61 @@ test('authenticated tariff foundation leaves consumed attempts unresolved on con
   assert.equal(result.outcome,'accepted-readback-unverified',fault);assert.notEqual(result.outcome,'accepted-exact-readback',fault);
   assert.equal(result.productionConfirmation,false);await io.access(h.file+'.execution');
   await assert.rejects(producer.run(),/ATTEMPT_NOT_LIVE/);assert.equal(h.calls.posts,1,fault);
+ }
+});
+test('private authenticated recovery classifies immutable consumed attempts without proving a POST or releasing the claim',async t=>{
+ for(const [fault,expected] of [['valid','proposed-exact'],['recovery-original','original-exact'],
+  ['recovery-external','external-conflict'],['recovery-wrong-site','unknown'],['recovery-malformed','unknown'],
+  ['recovery-product-missing','unknown'],['authenticated-transport','proposed-exact']]){
+  const h=await privateContinuationFixture(t,fault);await h.handle.recordApplyIntent();
+  const producer=await h.createAuthenticated();const attempted=await producer.run();
+  const posts=h.calls.posts,files=(await io.readdir(h.x.config.directory)).sort();
+  const recovered=await h.recoverAuthenticated();
+  assert.equal(recovered.classification,expected,fault);assert.equal(h.calls.posts,posts,fault);
+  assert.equal(recovered.attemptConsumed,true);assert.equal(recovered.siteClaimRetained,true);
+  assert.equal(recovered.restorationRequired,true);assert.equal(recovered.postProven,false);
+  for(const field of ['productionConfirmation','runtimeConfirmationVerified','writeReady','executionReady',
+   'grantsCompletionAuthority','grantsSuccessorAuthority','releasesOwnership','closesOperation'])assert.equal(recovered[field],false,`${fault}:${field}`);
+  assert.deepEqual((await io.readdir(h.x.config.directory)).sort(),files,fault);
+  assert.ok(attempted.attemptId);await io.access(path.join(h.x.config.directory,'site-12345-attempt.active'));
+  assert.equal((await journals.repeatAttemptEligibility(h.x.config.directory,'12345',{status:'missing'})).code,'ATTEMPT_IN_PROGRESS');
+  if(fault==='valid'){
+   await assert.rejects(h.restartAttempt(),/ATTEMPT_INTENT_INVALID/);
+   assert.equal(h.calls.posts,posts);
+   const source=fs.readFileSync('src/lib/tesla-tariff/supervised-local.ts','utf8');
+   assert.doesNotMatch(source,/export\s+(?:async\s+)?function\s+classifyConsumedAuthenticatedAttemptRecovery/);
+   assert.doesNotMatch(source,/--recover-authenticated|HEP_ENABLE_AUTHENTICATED_RECOVERY/);
+  }
+ }
+});
+test('private authenticated recovery rejects corrupt immutable journals and consumption markers before acquisition',async t=>{
+ for(const target of ['journal','consumption']){
+  const h=await privateContinuationFixture(t);await h.handle.recordApplyIntent();const producer=await h.createAuthenticated();await producer.run();
+  const file=path.join(h.x.config.directory,`site-12345-attempt-${h.x.initial.mutationId}.jsonl`);
+  if(target==='journal')await io.appendFile(file,'{}\n');else await io.writeFile(file+'.execution','{}\n');
+  const reads={products:h.calls.productReads,site:h.calls.authReads,posts:h.calls.posts};
+  const recovered=await h.recoverAuthenticated();assert.equal(recovered.classification,'unknown');
+  assert.equal(recovered.code,target==='journal'?'RECOVERY_JOURNAL_INVALID':'RECOVERY_CONSUMPTION_INVALID');
+  assert.deepEqual({products:h.calls.productReads,site:h.calls.authReads,posts:h.calls.posts},reads);
+  assert.equal(recovered.restorationRequired,true);assert.equal(recovered.siteClaimRetained,true);
+ }
+});
+test('private authenticated recovery verifies every retained prior journal before acquisition',async t=>{
+ for(const target of ['missing','changed','unsafe-reference','duplicate-reference']){
+  const h=await privateContinuationFixture(t);await h.handle.recordApplyIntent();const producer=await h.createAuthenticated();await producer.run();
+  if(target==='missing')await io.rm(h.x.root);
+  if(target==='changed')await io.writeFile(h.x.root,h.x.priorBytes.replace('write-outcome-unknown','write-outcome-substituted'));
+  if(target==='unsafe-reference'||target==='duplicate-reference'){
+   const marker=JSON.parse(await io.readFile(h.marker,'utf8'));
+   if(target==='unsafe-reference')marker.prior[0].name='../outside.jsonl';else marker.prior.push(structuredClone(marker.prior[0]));
+   marker.binding.priorHistoryKey=hash(marker.prior);
+   const {checksum:_checksum,...body}=marker;void _checksum;await io.writeFile(h.marker,JSON.stringify({...body,checksum:hash(body)})+'\n');
+  }
+  const reads={products:h.calls.productReads,site:h.calls.authReads,posts:h.calls.posts};
+  const recovered=await h.recoverAuthenticated();assert.equal(recovered.classification,'unknown',target);
+  assert.equal(recovered.code,'RECOVERY_PRIOR_EVIDENCE_INVALID',target);
+  assert.deepEqual({products:h.calls.productReads,site:h.calls.authReads,posts:h.calls.posts},reads,target);
+  assert.equal(recovered.attemptConsumed,true);assert.equal(recovered.siteClaimRetained,true);assert.equal(recovered.restorationRequired,true);
  }
 });
 test('caller-approved identity cannot substitute for authenticated product discovery',async t=>{
