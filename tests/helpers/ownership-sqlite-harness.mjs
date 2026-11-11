@@ -13,6 +13,7 @@ const sqlite=await import('node:sqlite');
 export function loadStore(hooks = {}, version = process.versions.node) {
   const cache = new Map();
   class ControlledDatabase extends sqlite.DatabaseSync {
+    constructor(...args) { hooks.beforeDatabaseOpen?.(...args); super(...args); }
     exec(sql) { hooks.beforeExec?.(sql); const out=super.exec(sql); hooks.afterExec?.(sql); return out; }
     prepare(sql) {
       const statement=super.prepare(sql);
@@ -24,7 +25,7 @@ export function loadStore(hooks = {}, version = process.versions.node) {
   function load(file) {
     file=path.resolve(file); if(cache.has(file))return cache.get(file);
     let source=fs.readFileSync(file,'utf8');
-    if(file.endsWith('/ownership-sqlite.ts'))source+='\nexport { commitOwnership as testCommit, commitOwnershipExact as testCommitExact };' + offlineTransactionSource + offlineRecoverySource;
+    if(file.endsWith('/ownership-sqlite.ts'))source+='\nexport { commitOwnership as testCommit, commitOwnershipExact as testCommitExact, trustTerminalRestoration as testTrustTerminalRestoration };' + offlineTransactionSource + offlineRecoverySource;
     // Test-realm-only entry points. Application exports remain unchanged.
     if(file.endsWith('/ownership-lifecycle.ts'))source+='\nexport { validateOfflineOwnershipLifecycleDocument as testValidateOfflineLifecycle };';
     if(file.endsWith('/ownership-persistence.ts'))source+=`\nexport function testValidateOfflinePersistence(current, records, site, zone, journal, context) {

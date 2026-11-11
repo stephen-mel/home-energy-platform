@@ -1,4 +1,4 @@
-import { lstatSync, mkdirSync, openSync, closeSync } from "node:fs";
+import { lstatSync, mkdirSync, openSync, closeSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
@@ -11,7 +11,8 @@ import { finaliseConfirmedSmartOwnership } from "./ownership-finalisation";
 
 import { validLifecycleOwnershipSnapshot, validRetainedOriginal, retainedOriginKey, type RetainedOriginal, type RetentionInput } from "./retained-original";
 import { validateRetainedJournal } from "./retained-original-journal";
-import { validatePersistedOwnershipHistory, persistenceOnly } from "./ownership-persistence";
+import { validatePersistedOwnershipHistory, persistenceOnly, type PersistedOwnershipLifecycle } from "./ownership-persistence";
+import { validateOwnershipLifecycleDocument, type OwnershipLifecycleValidationContext } from "./ownership-lifecycle";
 import { readOfflineOperationHistory } from "./repeat-attempt-journal";
 import type { OfflineOperationPreparationPorts } from "./prepared-mutation-context";
 
@@ -455,6 +456,137 @@ function ownershipTransaction(databasePath: string, input: CommitInput, exact?: 
         return { status, snapshot: structuredClone(snapshot) };
         });
     } catch (error) { return ownershipTransactionFailure(error, false); }
+}
+
+export type OwnershipRetirementRequest = {
+    version: 1; site: string; operationId: string; mutationId: string;
+    expectedGeneration: string; expectedCurrentRecordId: string; expectedCurrentLifecycleId: string;
+    expectedPredecessorApplicationId: string; originalFingerprint: string;
+    terminalRecord: PersistedOwnershipLifecycle;
+};
+type RetirementStoreBinding = { requestedPath: string; canonicalPath: string; device: number; inode: number };
+type TrustedTerminalRestoration = { requestKey: string; context: OwnershipLifecycleValidationContext;
+    store: RetirementStoreBinding; state: "live" | "consumed" };
+const trustedTerminalRestorations = new WeakMap<object, TrustedTerminalRestoration>();
+const retirementFlags = Object.freeze({ executionReady: false, writeReady: false, restorationProven: false,
+    grantsAdmissionAuthority: false, grantsSuccessorAuthority: false, grantsRepeatAuthority: false,
+    releasesSiteClaim: false, closesOperation: false } as const);
+
+function validateTerminalRetirementRequest(value: unknown, context: OwnershipLifecycleValidationContext) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw Error("OWNERSHIP_RETIREMENT_INPUT_INVALID");
+    const request = value as OwnershipRetirementRequest;
+    if (Object.keys(request).sort().join() !== "expectedCurrentLifecycleId,expectedCurrentRecordId,expectedGeneration,expectedPredecessorApplicationId,mutationId,operationId,originalFingerprint,site,terminalRecord,version"
+        || request.version !== 1 || !siteId(request.site)
+        || !/^[A-Za-z0-9_-]{1,128}$/.test(request.operationId) || !/^[A-Za-z0-9_-]{1,128}$/.test(request.mutationId)
+        || !/^[a-f0-9-]{36}$/.test(request.expectedGeneration)
+        || ![request.expectedCurrentRecordId, request.expectedCurrentLifecycleId,
+            request.expectedPredecessorApplicationId, request.originalFingerprint].every(digest))
+        throw Error("OWNERSHIP_RETIREMENT_INPUT_INVALID");
+    const terminal = request.terminalRecord;
+    if (!terminal || Object.keys(terminal).sort().join() !== "approvedValidity,kind,lifecycle,previousRecordId,recordId,version"
+        || terminal.version !== 1 || terminal.kind !== "v3-ownership-persistence"
+        || terminal.previousRecordId !== request.expectedCurrentRecordId
+        || terminal.recordId !== hash({ purpose: "smart-ownership-persistence-v1", version: terminal.version,
+            kind: terminal.kind, lifecycle: terminal.lifecycle, approvedValidity: terminal.approvedValidity,
+            previousRecordId: terminal.previousRecordId })) throw Error("OWNERSHIP_RETIREMENT_RECORD_INVALID");
+    const checked = validateOwnershipLifecycleDocument(terminal.lifecycle, context);
+    if (checked.status !== "validated") throw Error("OWNERSHIP_RETIREMENT_EVIDENCE_INVALID");
+    const lifecycle = checked.document, restoration = lifecycle.restoration;
+    const last = lifecycle.applications.at(-1), intent = restoration?.operation.initial.intent;
+    if (lifecycle.state !== "restored" || lifecycle.restorationObligation !== "retired" || !restoration || !last || !intent
+        || intent.kind !== "restore" || lifecycle.energySiteId !== request.site || context.energySiteId !== request.site
+        || intent.operationId !== request.operationId || intent.mutationId !== request.mutationId
+        || last.operationId !== request.operationId || last.mutationId !== request.mutationId
+        || restoration.applicationId !== last.applicationId
+        || restoration.predecessorApplicationId !== request.expectedPredecessorApplicationId
+        || last.predecessorApplicationId !== request.expectedPredecessorApplicationId
+        || intent.ownershipBefore?.generation !== request.expectedGeneration
+        || context.historicalOwnership.generation !== request.expectedGeneration
+        || context.previousLifecycle?.lifecycleId !== request.expectedCurrentLifecycleId
+        || context.previousLifecycle.state !== "active" || context.previousLifecycle.restorationObligation !== "required"
+        || intent.originalFingerprint !== request.originalFingerprint
+        || context.historicalOwnership.lifecycle.originalFingerprint !== request.originalFingerprint)
+        throw Error("OWNERSHIP_RETIREMENT_BINDING_INVALID");
+    return { request: structuredClone(request), context: structuredClone(context) };
+}
+
+function retirementStoreBinding(databasePath: string): RetirementStoreBinding {
+    const requestedPath = path.resolve(databasePath), stat = lstatSync(requestedPath), canonicalPath = realpathSync(requestedPath);
+    if (!stat.isFile() || stat.isSymbolicLink() || canonicalPath !== requestedPath
+        || !Number.isSafeInteger(stat.dev) || !Number.isSafeInteger(stat.ino)) throw Error("OWNERSHIP_RETIREMENT_STORE_INVALID");
+    return { requestedPath, canonicalPath, device: stat.dev, inode: stat.ino };
+}
+
+/** JSON-only detachment without property reads. Ordinary accessors are rejected
+ * without invocation. Proxy traps may still run while descriptors are queried,
+ * so no store identity is trusted until after this entire boundary completes. */
+function detachRetirementRequest(value: unknown): unknown {
+    const seen = new Set<object>();
+    const visit = (candidate: unknown): unknown => {
+        if (candidate === null || typeof candidate === "string" || typeof candidate === "boolean") return candidate;
+        if (typeof candidate === "number") { if (!Number.isFinite(candidate)) throw Error(); return candidate; }
+        if (typeof candidate !== "object") throw Error();
+        if (seen.has(candidate)) throw Error(); seen.add(candidate);
+        const array = Array.isArray(candidate);
+        const descriptors = Object.getOwnPropertyDescriptors(candidate);
+        if (Reflect.ownKeys(descriptors).some(key => typeof key !== "string")) throw Error();
+        if (array) {
+            const length = descriptors.length;
+            if (!length || "get" in length || typeof length.value !== "number" || !Number.isSafeInteger(length.value)
+                || length.value < 0 || Object.keys(descriptors).some(key => key !== "length" && !/^(0|[1-9]\d*)$/.test(key))) throw Error();
+            const result: unknown[] = [];
+            for (let n = 0; n < length.value; n++) {
+                const descriptor = descriptors[String(n)];
+                if (!descriptor || !descriptor.enumerable || "get" in descriptor || "set" in descriptor) throw Error();
+                result.push(visit(descriptor.value));
+            }
+            if (Object.keys(descriptors).length !== length.value + 1) throw Error();
+            seen.delete(candidate); return result;
+        }
+        const result: Record<string, unknown> = Object.create(null);
+        for (const [key, descriptor] of Object.entries(descriptors)) {
+            if (!descriptor.enumerable || "get" in descriptor || "set" in descriptor) throw Error();
+            Object.defineProperty(result, key, { value: visit(descriptor.value), enumerable: true, writable: true, configurable: true });
+        }
+        seen.delete(candidate); return result;
+    };
+    try { return visit(value); } catch { throw Error("OWNERSHIP_RETIREMENT_INPUT_INVALID"); }
+}
+
+/** Private trust-boundary seam. No production caller or export issues these
+ * capabilities in 2B2a; tests instrument it with explicitly trusted fixtures. */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- future trusted adapter seam; test-realm instrumentation only in 2B2a
+function trustTerminalRestoration(databasePath: string, value: unknown, context: OwnershipLifecycleValidationContext): object {
+    const checked = validateTerminalRetirementRequest(value, context), capability = Object.freeze({});
+    trustedTerminalRestorations.set(capability, { requestKey: hash(checked.request), context: checked.context,
+        store: retirementStoreBinding(databasePath), state: "live" });
+    return capability;
+}
+
+export function retireConfirmedSmartOwnership(databasePath: string, capability: unknown, supplied: unknown) {
+    const reject = (code: string) => Object.freeze({ status: "rejected" as const, code, ...retirementFlags });
+    try {
+        if (!capability || typeof capability !== "object") return reject("OWNERSHIP_RETIREMENT_AUTHORITY_REQUIRED");
+        const trusted = trustedTerminalRestorations.get(capability);
+        if (!trusted) return reject("OWNERSHIP_RETIREMENT_AUTHORITY_REQUIRED");
+        if (trusted.state !== "live") return reject("OWNERSHIP_RETIREMENT_AUTHORITY_CONSUMED");
+        trusted.state = "consumed";
+        if (typeof databasePath !== "string") return reject("OWNERSHIP_RETIREMENT_STORE_MISMATCH");
+        const detached = detachRetirementRequest(supplied);
+        if (hash(detached) !== trusted.requestKey) return reject("OWNERSHIP_RETIREMENT_AUTHORITY_MISMATCH");
+        const checked = validateTerminalRetirementRequest(detached, trusted.context), request = checked.request;
+        let actualStore: RetirementStoreBinding;
+        try { actualStore = retirementStoreBinding(databasePath); }
+        catch { return reject("OWNERSHIP_RETIREMENT_STORE_MISMATCH"); }
+        if (representationKey(actualStore) !== representationKey(trusted.store))
+            return reject("OWNERSHIP_RETIREMENT_STORE_MISMATCH");
+        // node:sqlite DatabaseSync accepts only a pathname and exposes no
+        // backing descriptor, sqlite3_file_control or VFS file handle. A path
+        // check cannot identify the file already opened by SQLite. Until a
+        // supported descriptor-bound driver exists, retirement is unavailable.
+        void checked; void request;
+        return reject("OWNERSHIP_RETIREMENT_OPEN_CONNECTION_IDENTITY_UNAVAILABLE");
+    } catch (error) { return reject(code(error)); }
 }
 
 function freeze<T>(value: T): Readonly<T> {
