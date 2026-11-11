@@ -1,7 +1,7 @@
 /** Local interactive adapter ONLY. Never import from a route, page, sync planner,
  * scheduled task or test transport. No token refresh, new scopes or other commands.
  */
-import { readFile, mkdir, writeFile, open } from "node:fs/promises";
+import { readFile, mkdir, writeFile, open, lstat, realpath } from "node:fs/promises";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { createInterface } from "node:readline/promises";
@@ -11,7 +11,7 @@ import { getRecordedKrakenStateForInspection } from "../site/kraken-refresh";
 import { representationKey as journalKey } from "./rollback-evidence";
 import { captureObservedTariff, simulatedTariffObservation, type ObservedTariff } from "./observed-tariff";
 import * as journalRecords from "./linked-experiment-records";
-import { prepareMutationContext, type PreparedMutationContext } from "./prepared-mutation-context";
+import { expectedOperationGeneration, prepareMutationContext, type PreparedMutationContext } from "./prepared-mutation-context";
 import { ownershipStore } from "./ownership-store";
 import { persistConfirmedSmart } from "./ownership-sqlite";
 import { admitOfflineReconciledExperiment, readOfflineReconciledExperiment, verifyOfflineReconciledPriorEvidence, validReconciledApplyRecords, validReconciledLifecycleRecords, type ReconciledRestoreIntent, type ReconciledRestoreAttempt, type ReconciledRestoreClassification, type ReconciledApplyIntent, type ReconciledApplyClassification, type ReconciledAttemptConsumption, type OfflineReconciliationPorts, type OfflineExperimentBinding } from "./repeat-attempt-journal";
@@ -20,6 +20,10 @@ import { approveTariffProposal } from "./proposal-approval";
 import type { RehearsalApproval } from "./smart-lifecycle-rehearsal";
 import { reviewObservedRestoration, compareObservedTariffReadBack } from "./restoration-review";
 import { validateTeslaInspectionEvidence } from "./smart-inspection";
+import { validateConfirmedOperationEvidence, validateOperationCompletionRecord, validateOperationInitialRecord,
+    type ConfirmedOperationEvidence, type ConfirmedOperationValidationContext, type SmartOperationCompletionRecord,
+    type SmartOperationInitialRecord, type SmartOperationIntent } from "./confirmed-operation-evidence";
+import type { RetainedOriginal } from "./retained-original";
 import { claimExperimentJournal } from "./supervised-journal";
 import { runSupervisedExperiment, interpretWriteResponse, StaleApprovalOrEvidenceError, validateCurrentSupervisedCapture, prepareSupervisedExperiment, classifyExperimentResult, CAPTURE_TTL_MS, EVIDENCE_TTL_MS, APPROVAL_TTL_MS, MIN_WRITE_REMAINING_MS, type ExperimentPorts } from "./supervised-experiment";
 
@@ -404,7 +408,8 @@ async function classifyConsumedAuthenticatedAttemptRecovery(
         grantsCompletionAuthority: false as const, grantsSuccessorAuthority: false as const,
         releasesOwnership: false as const, closesOperation: false as const,
         attemptConsumed: true as const, siteClaimRetained: true as const, restorationRequired: true as const };
-    const unknown = (code: string) => Object.freeze({ ...denied, classification: "unknown" as const,
+    const unknown = (code: string) => Object.freeze({ ...denied,
+        operationConfirmation: "unresolved" as const, operationEvidenceId: null, classification: "unknown" as const,
         code, observation: null, proposedComparison: null, originalComparison: null });
     try {
         if (config.mode !== "offline" || !/^\d+$/.test(config.site)) return unknown("RECOVERY_JOURNAL_INVALID");
@@ -429,6 +434,19 @@ async function classifyConsumedAuthenticatedAttemptRecovery(
             return unknown("RECOVERY_JOURNAL_INVALID");
         const consumedText = await readFile(file + ".execution", "utf8");
         if (consumedText !== JSON.stringify(attempt) + "\n") return unknown("RECOVERY_CONSUMPTION_INVALID");
+        const expectedInitialBridge = operationInitialBridge(initial, markerText, binding.experimentId as string);
+        const persistedInitialBridge = await readPhysicalBridge<OperationInitialBridge>(file + ".operation.initial");
+        if (journalKey(persistedInitialBridge) !== journalKey(expectedInitialBridge)
+            || attempt.binding.operationInitialRecordId !== expectedInitialBridge.operationInitial.initialRecordId)
+            return unknown("RECOVERY_OPERATION_INITIAL_INVALID");
+        let persistedCompletion: OperationCompletionBridge | null = null;
+        try {
+            persistedCompletion = await readPhysicalBridge<OperationCompletionBridge>(file + ".operation.completion");
+            if (!validOperationCompletionBridge(persistedCompletion, expectedInitialBridge, attempt))
+                return unknown("RECOVERY_OPERATION_COMPLETION_INVALID");
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") return unknown("RECOVERY_OPERATION_COMPLETION_INVALID");
+        }
 
         const site = await discoverAuthenticatedTeslaSite(config.site);
         const { getTeslaSiteInfo } = await import("../tesla/client");
@@ -450,10 +468,139 @@ async function classifyConsumedAuthenticatedAttemptRecovery(
             ? proposedExact ? "unknown" : proposedComparison.outcome === "different-observed-representation"
                 && originalComparison.outcome === "different-observed-representation" ? "external-conflict" : "unknown"
             : proposedExact ? "proposed-exact" : "original-exact";
-        return Object.freeze({ ...denied, classification,
+        // The completion sidecar proves only documentary consistency. It is
+        // stored by the same process that made the request and is therefore
+        // not an independent durable trust anchor for POST acceptance.
+        return Object.freeze({ ...denied,
             code: classification === "unknown" ? "RECOVERY_EVIDENCE_INCOMPLETE" : null,
-            observation: structuredClone(observation), proposedComparison, originalComparison });
+            operationConfirmation: "unresolved" as const, operationEvidenceId: null,
+            observation: structuredClone(observation), proposedComparison, originalComparison, classification });
     } catch { return unknown("RECOVERY_UNAVAILABLE"); }
+}
+
+type OperationInitialBridge = { version: 1; phase: "authenticated-operation-initial"; v3AdmissionKey: string;
+    v3InitialRecordId: string; sourceApprovalKey: string; operationInitial: SmartOperationInitialRecord; recordId: string };
+type OperationCompletionBridge = { version: 1; phase: "authenticated-operation-completion"; v3AdmissionKey: string;
+    v3AttemptRecordId: string; evidence: ConfirmedOperationEvidence; context: ConfirmedOperationValidationContext; recordId: string };
+
+async function readPhysicalBridge<T>(file: string): Promise<T> {
+    const stat = await lstat(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 8_000_000 || await realpath(file) !== file) throw Error("OPERATION_BRIDGE_CONFLICT");
+    const text = await readFile(file, "utf8");
+    if (!text.endsWith("\n") || text.slice(0, -1).includes("\n")) throw Error("OPERATION_BRIDGE_CONFLICT");
+    return JSON.parse(text) as T;
+}
+
+function validOperationCompletionBridge(value: OperationCompletionBridge, initial: OperationInitialBridge,
+    attempt: ReconciledAttemptConsumption) {
+    try {
+        if (!value || Object.keys(value).sort().join() !== "context,evidence,phase,recordId,v3AdmissionKey,v3AttemptRecordId,version") return false;
+        const { recordId, ...body } = value;
+        return value.version === 1 && value.phase === "authenticated-operation-completion"
+            && value.v3AdmissionKey === initial.v3AdmissionKey && value.v3AttemptRecordId === attempt.recordId
+            && recordId === ownershipFingerprint(body)
+            && validateOperationInitialRecord(value.evidence.initial).status === "validated"
+            && value.evidence.initial.initialRecordId === initial.operationInitial.initialRecordId
+            && completeAuthenticatedReadback(value.evidence.completion.readback.observation)
+            && validateOperationCompletionRecord(value.evidence.completion, value.evidence.initial).status === "validated"
+            && validateConfirmedOperationEvidence(value.evidence, value.context).status === "validated";
+    } catch { return false; }
+}
+
+function completeAuthenticatedReadback(observation: ObservedTariff): boolean {
+    const representations = observation?.representations;
+    if (!representations || representations.legacy === null || representations.relationship !== "consistent") return false;
+    const validated = validateTeslaInspectionEvidence(observation);
+    return validated !== null && journalKey(validated) === journalKey(observation);
+}
+
+function operationInitialBridge(initial: journalRecords.LinkedInitialRecord, markerText: string, experimentId: string): OperationInitialBridge {
+    const ownership = initial.preparedContext.ownership;
+    if (ownership.status !== "missing") throw Error("OPERATION_BRIDGE_OWNERSHIP_UNSUPPORTED");
+    const operationId = experimentId, mutationId = initial.mutationId, before = structuredClone(initial.review.before);
+    if (!before.representations || before.representations.legacy === null || before.representations.relationship !== "consistent")
+        throw Error("OPERATION_BRIDGE_ORIGINAL_INCOMPLETE");
+    const intent: SmartOperationIntent = { kind: "apply", operationId, mutationId,
+        energySiteId: before.source.energySiteId, timeZone: before.source.timeZone!, predecessor: null, ownershipBefore: null,
+        ownershipAfterGeneration: expectedOperationGeneration(before.source.energySiteId, operationId, mutationId, { status: "missing" }),
+        original: structuredClone(before), originalFingerprint: ownershipFingerprint(before.tariff), origin: null,
+        before: { observationId: ownershipFingerprint({ purpose: "v3-operation-before", admission: ownershipFingerprint(markerText), observation: before }), observation: before },
+        payloadJson: initial.review.payloadJson, payloadFingerprint: ownershipFingerprint(JSON.parse(initial.review.payloadJson)),
+        preparedAt: initial.review.proposal.bound.validFrom, validFrom: initial.review.proposal.bound.validFrom,
+        expiresAt: initial.review.proposal.bound.expiresAt };
+    const approved = { version: 2 as const, operationId, mutationId, fingerprint: journalKey(intent),
+        approvedAt: initial.exception.approval.approvedAt };
+    const approval = { ...approved, approvalId: ownershipFingerprint(approved) };
+    const initialBody = { journalSchemaVersion: 2 as const, phase: "approved-operation" as const, intent, approval };
+    const operationInitial: SmartOperationInitialRecord = { ...initialBody, initialRecordId: ownershipFingerprint(initialBody) };
+    const checked = validateOperationInitialRecord(operationInitial);
+    if (checked.status !== "validated") throw Error("OPERATION_BRIDGE_INITIAL_INVALID");
+    const body = { version: 1 as const, phase: "authenticated-operation-initial" as const,
+        v3AdmissionKey: ownershipFingerprint(markerText), v3InitialRecordId: initial.initialRecordId,
+        sourceApprovalKey: ownershipFingerprint(initial.exception.approval), operationInitial };
+    return { ...body, recordId: ownershipFingerprint(body) };
+}
+
+async function durableBridgeRecord<T>(file: string, value: T, directory: string): Promise<T> {
+    const text = JSON.stringify(value) + "\n";
+    try {
+        const handle = await open(file, "wx", 0o600);
+        try { await handle.writeFile(text, "utf8"); await handle.sync(); } finally { await handle.close(); }
+        const parent = await open(directory, "r"); try { await parent.sync(); } finally { await parent.close(); }
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        const stat = await lstat(file);
+        if (!stat.isFile() || stat.isSymbolicLink() || await realpath(file) !== file || await readFile(file, "utf8") !== text)
+            throw Error("OPERATION_BRIDGE_CONFLICT");
+        // A previous exclusive create may have written the exact bytes but
+        // failed before fsync. Matching contents are not durability proof.
+        const existing = await open(file, "r");
+        try { await existing.sync(); } finally { await existing.close(); }
+        const parent = await open(directory, "r");
+        try { await parent.sync(); } finally { await parent.close(); }
+    }
+    return value;
+}
+
+function operationCompletionBridge(initialBridge: OperationInitialBridge, attempt: ReconciledAttemptConsumption,
+    result: { attemptedAt: string; completedAt: string | null; apiWrite: ReturnType<typeof interpretWriteResponse>; observation: ObservedTariff | null },
+    journalCompletedAt: string): OperationCompletionBridge | null {
+    if (!result.completedAt || result.apiWrite.status !== "accepted" || !result.observation) return null;
+    const actual = result.observation.representations;
+    // The validation-only intended representation has no legacy expectation.
+    // Trusted completion still requires Tesla's actual authenticated V2+legacy
+    // pair, including export, to be present and internally consistent.
+    if (!actual || !completeAuthenticatedReadback(result.observation)) return null;
+    const i = initialBridge.operationInitial.intent;
+    const readback = { observationId: ownershipFingerprint({ purpose: "v3-operation-readback", attemptRecordId: attempt.recordId,
+        observation: result.observation }), observation: structuredClone(result.observation) };
+    const completionBody = { journalSchemaVersion: 2 as const, phase: "confirmed-operation" as const,
+        operationId: i.operationId, mutationId: i.mutationId, energySiteId: i.energySiteId, timeZone: i.timeZone,
+        initialRecordId: initialBridge.operationInitial.initialRecordId, ownershipAfterGeneration: i.ownershipAfterGeneration,
+        submittedAt: result.attemptedAt, completedAt: result.completedAt, journalCompletedAt, apiWrite: result.apiWrite,
+        readback, finalTariffFingerprint: ownershipFingerprint(result.observation.tariff), outcome: "applied" as const };
+    const completion: SmartOperationCompletionRecord = { ...completionBody, completionRecordId: ownershipFingerprint(completionBody) };
+    if (validateOperationCompletionRecord(completion, initialBridge.operationInitial).status !== "validated") return null;
+    const envelopeBody = { version: 2 as const, initial: initialBridge.operationInitial, completion };
+    const evidence: ConfirmedOperationEvidence = { ...envelopeBody, evidenceId: ownershipFingerprint(envelopeBody) };
+    const issuanceKey = ownershipFingerprint({ purpose: "v3-operation-issuance", admission: initialBridge.v3AdmissionKey,
+        sourceApproval: initialBridge.sourceApprovalKey });
+    const retainedOriginal: RetainedOriginal = { version: 1, energySiteId: i.energySiteId, timeZone: i.timeZone,
+        original: structuredClone(i.original), originalFingerprint: i.originalFingerprint,
+        origin: { mutationId: i.mutationId, initialRecordId: initialBridge.operationInitial.initialRecordId,
+            classifiedRecordId: completion.completionRecordId, issuanceKey, receiptKey: evidence.evidenceId, journal: "attempt" },
+        restorationObligation: "required", currentGeneration: i.ownershipAfterGeneration,
+        latestReadback: { mutationId: i.mutationId, receiptKey: evidence.evidenceId, fingerprint: completion.finalTariffFingerprint } };
+    const context: ConfirmedOperationValidationContext = { energySiteId: i.energySiteId, timeZone: i.timeZone,
+        ownershipBefore: null, ownershipAfterGeneration: i.ownershipAfterGeneration, retainedOriginal, confirmedHistory: [],
+        approvals: [initialBridge.operationInitial.approval], authenticatedObservations: [
+            { ...i.before, operationId: i.operationId, mutationId: i.mutationId, phase: "before" },
+            { ...readback, operationId: i.operationId, mutationId: i.mutationId, phase: "readback" }],
+        durableJournal: [{ initialRecordId: initialBridge.operationInitial.initialRecordId, completionRecordId: completion.completionRecordId }] };
+    if (validateConfirmedOperationEvidence(evidence, context).status !== "validated") return null;
+    const body = { version: 1 as const, phase: "authenticated-operation-completion" as const,
+        v3AdmissionKey: initialBridge.v3AdmissionKey, v3AttemptRecordId: attempt.recordId, evidence, context };
+    return { ...body, recordId: ownershipFingerprint(body) };
 }
 const attemptedIntents = new Set<string>();
 const intentAttempted = attemptedIntents.has.bind(attemptedIntents);
@@ -486,10 +633,14 @@ async function createPrivateAttemptProducer(initialRecord: journalRecords.Linked
         throw Error("ATTEMPT_INTENT_INVALID");
     const authenticatedRequest = adapter === authenticatedTransportFoundation;
     const providerSite = authenticatedRequest ? await discoverAuthenticatedTeslaSite(site) : site;
+    const operationBridge = authenticatedRequest && kind === "apply" ? operationInitialBridge(initial, markerText, marker.binding.experimentId) : null;
+    const operationInitialFile = file + ".operation.initial";
+    if (operationBridge) await durableBridgeRecord(operationInitialFile, operationBridge, config.directory);
     const binding = Object.freeze({ site: providerSite, mutationId: initial.mutationId, experimentId: marker.binding.experimentId,
         initialRecordId: initial.initialRecordId, intentRecordId: intent.recordId, admissionKey: ownershipFingerprint(markerText),
         payloadKey: ownershipFingerprint(payloadJson), ownershipKey: ownershipFingerprint(initial.preparedContext.ownership),
-        originalObservationKey: ownershipFingerprint(initial.review.before) });
+        originalObservationKey: ownershipFingerprint(initial.review.before),
+        ...(operationBridge ? { operationInitialRecordId: operationBridge.operationInitial.initialRecordId } : {}) });
     const authenticated = authenticatedRequest
         ? await createAuthenticatedTeslaAttemptAdapter(providerSite, payloadJson, binding, now) : null;
     const selected = authenticated ?? adapter as SimulatedAttemptAdapter | undefined;
@@ -516,6 +667,12 @@ async function createPrivateAttemptProducer(initialRecord: journalRecords.Linked
         rememberAttempt(claim); // consume before durability checks or transport
         if (await readFile(markerFile, "utf8") !== markerText || await readFile(file, "utf8") !== text)
             throw Error("ATTEMPT_JOURNAL_CHANGED");
+        if (operationBridge) {
+            let operationText: string;
+            try { operationText = await readFile(operationInitialFile, "utf8"); }
+            catch { throw Error("OPERATION_BRIDGE_CONFLICT"); }
+            if (operationText !== JSON.stringify(operationBridge) + "\n") throw Error("OPERATION_BRIDGE_CONFLICT");
+        }
         // Independently flush the existing intent and directory before invoking
         // even a simulated transport. Failure never reaches post and cannot retry.
         const handle = await open(file, "r");
@@ -594,8 +751,19 @@ async function createPrivateAttemptProducer(initialRecord: journalRecords.Linked
         const classification = classifyExperimentResult(apiWrite, intended, observation, comparison);
         const outcome = apiWrite.status === "unknown" ? "write-outcome-unknown" : apiWrite.status === "rejected" ? "write-rejected"
             : comparison.outcome === "exact-observed-match" && comparison.timelineScope.complete ? "accepted-exact-readback" : "accepted-readback-unverified";
+        let operationEvidence: OperationCompletionBridge | null = null;
+        if (operationBridge && outcome === "accepted-exact-readback") try {
+            const journalCompletedAt = now();
+            if (completedAt && Number.isFinite(Date.parse(journalCompletedAt)) && Date.parse(journalCompletedAt) >= Date.parse(completedAt)) {
+                const candidate = operationCompletionBridge(operationBridge, attempt as ReconciledAttemptConsumption,
+                    { attemptedAt: dispatchedAt, completedAt, apiWrite, observation }, journalCompletedAt);
+                if (candidate) operationEvidence = await durableBridgeRecord(file + ".operation.completion", candidate, config.directory);
+            }
+        } catch { /* A consumed write with uncertain completion durability remains unresolved. */ }
         return freeze({ ...denied, provenance, attemptId, attemptRecordId: attempt.recordId, binding,
-            attemptedAt: dispatchedAt, completedAt, apiWrite, observation, comparison, classification: classification as journalRecords.LinkedClassifiedRecord["classification"], outcome });
+            attemptedAt: dispatchedAt, completedAt, apiWrite, observation, comparison, classification: classification as journalRecords.LinkedClassifiedRecord["classification"], outcome,
+            operationConfirmation: operationEvidence ? "confirmed" as const : "unresolved" as const,
+            operationEvidenceId: operationEvidence?.evidence.evidenceId ?? null });
     } });
     return producer;
 }

@@ -625,6 +625,7 @@ export async function verifyOfflineReconciledPriorEvidence(config: OfflineExperi
         if (!Array.isArray(marker.prior) || typeof marker.binding?.mutationId !== "string"
             || typeof marker.binding.priorHistoryKey !== "string" || ownershipFingerprint(marker.prior) !== marker.binding.priorHistoryKey) return false;
         const current = journalName(config.site, marker.binding.mutationId), active = activeName(config.site);
+        const operationInitial = current + ".operation.initial", operationCompletion = current + ".operation.completion";
         const references = marker.prior as PriorFile[], names = new Set<string>();
         for (const reference of references) {
             if (!reference || typeof reference !== "object" || Array.isArray(reference)
@@ -632,11 +633,11 @@ export async function verifyOfflineReconciledPriorEvidence(config: OfflineExperi
                 || typeof reference.digest !== "string" || !/^[a-f0-9]{64}$/.test(reference.digest)
                 || path.basename(reference.name) !== reference.name || names.has(reference.name)
                 || !(reference.name === legacyName(config.site) || reference.name.startsWith(`site-${config.site}-`))
-                || [active, current, current + ".execution", current + ".restore.execution"].includes(reference.name)) return false;
+                || [active, current, current + ".execution", current + ".restore.execution", operationInitial, operationCompletion].includes(reference.name)) return false;
             names.add(reference.name);
         }
         const relevant = (await readdir(config.directory)).filter(name => name === legacyName(config.site) || name.startsWith(`site-${config.site}-`));
-        const currentFiles = new Set([active, current, current + ".execution", current + ".restore.execution"]);
+        const currentFiles = new Set([active, current, current + ".execution", current + ".restore.execution", operationInitial, operationCompletion]);
         const physicalPrior = relevant.filter(name => !currentFiles.has(name));
         if (physicalPrior.length !== names.size || physicalPrior.some(name => !names.has(name))) return false;
         for (const reference of references)
@@ -809,7 +810,7 @@ export type ReconciledAttemptConsumption = {
     version: 1; mode: "disabled-supervised-lifecycle"; phase: "attempt-consumed";
     attemptId: string; attemptedAt: string;
     binding: { site: string; mutationId: string; experimentId: string; initialRecordId: string; intentRecordId: string;
-        admissionKey: string; payloadKey: string; ownershipKey: string; originalObservationKey: string };
+        admissionKey: string; payloadKey: string; ownershipKey: string; originalObservationKey: string; operationInitialRecordId?: string };
     provenance: "simulated-injected-transport" | "authenticated-tesla-fleet-api"; writeReady: false; runtimeConfirmationVerified: false; recordId: string;
 };
 export function validReconciledApplyRecords(initial: LinkedInitialRecord, admissionKey: string, records: unknown[], experimentId?: string): boolean {
@@ -835,11 +836,13 @@ export function validReconciledApplyRecords(initial: LinkedInitialRecord, admiss
             const expected = { site: intent.site, mutationId: initial.mutationId, experimentId,
                 initialRecordId: initial.initialRecordId, intentRecordId: intent.recordId, admissionKey,
                 payloadKey: ownershipFingerprint(initial.review.payloadJson), ownershipKey: ownershipFingerprint(initial.preparedContext.ownership),
-                originalObservationKey: ownershipFingerprint(initial.review.before) };
+                originalObservationKey: ownershipFingerprint(initial.review.before),
+                ...(attempt.provenance === "authenticated-tesla-fleet-api" ? { operationInitialRecordId: attempt.binding.operationInitialRecordId } : {}) };
             if (!identifier(experimentId) || !validJournalEvidenceJson(attempt)
                 || !sameKeys(attempt, ["version", "mode", "phase", "attemptId", "attemptedAt", "binding", "provenance", "writeReady", "runtimeConfirmationVerified", "recordId"])
                 || attempt.version !== 1 || attempt.mode !== "disabled-supervised-lifecycle" || !identifier(attempt.attemptId)
                 || !["simulated-injected-transport", "authenticated-tesla-fleet-api"].includes(attempt.provenance)
+                || attempt.provenance === "authenticated-tesla-fleet-api" && !/^[a-f0-9]{64}$/.test(attempt.binding.operationInitialRecordId ?? "")
                 || attempt.writeReady !== false || attempt.runtimeConfirmationVerified !== false
                 || attemptRecordId !== ownershipFingerprint(attemptBody) || ownershipFingerprint(attempt.binding) !== ownershipFingerprint(expected)
                 || !validOwnershipTimestamp(attempt.attemptedAt) || Date.parse(attempt.attemptedAt) < Date.parse(intent.attemptedAt)

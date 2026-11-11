@@ -63,6 +63,12 @@ export type ConfirmedOperationValidationContext = {
 };
 
 const hash = ownershipFingerprint, same = (a: unknown, b: unknown) => representationKey(a) === representationKey(b);
+const intendedObservation = (before: ObservedTariff, tariff: ObservedTariff["tariff"]): ObservedTariff => {
+    const { representations: _representations, ...base } = before; void _representations;
+    const detached = validateTeslaInspectionEvidence({ ...base, tariff });
+    return { ...base, tariff, ...(before.representations && detached
+        ? { representations: { v2: detached.tariff, legacy: null, relationship: "unverifiable" as const } } : {}) };
+};
 const keys = (v: object, names: string) => Object.keys(v).sort().join() === names;
 const operationIntentKeys = (i: SmartOperationIntent) => keys(i, "before,energySiteId,expiresAt,kind,mutationId,operationId,origin,original,originalFingerprint,ownershipAfterGeneration,ownershipBefore,payloadFingerprint,payloadJson,predecessor,preparedAt,timeZone,validFrom")
     || keys(i, "before,energySiteId,expiresAt,kind,mutationId,operationId,origin,original,originalFingerprint,ownershipAfterGeneration,ownershipAttribution,ownershipBefore,payloadFingerprint,payloadJson,predecessor,preparedAt,timeZone,validFrom");
@@ -124,8 +130,8 @@ export function validateOperationInitialRecord(value: unknown) {
         const payload = JSON.parse(i.payloadJson);
         if (!payload || !keys(payload, "tou_settings") || !payload.tou_settings || !keys(payload.tou_settings, "tariff_content_v2")
             || i.payloadJson !== representationKey(payload) || i.payloadFingerprint !== hash(payload)
-            || !same(validateTeslaInspectionEvidence({ ...i.before.observation, tariff: payload.tou_settings.tariff_content_v2 }),
-                { ...i.before.observation, tariff: payload.tou_settings.tariff_content_v2 })
+            || !same(validateTeslaInspectionEvidence(intendedObservation(i.before.observation, payload.tou_settings.tariff_content_v2)),
+                intendedObservation(i.before.observation, payload.tou_settings.tariff_content_v2))
             || i.kind === "restore" && !same(payload.tou_settings.tariff_content_v2, i.original.tariff)) return reject("INVALID_OPERATION_PAYLOAD");
         if ("ownershipAttribution" in i) {
             const t = i.ownershipAttribution!;
@@ -166,7 +172,7 @@ export function validateOperationCompletionRecord(value: unknown, initial: Smart
             || submit - Date.parse(i.before.observation.source.observedAt) > CAPTURE_TTL_MS
             || observed > complete || complete - observed > CAPTURE_TTL_MS || complete > Date.parse(record.journalCompletedAt)) return reject("INVALID_OPERATION_TIME");
         const date = new Intl.DateTimeFormat("en-CA", { timeZone: i.timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(submit));
-        const intended = { ...i.before.observation, tariff: JSON.parse(i.payloadJson).tou_settings.tariff_content_v2 };
+        const intended = intendedObservation(i.before.observation, JSON.parse(i.payloadJson).tou_settings.tariff_content_v2);
         const match = compareObservedTariffReadBack({ intended, readBack: o.observation, after: record.submittedAt, dates: [date] });
         if (match.outcome !== "exact-observed-match" || !match.timelineScope.complete || record.finalTariffFingerprint !== hash(o.observation.tariff))
             return reject("READBACK_NOT_EXACT");
@@ -331,7 +337,7 @@ export function validateConfirmedOperationEvidence(supplied: unknown, trusted: C
             const payload = JSON.parse(intent.payloadJson);
             if (!payload || !keys(payload, "tou_settings") || !payload.tou_settings || !keys(payload.tou_settings, "tariff_content_v2")
                 || intent.payloadJson !== representationKey(payload) || intent.payloadFingerprint !== hash(payload)) return reject("PAYLOAD_NOT_BOUND");
-            const intended = { ...before, tariff: payload.tou_settings.tariff_content_v2 };
+            const intended = intendedObservation(before, payload.tou_settings.tariff_content_v2);
             if (!same(validateTeslaInspectionEvidence(intended), intended)
                 || intent.kind === "restore" && !same(intended.tariff, intent.original.tariff)) return reject("INVALID_OPERATION_PAYLOAD");
             const date = new Intl.DateTimeFormat("en-CA", { timeZone: intent.timeZone, year: "numeric", month: "2-digit", day: "2-digit" })

@@ -253,11 +253,13 @@ async function reconciledCliHarness(t,fault){
  await io.mkdir(directory,{recursive:true,mode:0o700});
  const historical=path.join(directory,'site-12345.jsonl');await io.writeFile(historical,x.priorBytes);
  if(fault==='conflict')await io.writeFile(path.join(directory,'site-12345-attempt.active'),'already-pending');
- const calls={gets:0,posts:0,productReads:0,authReads:0,acquisitions:0,questions:0,output:[]};let uuid=0,lastReconciliation='',continuationAppends=0;
+ const calls={gets:0,posts:0,productReads:0,authReads:0,acquisitions:0,questions:0,output:[]};let uuid=0,lastReconciliation='',continuationAppends=0,operationInitialSyncFailures=0;
  const blocked=()=>{throw Error('UNEXPECTED_EXECUTION');};
  const dependencies={
   'node:fs/promises':{...io,open:async(file,flags,...args)=>{
    const handle=await io.open(file,flags,...args);
+   if(fault==='operation-initial-sync-once'&&file.endsWith('.operation.initial')&&flags==='wx'&&operationInitialSyncFailures++===0)
+    return new Proxy(handle,{get(target,k){if(k==='sync')return async()=>{throw Error('OPERATION_INITIAL_SYNC_FAILURE');};const v=target[k];return typeof v==='function'?v.bind(target):v;}});
    if(flags==='a'&&['continuation-io-failure','continuation-result-io-failure','continuation-slow-sync'].includes(fault)){
     const number=++continuationAppends;
     return new Proxy(handle,{get(target,k){if(k==='sync')return async()=>{
@@ -314,7 +316,9 @@ async function reconciledCliHarness(t,fault){
    const malformed=preflight?fault==='authenticated-preflight-malformed-site':fault==='authenticated-readback-malformed-site';
    const wrong=preflight?fault==='authenticated-preflight-wrong-site':fault==='authenticated-readback-wrong-site';
    const recoveryWrong=recovering&&fault==='recovery-wrong-site';
-   const response={...(!missing?{energy_site_id:malformed?{}:wrong||recoveryWrong?'99999':'12345'}:{}),installation_time_zone:'Europe/London',tariff_content_v2:structuredClone(tariff),tariff_content:legacy(tariff)};
+   const legacyTariff=legacy(tariff);
+   if(fault==='authenticated-readback-wrong-legacy'&&!preflight)legacyTariff.name='Wrong legacy metadata';
+   const response={...(!missing?{energy_site_id:malformed?{}:wrong||recoveryWrong?'99999':'12345'}:{}),installation_time_zone:'Europe/London',tariff_content_v2:structuredClone(tariff),tariff_content:legacyTariff};
    if(recovering&&fault==='recovery-malformed')delete response.tariff_content_v2;
    return{response};
   }},
@@ -324,6 +328,7 @@ async function reconciledCliHarness(t,fault){
   './observed-tariff':load('src/lib/tesla-tariff/observed-tariff.ts'),'./rollback-evidence':load('src/lib/tesla-tariff/rollback-evidence.ts'),
   './restoration-review':load('src/lib/tesla-tariff/restoration-review.ts'),
    './smart-inspection':load('src/lib/tesla-tariff/smart-inspection.ts'),
+   './confirmed-operation-evidence':load('src/lib/tesla-tariff/confirmed-operation-evidence.ts'),
    './proposal-approval':load('src/lib/tesla-tariff/proposal-approval.ts'),'./ownership-transition':load('src/lib/tesla-tariff/ownership-transition.ts'),
   './repeat-attempt-journal':journals,'./linked-experiment-records':linked,'./prepared-mutation-context':load('src/lib/tesla-tariff/prepared-mutation-context.ts'),
   './ownership-store':{ownershipStore:()=>({read:async()=>({status:'missing'})})},
@@ -339,6 +344,10 @@ async function reconciledCliHarness(t,fault){
   if(options.method==='POST'){
    calls.posts++;assert.match(_url,/\/energy_sites\/12345\/time_of_use_settings$/);
    assert.equal(options.headers.Authorization,'Bearer synthetic.jwt.value');assert.equal(options.body,x.initial.review.payloadJson);
+   const operationFile=path.join(x.config.directory,`site-12345-attempt-${x.initial.mutationId}.jsonl.operation.initial`);
+   const operationInitial=JSON.parse(await io.readFile(operationFile,'utf8'));
+   assert.equal(operationInitial.phase,'authenticated-operation-initial');
+   await assert.rejects(io.access(operationFile.replace('.initial','.completion')),{code:'ENOENT'});
    if(fault==='authenticated-transport')throw Error('PRIVATE_TRANSPORT_MARKER');
    return{status:fault==='authenticated-rejected'?400:fault==='authenticated-ambiguous'?503:200,
     json:async()=>({response:{result:fault!=='authenticated-rejected'},private:'DO_NOT_RETAIN'})};
@@ -358,6 +367,7 @@ async function reconciledCliHarness(t,fault){
   createPrivate:()=>exports.testPrivateContinuation(x.initial,x.config,x.ports),
   createAttempt:adapter=>exports.testPrivateAttemptProducer(x.initial,x.config,()=>x.ports.now(),adapter),
   createAuthenticated:()=>exports.testPrivateAttemptProducer(x.initial,x.config,()=>x.ports.now(),exports.testAuthenticatedTransportFoundation),
+  restartAuthenticated:()=>{const restarted=evaluatePrivateRealm();return restarted.testPrivateAttemptProducer(x.initial,x.config,()=>x.ports.now(),restarted.testAuthenticatedTransportFoundation);},
   recoverAuthenticated:()=>evaluatePrivateRealm().testAuthenticatedRecovery(x.config,()=>x.ports.now()),
   run:(extra=[])=>exports.runLocalExperiment(['--site','12345','--vehicle','fixture-ev','--dispatch-start',x.f.selection.dispatchStart,'--prepare-reconciled','--experiment-id','cli-independent',...extra])};
 }
@@ -845,19 +855,50 @@ test('authenticated tariff foundation performs one exact POST and strict authent
  const result=await producer.run();
  assert.equal(h.calls.posts,1);assert.equal(h.calls.authReads,2);assert.equal(result.provenance,'authenticated-tesla-fleet-api');
  assert.equal(result.outcome,'accepted-exact-readback');assert.equal(result.comparison.outcome,'exact-observed-match');
+ assert.equal(result.operationConfirmation,'confirmed');assert.match(result.operationEvidenceId,/^[a-f0-9]{64}$/);
  assert.equal(result.binding.site,'12345');assert.equal(result.binding.experimentId,'private-journal-continuation');
  assert.equal(result.binding.mutationId,h.x.initial.mutationId);assert.equal(result.binding.payloadKey,hash(h.x.initial.review.payloadJson));
  for(const field of ['productionConfirmation','runtimeConfirmationVerified','writeReady','executionReady','grantsCompletionAuthority'])assert.equal(result[field],false,field);
  await assert.rejects(producer.run(),/ATTEMPT_NOT_LIVE/);assert.equal(h.calls.posts,1);
  const rows=(await io.readFile(h.file,'utf8')).trim().split('\n').map(JSON.parse);
  assert.equal(rows.at(-1).provenance,'authenticated-tesla-fleet-api');
+ const operationInitial=JSON.parse(await io.readFile(h.file+'.operation.initial','utf8'));
+ const operationCompletion=JSON.parse(await io.readFile(h.file+'.operation.completion','utf8'));
+ assert.equal(rows.at(-1).binding.operationInitialRecordId,operationInitial.operationInitial.initialRecordId);
+ assert.equal(operationCompletion.v3AttemptRecordId,rows.at(-1).recordId);
+ assert.equal(operationCompletion.evidence.evidenceId,result.operationEvidenceId);
+ assert.equal(operationCompletion.context.retainedOriginal.restorationObligation,'required');
+ assert.notEqual(operationCompletion.evidence.completion.readback.observation.representations.legacy,null);
+ assert.equal(operationCompletion.evidence.completion.readback.observation.representations.relationship,'consistent');
+ assert.equal(load('src/lib/tesla-tariff/confirmed-operation-evidence.ts').validateConfirmedOperationEvidence(
+  operationCompletion.evidence,operationCompletion.context).status,'validated');
  assert.equal(journals.validReconciledApplyRecords(h.x.initial,hash(h.markerBytes),rows.slice(1),'private-journal-continuation'),true);
+});
+test('authenticated operation initial is durable before consumption and missing or tampered bridge evidence prevents POST',async t=>{
+ for(const fault of ['missing-operation-initial','tampered-operation-initial']){
+  const h=await privateContinuationFixture(t);await h.handle.recordApplyIntent();const producer=await h.createAuthenticated();
+  const operationFile=h.file+'.operation.initial';await io.access(operationFile);
+  await assert.rejects(io.access(h.file+'.execution'),{code:'ENOENT'});
+  if(fault==='missing-operation-initial')await io.rm(operationFile);else await io.appendFile(operationFile,'{}\n');
+  await assert.rejects(producer.run(),/OPERATION_BRIDGE_CONFLICT/,fault);
+  assert.equal(h.calls.posts,0,fault);await assert.rejects(io.access(h.file+'.execution'),{code:'ENOENT'});
+ }
+});
+test('authenticated operation initial is re-synchronised before a retry can consume or POST',async t=>{
+ const h=await privateContinuationFixture(t,'operation-initial-sync-once');await h.handle.recordApplyIntent();
+ await assert.rejects(h.createAuthenticated(),/OPERATION_INITIAL_SYNC_FAILURE/);
+ assert.equal(h.calls.posts,0);await assert.rejects(io.access(h.file+'.execution'),{code:'ENOENT'});
+ const producer=await h.restartAuthenticated();const result=await producer.run();
+ assert.equal(result.outcome,'accepted-exact-readback');assert.equal(h.calls.posts,1);
+ await io.access(h.file+'.execution');
 });
 test('authenticated tariff foundation never retries rejected or ambiguous mutation outcomes',async t=>{
  for(const [fault,outcome] of [['authenticated-rejected','write-rejected'],['authenticated-ambiguous','write-outcome-unknown'],
-  ['authenticated-transport','write-outcome-unknown']]){
+  ['authenticated-transport','write-outcome-unknown'],['authenticated-readback-wrong-legacy','accepted-readback-unverified']]){
   const h=await privateContinuationFixture(t,fault);await h.handle.recordApplyIntent();const producer=await h.createAuthenticated();
   const result=await producer.run();assert.equal(result.outcome,outcome,fault);assert.equal(h.calls.posts,1,fault);
+  assert.equal(result.operationConfirmation,'unresolved',fault);assert.equal(result.operationEvidenceId,null,fault);
+  await assert.rejects(io.access(h.file+'.operation.completion'),{code:'ENOENT'});
   assert.equal(h.calls.authReads,2,fault);await assert.rejects(producer.run(),/ATTEMPT_NOT_LIVE/);assert.equal(h.calls.posts,1,fault);
  }
 });
@@ -877,7 +918,7 @@ test('authenticated tariff foundation leaves consumed attempts unresolved on con
   await assert.rejects(producer.run(),/ATTEMPT_NOT_LIVE/);assert.equal(h.calls.posts,1,fault);
  }
 });
-test('private authenticated recovery classifies immutable consumed attempts without proving a POST or releasing the claim',async t=>{
+test('private authenticated recovery never promotes documentary completion or a matching GET to POST proof',async t=>{
  for(const [fault,expected] of [['valid','proposed-exact'],['recovery-original','original-exact'],
   ['recovery-external','external-conflict'],['recovery-wrong-site','unknown'],['recovery-malformed','unknown'],
   ['recovery-product-missing','unknown'],['authenticated-transport','proposed-exact']]){
@@ -887,7 +928,8 @@ test('private authenticated recovery classifies immutable consumed attempts with
   const recovered=await h.recoverAuthenticated();
   assert.equal(recovered.classification,expected,fault);assert.equal(h.calls.posts,posts,fault);
   assert.equal(recovered.attemptConsumed,true);assert.equal(recovered.siteClaimRetained,true);
-  assert.equal(recovered.restorationRequired,true);assert.equal(recovered.postProven,false);
+  assert.equal(recovered.restorationRequired,true);assert.equal(recovered.postProven,false,fault);
+  assert.equal(recovered.operationConfirmation,'unresolved',fault);assert.equal(recovered.operationEvidenceId,null,fault);
   for(const field of ['productionConfirmation','runtimeConfirmationVerified','writeReady','executionReady',
    'grantsCompletionAuthority','grantsSuccessorAuthority','releasesOwnership','closesOperation'])assert.equal(recovered[field],false,`${fault}:${field}`);
   assert.deepEqual((await io.readdir(h.x.config.directory)).sort(),files,fault);
@@ -902,6 +944,51 @@ test('private authenticated recovery classifies immutable consumed attempts with
   }
  }
 });
+test('forged self-attesting completion after ambiguous POST remains observationally proposed-exact and unresolved',async t=>{
+ const ambiguous=await privateContinuationFixture(t,'authenticated-transport');await ambiguous.handle.recordApplyIntent();
+ const attempted=await (await ambiguous.createAuthenticated()).run();assert.equal(attempted.outcome,'write-outcome-unknown');
+ const source=await privateContinuationFixture(t);await source.handle.recordApplyIntent();await (await source.createAuthenticated()).run();
+ const bridge=JSON.parse(await io.readFile(source.file+'.operation.completion','utf8'));
+ const initial=JSON.parse(await io.readFile(ambiguous.file+'.operation.initial','utf8'));
+ bridge.v3AdmissionKey=initial.v3AdmissionKey;bridge.v3AttemptRecordId=attempted.attemptRecordId;
+ const {recordId:_recordId,...body}=bridge;void _recordId;bridge.recordId=hash(body);
+ await io.writeFile(ambiguous.file+'.operation.completion',JSON.stringify(bridge)+'\n');
+ const recovered=await ambiguous.recoverAuthenticated();
+ assert.equal(recovered.classification,'proposed-exact');assert.equal(recovered.postProven,false);
+ assert.equal(recovered.operationConfirmation,'unresolved');assert.equal(recovered.operationEvidenceId,null);
+ assert.equal(recovered.restorationRequired,true);assert.equal(recovered.siteClaimRetained,true);
+});
+
+function rehashCompletionBridge(bridge){
+ const completion=bridge.evidence.completion,observation=completion.readback.observation;
+ completion.readback.observationId=hash({purpose:'v3-operation-readback',attemptRecordId:bridge.v3AttemptRecordId,observation});
+ const {completionRecordId:_completionRecordId,...completionBody}=completion;void _completionRecordId;
+ completion.completionRecordId=hash(completionBody);
+ const {evidenceId:_evidenceId,...evidenceBody}=bridge.evidence;void _evidenceId;
+ bridge.evidence.evidenceId=hash(evidenceBody);
+ const context=bridge.context,readback=context.authenticatedObservations.find(x=>x.phase==='readback');
+ Object.assign(readback,completion.readback);
+ context.durableJournal[0].completionRecordId=completion.completionRecordId;
+ context.retainedOriginal.origin.classifiedRecordId=completion.completionRecordId;
+ context.retainedOriginal.origin.receiptKey=bridge.evidence.evidenceId;
+ context.retainedOriginal.latestReadback.receiptKey=bridge.evidence.evidenceId;
+ const {recordId:_bridgeRecordId,...bridgeBody}=bridge;void _bridgeRecordId;bridge.recordId=hash(bridgeBody);
+ return bridge;
+}
+test('recovery rejects incomplete actual dual representations even when documentary hashes are recomputed',async t=>{
+ for(const kind of ['legacy-null','representations-missing']){
+  const h=await privateContinuationFixture(t);await h.handle.recordApplyIntent();await (await h.createAuthenticated()).run();
+  const bridge=JSON.parse(await io.readFile(h.file+'.operation.completion','utf8'));
+  const observation=bridge.evidence.completion.readback.observation;
+  if(kind==='legacy-null')observation.representations={v2:structuredClone(observation.tariff),legacy:null,relationship:'unverifiable'};
+  else delete observation.representations;
+  rehashCompletionBridge(bridge);await io.writeFile(h.file+'.operation.completion',JSON.stringify(bridge)+'\n');
+  const reads={products:h.calls.productReads,site:h.calls.authReads};const recovered=await h.recoverAuthenticated();
+  assert.equal(recovered.classification,'unknown',kind);assert.equal(recovered.code,'RECOVERY_OPERATION_COMPLETION_INVALID',kind);
+  assert.equal(recovered.postProven,false,kind);assert.equal(recovered.operationConfirmation,'unresolved',kind);
+  assert.deepEqual({products:h.calls.productReads,site:h.calls.authReads},reads,kind);
+ }
+});
 test('private authenticated recovery rejects corrupt immutable journals and consumption markers before acquisition',async t=>{
  for(const target of ['journal','consumption']){
   const h=await privateContinuationFixture(t);await h.handle.recordApplyIntent();const producer=await h.createAuthenticated();await producer.run();
@@ -913,6 +1000,16 @@ test('private authenticated recovery rejects corrupt immutable journals and cons
   assert.deepEqual({products:h.calls.productReads,site:h.calls.authReads,posts:h.calls.posts},reads);
   assert.equal(recovered.restorationRequired,true);assert.equal(recovered.siteClaimRetained,true);
  }
+});
+test('private authenticated recovery rejects tampered completion evidence before acquisition',async t=>{
+ const h=await privateContinuationFixture(t);await h.handle.recordApplyIntent();const producer=await h.createAuthenticated();await producer.run();
+ await io.appendFile(h.file+'.operation.completion','{}\n');
+ const reads={products:h.calls.productReads,site:h.calls.authReads,posts:h.calls.posts};
+ const recovered=await h.recoverAuthenticated();assert.equal(recovered.classification,'unknown');
+ assert.equal(recovered.code,'RECOVERY_OPERATION_COMPLETION_INVALID');
+ assert.equal(recovered.operationConfirmation,'unresolved');assert.equal(recovered.postProven,false);
+ assert.deepEqual({products:h.calls.productReads,site:h.calls.authReads,posts:h.calls.posts},reads);
+ assert.equal(recovered.attemptConsumed,true);assert.equal(recovered.siteClaimRetained,true);assert.equal(recovered.restorationRequired,true);
 });
 test('private authenticated recovery verifies every retained prior journal before acquisition',async t=>{
  for(const target of ['missing','changed','unsafe-reference','duplicate-reference']){
