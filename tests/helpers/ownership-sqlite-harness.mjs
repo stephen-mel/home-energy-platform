@@ -34,7 +34,8 @@ export function loadStore(hooks = {}, version = process.versions.node) {
     }`;
     const exports={}; cache.set(file,exports);
     vm.runInNewContext(ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,
-      {exports,Error,structuredClone,Date,process:{versions:{node:version},cwd:()=>hooks.cwd ?? process.cwd(),getBuiltinModule(name){
+      {exports,Error,structuredClone,Date,process:{versions:{node:version},cwd:()=>hooks.cwd ?? process.cwd(),
+        getuid:()=>hooks.uid ?? process.getuid(),umask:()=>hooks.umask ?? 0o077,getBuiltinModule(name){
         assert.equal(name,'node:sqlite');return {...sqlite,DatabaseSync:ControlledDatabase};}}, require(name){
         if(name.startsWith('.'))return load(path.resolve(path.dirname(file),name+'.ts'));
         const allowed={'node:fs':fs,'node:fs/promises':io,'node:path':path,'node:crypto':crypto};

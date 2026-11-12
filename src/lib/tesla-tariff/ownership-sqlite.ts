@@ -79,7 +79,7 @@ function validApplication(a: Application, site: string) {
         && (a.prior.status === "missing" ? a.priorHistoryDigest === null : digest(a.priorHistoryDigest))
         && validIdentity(a.result, site) && a.result.status === "available" && checksum === hash(bound);
 }
-function connect(file: string, create: boolean): { db: DatabaseSync; created: boolean } {
+function connect(file: string, create: boolean, writable = create): { db: DatabaseSync; created: boolean } {
     guard();
     let created = false;
     if (create) {
@@ -90,7 +90,7 @@ function connect(file: string, create: boolean): { db: DatabaseSync; created: bo
     if (!exists(file)) throw Error("OWNERSHIP_STORE_UNAVAILABLE");
     // Load only after the explicit runtime check, including on older Node versions.
     const sqlite = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
-    const db = new sqlite.DatabaseSync(file, { readOnly: !create, timeout: 0 });
+    const db = new sqlite.DatabaseSync(file, { readOnly: !writable, timeout: 0 });
     try {
         // Never select WAL or silently convert an existing database's journal mode.
         if (db.prepare("PRAGMA journal_mode").get()?.journal_mode !== "delete") throw Error("OWNERSHIP_STORE_INVALID");
@@ -348,9 +348,13 @@ function ownershipTransactionFailure(error: unknown, uncertain: boolean): Transa
 /** Private shared SQLite mechanics. A callback is NOT authority; only internal
  * guarded callers select work. Offline format handling exists in test VM code
  * only, never in application exports or a production caller-selectable profile. */
-function ownershipDatabaseTransaction<T>(file: string, site: string, work: (db: DatabaseSync) => Promise<T>): Promise<T | TransactionFailure>;
-function ownershipDatabaseTransaction<T>(file: string, site: string, work: (db: DatabaseSync) => T): T | TransactionFailure;
-function ownershipDatabaseTransaction<T>(file: string, site: string, work: (db: DatabaseSync) => T | Promise<T>): T | TransactionFailure | Promise<T | TransactionFailure> {
+type OwnershipTransactionOptions = { create?: boolean; expectedStore?: RetirementStoreBinding };
+function ownershipDatabaseTransaction<T>(file: string, site: string, work: (db: DatabaseSync) => Promise<T>,
+    options?: OwnershipTransactionOptions): Promise<T | TransactionFailure>;
+function ownershipDatabaseTransaction<T>(file: string, site: string, work: (db: DatabaseSync) => T,
+    options?: OwnershipTransactionOptions): T | TransactionFailure;
+function ownershipDatabaseTransaction<T>(file: string, site: string, work: (db: DatabaseSync) => T | Promise<T>,
+    options: OwnershipTransactionOptions = {}): T | TransactionFailure | Promise<T | TransactionFailure> {
     let db: DatabaseSync | undefined, inTransaction = false, commitAttempted = false;
     const failed = (error: unknown): TransactionFailure => {
         let uncertain = commitAttempted;
@@ -367,7 +371,11 @@ function ownershipDatabaseTransaction<T>(file: string, site: string, work: (db: 
     };
     try {
         guard(); legacy(file, site);
-        const connection = connect(file, true); db = connection.db;
+        const create = options.create ?? true;
+        const connection = connect(file, create, create || options.expectedStore !== undefined); db = connection.db;
+        if (options.expectedStore
+            && representationKey(retirementStoreBinding(file)) !== representationKey(options.expectedStore))
+            throw Error("OWNERSHIP_RETIREMENT_STORE_MISMATCH");
         db.exec("BEGIN IMMEDIATE"); inTransaction = true;
         schema(db, connection.created); legacy(file, site);
         const result = work(db);
@@ -511,10 +519,108 @@ function validateTerminalRetirementRequest(value: unknown, context: OwnershipLif
 }
 
 function retirementStoreBinding(databasePath: string): RetirementStoreBinding {
-    const requestedPath = path.resolve(databasePath), stat = lstatSync(requestedPath), canonicalPath = realpathSync(requestedPath);
-    if (!stat.isFile() || stat.isSymbolicLink() || canonicalPath !== requestedPath
-        || !Number.isSafeInteger(stat.dev) || !Number.isSafeInteger(stat.ino)) throw Error("OWNERSHIP_RETIREMENT_STORE_INVALID");
+    const requestedPath = path.resolve(databasePath), directory = path.dirname(requestedPath);
+    const owner = process.getuid?.();
+    if (!Number.isSafeInteger(owner) || process.umask() !== 0o077) throw Error("OWNERSHIP_RETIREMENT_STORE_INVALID");
+    const directoryStat = lstatSync(directory), canonicalDirectory = realpathSync(directory);
+    const stat = lstatSync(requestedPath), canonicalPath = realpathSync(requestedPath);
+    if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || canonicalDirectory !== directory
+        || directoryStat.uid !== owner || (directoryStat.mode & 0o777) !== 0o700
+        || !stat.isFile() || stat.isSymbolicLink() || canonicalPath !== requestedPath
+        || stat.uid !== owner || (stat.mode & 0o777) !== 0o600 || stat.nlink !== 1
+        || !Number.isSafeInteger(stat.dev) || !Number.isSafeInteger(stat.ino))
+        throw Error("OWNERSHIP_RETIREMENT_STORE_INVALID");
+    for (const suffix of ["-wal", "-shm"]) {
+        try { lstatSync(`${requestedPath}${suffix}`); throw Error("OWNERSHIP_RETIREMENT_STORE_INVALID"); }
+        catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+    }
     return { requestedPath, canonicalPath, device: stat.dev, inode: stat.ino };
+}
+
+function retirementJournal(context: OwnershipLifecycleValidationContext) {
+    return {
+        records: context.operations.map(operation => structuredClone(operation.evidence)),
+        contexts: context.operations.map(operation => structuredClone(operation.context)),
+    };
+}
+
+function retireOwnershipTransaction(file: string, trusted: TrustedTerminalRestoration,
+    request: OwnershipRetirementRequest) {
+    const transaction = ownershipDatabaseTransaction(file, request.site, db => {
+        const ownershipRows = db.prepare("SELECT site,snapshot FROM ownership WHERE site=?").all(request.site);
+        const appliedRows = db.prepare("SELECT site,mutation,issuance,record FROM applied WHERE site=?").all(request.site);
+        if (ownershipRows.length !== 1 || !appliedRows.length) throw Error("OWNERSHIP_RETIREMENT_HISTORY_INVALID");
+        const current = JSON.parse(String(ownershipRows[0].snapshot)) as PersistedOwnershipLifecycle;
+        const records = appliedRows.map(row => {
+            const record = JSON.parse(String(row.record)) as PersistedOwnershipLifecycle;
+            const application = record?.lifecycle?.applications?.at(-1);
+            if (row.site !== request.site || !application || row.mutation !== application.mutationId
+                || row.issuance !== application.runtime?.issuanceKey)
+                throw Error("OWNERSHIP_RETIREMENT_HISTORY_INVALID");
+            return record;
+        });
+        const completeJournal = retirementJournal(trusted.context);
+        if (completeJournal.records.length !== records.length + 1
+            || completeJournal.contexts.length !== completeJournal.records.length)
+            throw Error("OWNERSHIP_RETIREMENT_HISTORY_INVALID");
+        const currentJournal = {
+            records: completeJournal.records.slice(0, records.length),
+            contexts: completeJournal.contexts.slice(0, records.length),
+        };
+        const currentCheck = validatePersistedOwnershipHistory(current, records, request.site,
+            trusted.context.timeZone, currentJournal);
+        const last = current.lifecycle?.applications?.at(-1);
+        if (currentCheck.status !== "consistent-only" || ownershipRows[0].site !== request.site || !last
+            || current.recordId !== request.expectedCurrentRecordId
+            || current.lifecycle.lifecycleId !== request.expectedCurrentLifecycleId
+            || current.lifecycle.generation !== request.expectedGeneration
+            || current.lifecycle.state !== "active" || current.lifecycle.restorationObligation !== "required"
+            || last.applicationId !== request.expectedPredecessorApplicationId
+            || current.lifecycle.historicalOwnership.lifecycle.originalFingerprint !== request.originalFingerprint)
+            throw Error("OWNERSHIP_RETIREMENT_PRECONDITION_CHANGED");
+        const terminal = request.terminalRecord, terminalApplication = terminal.lifecycle.applications.at(-1);
+        if (!terminalApplication || terminal.previousRecordId !== current.recordId
+            || appliedRows.some(row => row.mutation === terminalApplication.mutationId
+                || row.issuance === terminalApplication.runtime.issuanceKey))
+            throw Error("OWNERSHIP_RETIREMENT_PRECONDITION_CHANGED");
+        const expectedRecords = [...records, terminal];
+        if (validatePersistedOwnershipHistory(terminal, expectedRecords, request.site,
+            trusted.context.timeZone, completeJournal).status !== "consistent-only")
+            throw Error("OWNERSHIP_RETIREMENT_HISTORY_INVALID");
+
+        db.prepare("UPDATE ownership SET snapshot=? WHERE site=? AND snapshot=?")
+            .run(JSON.stringify(terminal), request.site, String(ownershipRows[0].snapshot));
+        if (db.prepare("SELECT changes() AS count").get()?.count !== 1)
+            throw Error("OWNERSHIP_RETIREMENT_PRECONDITION_CHANGED");
+        db.prepare("INSERT INTO applied(site,mutation,issuance,record) VALUES(?,?,?,?)")
+            .run(request.site, terminalApplication.mutationId, terminalApplication.runtime.issuanceKey,
+                JSON.stringify(terminal));
+
+        const afterOwnership = db.prepare("SELECT site,snapshot FROM ownership WHERE site=?").all(request.site);
+        const afterApplied = db.prepare("SELECT site,mutation,issuance,record FROM applied WHERE site=?").all(request.site);
+        if (afterOwnership.length !== 1 || afterApplied.length !== appliedRows.length + 1
+            || afterOwnership[0].site !== request.site) throw Error("OWNERSHIP_RETIREMENT_READBACK_INVALID");
+        const observed = JSON.parse(String(afterOwnership[0].snapshot));
+        const observedRecords = afterApplied.map(row => {
+            const record = JSON.parse(String(row.record));
+            const application = record?.lifecycle?.applications?.at(-1);
+            if (!application || row.site !== request.site || row.mutation !== application.mutationId
+                || row.issuance !== application.runtime?.issuanceKey)
+                throw Error("OWNERSHIP_RETIREMENT_READBACK_INVALID");
+            return record;
+        });
+        if (representationKey(observed) !== representationKey(terminal)
+            || validatePersistedOwnershipHistory(observed, observedRecords, request.site,
+                trusted.context.timeZone, completeJournal).status !== "consistent-only")
+            throw Error("OWNERSHIP_RETIREMENT_READBACK_INVALID");
+        return Object.freeze({ status: "retired" as const, recordId: terminal.recordId, ...retirementFlags });
+    }, { create: false, expectedStore: trusted.store });
+    if (transaction.status === "retired") return transaction;
+    if (transaction.status === "indeterminate")
+        return Object.freeze({ status: "indeterminate" as const, code: transaction.code, ...retirementFlags });
+    return Object.freeze({ status: "rejected" as const, code: transaction.code, ...retirementFlags });
 }
 
 /** JSON-only detachment without property reads. Ordinary accessors are rejected
@@ -580,12 +686,10 @@ export function retireConfirmedSmartOwnership(databasePath: string, capability: 
         catch { return reject("OWNERSHIP_RETIREMENT_STORE_MISMATCH"); }
         if (representationKey(actualStore) !== representationKey(trusted.store))
             return reject("OWNERSHIP_RETIREMENT_STORE_MISMATCH");
-        // node:sqlite DatabaseSync accepts only a pathname and exposes no
-        // backing descriptor, sqlite3_file_control or VFS file handle. A path
-        // check cannot identify the file already opened by SQLite. Until a
-        // supported descriptor-bound driver exists, retirement is unavailable.
-        void checked; void request;
-        return reject("OWNERSHIP_RETIREMENT_OPEN_CONNECTION_IDENTITY_UNAVAILABLE");
+        // Trusted-filesystem deployment contract: these checks detect
+        // configuration mistakes and accidental replacement. They are not a
+        // defence against a hostile process with equivalent filesystem access.
+        return retireOwnershipTransaction(actualStore.requestedPath, trusted, request);
     } catch (error) { return reject(code(error)); }
 }
 
